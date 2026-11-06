@@ -230,3 +230,69 @@ class InvoiceLineItem(TimeStampedUUIDModel):
 
     def __str__(self):
         return self.description
+
+class InvoiceValidationIssue(TimeStampedUUIDModel):
+
+    class Severity(models.TextChoices):
+        INFO = "info", "Information"
+        WARNING = "warning", "Warning"
+        ERROR = "error", "Error"
+
+    class Status(models.TextChoices):
+        OPEN = "open", "Open"
+        RESOLVED = "resolved", "Resolved"
+        IGNORED = "ignored", "Ignored"
+
+    invoice = models.ForeignKey(
+        Invoice,
+        on_delete=models.CASCADE,
+        related_name="validation_issues",
+    )
+
+    code = models.CharField(max_length=100)
+
+    severity = models.CharField(
+        max_length=20,
+        choices=Severity.choices,
+    )
+
+    field_name = models.CharField(
+        max_length=100,
+        blank=True,
+    )
+
+    message = models.TextField()
+
+    details = models.JSONField(default=dict)
+
+    status = models.CharField(
+        max_length=20,
+        choices=Status.choices,
+        default=Status.OPEN,
+    )
+
+    resolved_by = models.ForeignKey(
+        settings.AUTH_USER_MODEL,
+        on_delete=models.SET_NULL,
+        null=True,
+        blank=True,
+        related_name="resolved_invoice_issues",
+    )
+
+    resolved_at = models.DateTimeField(
+        null=True,
+        blank=True,
+    )
+
+    class Meta:
+        ordering = ["-created_at"]
+
+        indexes = [
+            models.Index(
+                fields=["invoice", "status", "severity"],
+                name="invoice_issue_status_idx",
+            ),
+        ]
+
+    def __str__(self):
+        return f"{self.code}: {self.invoice}"

@@ -25,3 +25,4 @@ backend/staticfiles/
 .pytest_cache/
 .coverage
 htmlcov/
+run.md

@@ -141,3 +141,15 @@ MAILERS = {
         'BACKEND': 'django.core.mail.backends.console.EmailBackend',
     },
 }
+
+
+MAX_INVOICE_UPLOAD_SIZE = 10 * 1024 * 1024
+
+MAX_INVOICE_PDF_PAGES = 100
+
+REST_FRAMEWORK = {
+    "DEFAULT_AUTHENTICATION_CLASSES": [
+        "rest_framework.authentication.SessionAuthentication",
+        "rest_framework.authentication.BasicAuthentication",
+    ],
+}
