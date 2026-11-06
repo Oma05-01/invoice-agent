@@ -53,6 +53,8 @@ class Document(TimeStampedUUIDModel):
         related_name="uploaded_finance_documents",
     )
 
+    processing_error = models.TextField(blank=True)
+
     original_filename = models.CharField(max_length=255)
 
     file = models.FileField(

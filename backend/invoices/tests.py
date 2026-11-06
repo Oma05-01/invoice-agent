@@ -1,7 +1,9 @@
 from decimal import Decimal
+from unittest.mock import patch
 
+from django.urls import reverse
 from django.test import SimpleTestCase
-
+from rest_framework.test import APIClient
 from pydantic import ValidationError
 
 from invoices.schemas import InvoiceExtractionResult
@@ -17,7 +19,28 @@ from invoices.services.validation import (
 from invoices.services.evidence import (
     verify_extraction_evidence,
 )
+import shutil
+import tempfile
 
+import pymupdf
+
+from django.contrib.auth import get_user_model
+from django.core.files.base import ContentFile
+from django.test import TestCase, override_settings
+
+from organizations.models import Organization, OrganizationMembership
+from vendors.models import Vendor
+from documents.models import Document
+from invoices.models import Invoice, InvoiceLineItem, InvoiceValidationIssue
+
+from documents.extraction import OCRRequiredError
+from invoices.models import Invoice
+
+
+from invoices.services.processing import (
+    process_invoice,
+    InvoiceProcessingStateError,
+)
 
 class InvoiceExtractionSchemaTests(SimpleTestCase):
 
@@ -634,3 +657,719 @@ class InvoiceEvidenceVerificationTests(SimpleTestCase):
         )
 
         self.assertEqual(findings, [])
+
+
+class InvoiceProcessingTests(TestCase):
+
+    def setUp(self):
+
+        self.media_directory = tempfile.mkdtemp()
+
+        self.settings_override = override_settings(
+            MEDIA_ROOT=self.media_directory,
+        )
+        self.settings_override.enable()
+
+        User = get_user_model()
+
+        self.user = User.objects.create_user(
+            username="processing_admin",
+            password="temporary-test-password",
+        )
+
+        self.organization = Organization.objects.create(
+            name="Processing Test Company",
+            slug="processing-test-company",
+        )
+
+        self.vendor = Vendor.objects.create(
+            organization=self.organization,
+            legal_name="ABC Engineering Ltd",
+            display_name="ABC Engineering",
+        )
+
+        self.document = self.create_document(
+            self.generate_pdf(),
+        )
+
+        self.invoice = Invoice.objects.create(
+            organization=self.organization,
+            source_document=self.document,
+        )
+
+    def tearDown(self):
+
+        self.settings_override.disable()
+
+        shutil.rmtree(
+            self.media_directory,
+            ignore_errors=True,
+        )
+
+        super().tearDown()
+
+    @staticmethod
+    def generate_pdf(scanned=False):
+
+        pdf = pymupdf.open()
+
+        page = pdf.new_page()
+
+        if not scanned:
+            page.insert_text(
+                (72, 72),
+                "SUPPLIER INVOICE\n"
+                "Invoice Number: DEMO-002\n"
+                "Supplier: ABC Engineering Ltd\n"
+                "Date: 06 November 2026\n"
+                "Subtotal: NGN 100000.00\n"
+                "VAT: NGN 7500.00\n"
+                "Total: NGN 107500.00\n"
+                "Description: Engineering services\n"
+                "Quantity: 1\n"
+                "Unit Price: NGN 100000.00\n"
+                "Line Total: NGN 100000.00",
+            )
+
+        content = pdf.tobytes()
+
+        pdf.close()
+
+        return content
+
+    def create_document(self, content):
+
+        document = Document(
+            organization=self.organization,
+            uploaded_by=self.user,
+            original_filename="demo_invoice.pdf",
+            content_type="application/pdf",
+            file_size=len(content),
+        )
+
+        document.file.save(
+            "demo_invoice.pdf",
+            ContentFile(content),
+            save=False,
+        )
+
+        document.save()
+
+        return document
+
+    def valid_extraction_payload(self):
+
+        return {
+            "supplier_legal_name": "ABC Engineering Ltd",
+            "invoice_number": "DEMO-002",
+            "invoice_date": "2026-11-06",
+            "currency": "NGN",
+            "subtotal": "100000.00",
+            "taxes": [
+                {
+                    "name": "VAT",
+                    "tax_type": "VAT",
+                    "treatment": "added",
+                    "rate_percent": "7.5",
+                    "amount": "7500.00",
+                }
+            ],
+            "other_charges": "0.00",
+            "total_amount": "107500.00",
+            "line_items": [
+                {
+                    "description": "Engineering services",
+                    "quantity": "1",
+                    "unit_price": "100000.00",
+                    "line_total": "100000.00",
+                    "suggested_expense_category": "Professional Services",
+                }
+            ],
+            "field_evidence": {
+                "invoice_number": [
+                    {
+                        "page": 1,
+                        "quote": "Invoice Number: DEMO-002",
+                    }
+                ],
+                "supplier_legal_name": [
+                    {
+                        "page": 1,
+                        "quote": "Supplier: ABC Engineering Ltd",
+                    }
+                ],
+                "invoice_date": [
+                    {
+                        "page": 1,
+                        "quote": "Date: 06 November 2026",
+                    }
+                ],
+                "currency": [
+                    {
+                        "page": 1,
+                        "quote": "Subtotal: NGN 100000.00",
+                    }
+                ],
+                "subtotal": [
+                    {
+                        "page": 1,
+                        "quote": "Subtotal: NGN 100000.00",
+                    }
+                ],
+                "taxes": [
+                    {
+                        "page": 1,
+                        "quote": "VAT: NGN 7500.00",
+                    }
+                ],
+                "total_amount": [
+                    {
+                        "page": 1,
+                        "quote": "Total: NGN 107500.00",
+                    }
+                ],
+                "line_items": [
+                    {
+                        "page": 1,
+                        "quote": (
+                            "Description: Engineering services"
+                        ),
+                    }
+                ],
+            },
+        }
+
+class FakeExtractionService:
+
+    def __init__(self, payload):
+        self.payload = payload
+
+    def extract(self, *, document_text):
+
+        assert "DEMO-002" in document_text
+
+        return InvoiceExtractionResult.model_validate(
+            self.payload
+        )
+
+
+class InvoiceProcessingTests(TestCase):
+
+    def setUp(self):
+
+        self.media_directory = tempfile.mkdtemp()
+
+        self.settings_override = override_settings(
+            MEDIA_ROOT=self.media_directory,
+        )
+        self.settings_override.enable()
+
+        User = get_user_model()
+
+        self.user = User.objects.create_user(
+            username="processing_admin",
+            password="temporary-test-password",
+        )
+
+        self.organization = Organization.objects.create(
+            name="Processing Test Company",
+            slug="processing-test-company",
+        )
+
+        self.vendor = Vendor.objects.create(
+            organization=self.organization,
+            legal_name="ABC Engineering Ltd",
+            display_name="ABC Engineering",
+        )
+
+        self.document = self.create_document(
+            self.generate_pdf()
+        )
+
+        self.invoice = Invoice.objects.create(
+            organization=self.organization,
+            source_document=self.document,
+        )
+
+    def tearDown(self):
+
+        self.settings_override.disable()
+
+        shutil.rmtree(
+            self.media_directory,
+            ignore_errors=True,
+        )
+
+        super().tearDown()
+
+    @staticmethod
+    def generate_pdf(scanned=False):
+
+        pdf = pymupdf.open()
+        page = pdf.new_page()
+
+        if not scanned:
+            page.insert_text(
+                (72, 72),
+                "SUPPLIER INVOICE\n"
+                "Invoice Number: DEMO-002\n"
+                "Supplier: ABC Engineering Ltd\n"
+                "Date: 06 November 2026\n"
+                "Subtotal: NGN 100000.00\n"
+                "VAT: NGN 7500.00\n"
+                "Total: NGN 107500.00\n"
+                "Description: Engineering services\n"
+                "Quantity: 1\n"
+                "Unit Price: NGN 100000.00\n"
+                "Line Total: NGN 100000.00",
+            )
+
+        content = pdf.tobytes()
+        pdf.close()
+
+        return content
+
+    def create_document(self, content):
+
+        document = Document(
+            organization=self.organization,
+            uploaded_by=self.user,
+            original_filename="demo_invoice.pdf",
+            content_type="application/pdf",
+            file_size=len(content),
+        )
+
+        document.file.save(
+            "demo_invoice.pdf",
+            ContentFile(content),
+            save=False,
+        )
+
+        document.save()
+
+        return document
+
+    def valid_extraction_payload(self):
+
+        return {
+            "supplier_legal_name": "ABC Engineering Ltd",
+            "invoice_number": "DEMO-002",
+            "invoice_date": "2026-11-06",
+            "currency": "NGN",
+            "subtotal": "100000.00",
+            "taxes": [
+                {
+                    "name": "VAT",
+                    "tax_type": "VAT",
+                    "treatment": "added",
+                    "rate_percent": "7.5",
+                    "amount": "7500.00",
+                }
+            ],
+            "other_charges": "0.00",
+            "total_amount": "107500.00",
+            "line_items": [
+                {
+                    "description": "Engineering services",
+                    "quantity": "1",
+                    "unit_price": "100000.00",
+                    "line_total": "100000.00",
+                    "suggested_expense_category": (
+                        "Professional Services"
+                    ),
+                }
+            ],
+            "field_evidence": {
+                "invoice_number": [
+                    {
+                        "page": 1,
+                        "quote": "Invoice Number: DEMO-002",
+                    }
+                ],
+                "supplier_legal_name": [
+                    {
+                        "page": 1,
+                        "quote": "Supplier: ABC Engineering Ltd",
+                    }
+                ],
+                "invoice_date": [
+                    {
+                        "page": 1,
+                        "quote": "Date: 06 November 2026",
+                    }
+                ],
+                "currency": [
+                    {
+                        "page": 1,
+                        "quote": "Subtotal: NGN 100000.00",
+                    }
+                ],
+                "subtotal": [
+                    {
+                        "page": 1,
+                        "quote": "Subtotal: NGN 100000.00",
+                    }
+                ],
+                "taxes": [
+                    {
+                        "page": 1,
+                        "quote": "VAT: NGN 7500.00",
+                    }
+                ],
+                "total_amount": [
+                    {
+                        "page": 1,
+                        "quote": "Total: NGN 107500.00",
+                    }
+                ],
+                "line_items": [
+                    {
+                        "page": 1,
+                        "quote": "Description: Engineering services",
+                    }
+                ],
+            },
+        }
+
+    def test_complete_invoice_processing(self):
+
+        service = FakeExtractionService(
+            self.valid_extraction_payload()
+        )
+
+        invoice = process_invoice(
+            self.invoice.id,
+            extraction_service=service,
+        )
+
+        invoice.refresh_from_db()
+        self.document.refresh_from_db()
+
+        self.assertEqual(
+            invoice.status,
+            Invoice.Status.NEEDS_REVIEW,
+        )
+
+        self.assertEqual(
+            self.document.status,
+            Document.Status.PROCESSED,
+        )
+
+        self.assertEqual(invoice.vendor, self.vendor)
+
+        self.assertEqual(invoice.currency, "NGN")
+
+        self.assertEqual(
+            invoice.total_amount,
+            Decimal("107500.00"),
+        )
+
+        self.assertIsNone(invoice.amount_due)
+
+        self.assertEqual(
+            invoice.extracted_data["invoice_number"],
+            "DEMO-002",
+        )
+
+        self.assertEqual(
+            InvoiceLineItem.objects.filter(
+                invoice=invoice
+            ).count(),
+            1,
+        )
+
+        self.assertEqual(
+            InvoiceValidationIssue.objects.filter(
+                invoice=invoice
+            ).count(),
+            0,
+        )
+
+    def test_financial_validation_findings_are_persisted(self):
+
+        payload = self.valid_extraction_payload()
+        payload["total_amount"] = "105000.00"
+
+        service = FakeExtractionService(payload)
+
+        invoice = process_invoice(
+            self.invoice.id,
+            extraction_service=service,
+        )
+
+        issues = InvoiceValidationIssue.objects.filter(
+            invoice=invoice
+        )
+
+        self.assertTrue(
+            issues.filter(
+                code="TOTAL_MISMATCH"
+            ).exists()
+        )
+
+        self.assertEqual(
+            invoice.status,
+            Invoice.Status.NEEDS_REVIEW,
+        )
+
+    def test_scanned_pdf_is_marked_as_failed(self):
+
+        scanned_document = self.create_document(
+            self.generate_pdf(scanned=True)
+        )
+
+        scanned_invoice = Invoice.objects.create(
+            organization=self.organization,
+            source_document=scanned_document,
+        )
+
+        with self.assertRaises(OCRRequiredError):
+
+            process_invoice(
+                scanned_invoice.id,
+                extraction_service=FakeExtractionService(
+                    self.valid_extraction_payload()
+                ),
+            )
+
+        scanned_invoice.refresh_from_db()
+        scanned_document.refresh_from_db()
+
+        self.assertEqual(
+            scanned_invoice.status,
+            Invoice.Status.FAILED,
+        )
+
+        self.assertEqual(
+            scanned_document.status,
+            Document.Status.FAILED,
+        )
+
+        self.assertTrue(
+            scanned_document.processing_error
+        )
+
+    def test_completed_invoice_cannot_be_processed_again(self):
+
+        service = FakeExtractionService(
+            self.valid_extraction_payload()
+        )
+
+        process_invoice(
+            self.invoice.id,
+            extraction_service=service,
+        )
+
+        with self.assertRaises(InvoiceProcessingStateError):
+
+            process_invoice(
+                self.invoice.id,
+                extraction_service=service,
+            )
+
+        self.assertEqual(
+            InvoiceLineItem.objects.filter(
+                invoice=self.invoice
+            ).count(),
+            1,
+        )
+
+class InvoiceQueueAPITests(TestCase):
+
+    def setUp(self):
+
+        self.user = get_user_model().objects.create_user(
+            username="queue_operator",
+            password="test-password-123",
+        )
+
+        self.organization = Organization.objects.create(
+            name="Queue Test Company",
+            slug="queue-test-company",
+        )
+
+        self.membership = OrganizationMembership.objects.create(
+            organization=self.organization,
+            user=self.user,
+            role=OrganizationMembership.Role.OWNER,
+        )
+
+        self.document = Document.objects.create(
+            organization=self.organization,
+            uploaded_by=self.user,
+            original_filename="queue_test.pdf",
+            file="queue_test.pdf",
+            content_type="application/pdf",
+            file_size=100,
+            status=Document.Status.UPLOADED,
+        )
+
+        self.invoice = Invoice.objects.create(
+            organization=self.organization,
+            source_document=self.document,
+            status=Invoice.Status.UPLOADED,
+        )
+
+        self.client = APIClient()
+        self.client.force_authenticate(user=self.user)
+
+        self.process_url = reverse(
+            "invoice-process",
+            kwargs={
+                "organization_id": self.organization.id,
+                "invoice_id": self.invoice.id,
+            },
+        )
+
+        self.status_url = reverse(
+            "invoice-processing-status",
+            kwargs={
+                "organization_id": self.organization.id,
+                "invoice_id": self.invoice.id,
+            },
+        )
+
+    @patch("invoices.views.process_invoice_task.apply_async")
+    def test_invoice_is_queued_successfully(self, enqueue):
+
+        response = self.client.post(
+            self.process_url,
+            {},
+            format="json",
+        )
+
+        self.assertEqual(response.status_code, 202)
+
+        self.invoice.refresh_from_db()
+        self.document.refresh_from_db()
+
+        self.assertEqual(
+            self.invoice.status,
+            Invoice.Status.QUEUED,
+        )
+
+        self.assertEqual(
+            self.document.status,
+            Document.Status.QUEUED,
+        )
+
+        self.assertIsNotNone(
+            self.invoice.processing_task_id,
+        )
+
+        self.assertIsNotNone(
+            self.invoice.queued_at,
+        )
+
+        enqueue.assert_called_once_with(
+            args=[
+                str(self.invoice.id),
+                str(self.invoice.processing_task_id),
+            ],
+            task_id=str(self.invoice.processing_task_id),
+        )
+
+    @patch("invoices.views.process_invoice_task.apply_async")
+    def test_already_queued_invoice_cannot_be_queued_again(
+        self,
+        enqueue,
+    ):
+
+        first_response = self.client.post(
+            self.process_url,
+            {},
+            format="json",
+        )
+
+        second_response = self.client.post(
+            self.process_url,
+            {},
+            format="json",
+        )
+
+        self.assertEqual(first_response.status_code, 202)
+        self.assertEqual(second_response.status_code, 409)
+
+        enqueue.assert_called_once()
+
+    @patch("invoices.views.process_invoice_task.apply_async")
+    def test_read_only_member_cannot_queue_invoice(
+        self,
+        enqueue,
+    ):
+
+        self.membership.role = (
+            OrganizationMembership.Role.READ_ONLY
+        )
+
+        self.membership.save()
+
+        response = self.client.post(
+            self.process_url,
+            {},
+            format="json",
+        )
+
+        self.assertEqual(response.status_code, 403)
+
+        self.invoice.refresh_from_db()
+
+        self.assertEqual(
+            self.invoice.status,
+            Invoice.Status.UPLOADED,
+        )
+
+        enqueue.assert_not_called()
+
+    @patch(
+        "invoices.views.process_invoice_task.apply_async",
+        side_effect=RuntimeError("Redis unavailable"),
+    )
+    def test_broker_failure_marks_invoice_failed(
+        self,
+        enqueue,
+    ):
+
+        response = self.client.post(
+            self.process_url,
+            {},
+            format="json",
+        )
+
+        self.assertEqual(response.status_code, 503)
+
+        self.invoice.refresh_from_db()
+        self.document.refresh_from_db()
+
+        self.assertEqual(
+            self.invoice.status,
+            Invoice.Status.FAILED,
+        )
+
+        self.assertEqual(
+            self.document.status,
+            Document.Status.FAILED,
+        )
+
+        self.assertTrue(
+            self.document.processing_error,
+        )
+
+    def test_invoice_processing_status_is_accessible(self):
+
+        response = self.client.get(
+            self.status_url,
+        )
+
+        self.assertEqual(response.status_code, 200)
+
+        self.assertEqual(
+            response.data["status"],
+            Invoice.Status.UPLOADED,
+        )
+
+        self.assertEqual(
+            response.data["document"]["status"],
+            Document.Status.UPLOADED,
+        )
+        

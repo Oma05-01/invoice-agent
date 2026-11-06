@@ -19,6 +19,7 @@ class Invoice(TimeStampedUUIDModel):
         REJECTED = "rejected", "Rejected"
         EXPORTED = "exported", "Exported"
         FAILED = "failed", "Failed"
+        QUEUED = "queued", "Queued"
 
     organization = models.ForeignKey(
         Organization,
@@ -59,7 +60,9 @@ class Invoice(TimeStampedUUIDModel):
 
     currency = models.CharField(
         max_length=3,
-        default="NGN",
+        null=True,
+        blank=True,
+        default=None,
     )
 
     subtotal = models.DecimalField(
@@ -108,6 +111,18 @@ class Invoice(TimeStampedUUIDModel):
     extracted_data = models.JSONField(default=dict)
 
     field_confidence = models.JSONField(default=dict)
+
+    processing_task_id = models.UUIDField(
+        null=True,
+        blank=True,
+        editable=False,
+    )
+
+    queued_at = models.DateTimeField(
+        null=True,
+        blank=True,
+        editable=False,
+    )
 
     class Meta:
         ordering = ["-created_at"]
