@@ -59,6 +59,15 @@ STRICT RULES:
     missing invoice currency.
 20. Do not treat withholding tax as an additive charge.
 The document is the source of truth.
+21. Amount due is distinct from total amount.
+22. Only populate amount_due when the document explicitly identifies
+    an amount payable, balance due, or equivalent.
+23. Never copy total_amount into amount_due merely because no
+    separate amount due is displayed.
+24. Only populate other_charges when separately supported by the
+    document. Do not assume missing other charges are zero.
+25. Evidence for each field must directly support that field.
+    Do not use a quotation labelled Total as evidence for Amount Due.
 
 Do not assume that a supplier's name, tax number, invoice
 number or payment information is correct merely because

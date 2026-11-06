@@ -17,15 +17,10 @@ class PDFExtractionResult:
     page_count: int
     pages_with_text: tuple[int, ...]
     pages_requiring_ocr: tuple[int, ...]
+    page_texts: dict[int, str]
 
 
 def extract_pdf_text(content: bytes) -> PDFExtractionResult:
-    """
-    Extract text from a PDF using PyMuPDF.
-
-    Page numbers are one-based.
-    """
-
     if not content:
         raise DocumentExtractionError(
             "The document is empty."
@@ -48,9 +43,7 @@ def extract_pdf_text(content: bytes) -> PDFExtractionResult:
                 "Encrypted PDFs are not supported."
             )
 
-        page_count = pdf.page_count
-
-        if page_count == 0:
+        if pdf.page_count == 0:
             raise DocumentExtractionError(
                 "The PDF contains no pages."
             )
@@ -58,6 +51,7 @@ def extract_pdf_text(content: bytes) -> PDFExtractionResult:
         extracted_pages = []
         pages_with_text = []
         pages_requiring_ocr = []
+        page_texts = {}
 
         for page_number, page in enumerate(pdf, start=1):
 
@@ -66,16 +60,17 @@ def extract_pdf_text(content: bytes) -> PDFExtractionResult:
                 sort=True,
             ).strip()
 
+            page_texts[page_number] = page_text
+
             if page_text:
                 pages_with_text.append(page_number)
+
                 extracted_pages.append(
                     f"[PAGE {page_number}]\n{page_text}"
                 )
 
             else:
-                pages_requiring_ocr.append(
-                    page_number
-                )
+                pages_requiring_ocr.append(page_number)
 
         if not extracted_pages:
             raise OCRRequiredError(
@@ -84,9 +79,10 @@ def extract_pdf_text(content: bytes) -> PDFExtractionResult:
 
         return PDFExtractionResult(
             text="\n\n".join(extracted_pages),
-            page_count=page_count,
+            page_count=pdf.page_count,
             pages_with_text=tuple(pages_with_text),
             pages_requiring_ocr=tuple(pages_requiring_ocr),
+            page_texts=page_texts,
         )
 
     finally:

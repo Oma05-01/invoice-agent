@@ -14,6 +14,10 @@ from invoices.services.validation import (
     validate_invoice_extraction,
 )
 
+from invoices.services.evidence import (
+    verify_extraction_evidence,
+)
+
 
 class InvoiceExtractionSchemaTests(SimpleTestCase):
 
@@ -504,3 +508,129 @@ class InvoiceFinancialValidationTests(SimpleTestCase):
             {item.code for item in findings},
         )
 
+class InvoiceEvidenceVerificationTests(SimpleTestCase):
+
+    def setUp(self):
+
+        self.extraction = InvoiceExtractionResult.model_validate(
+            {
+                "invoice_number": "DEMO-001",
+                "supplier_legal_name": "ABC Engineering Ltd",
+                "field_evidence": {
+                    "invoice_number": [
+                        {
+                            "page": 1,
+                            "quote": "Invoice Number: DEMO-001",
+                        }
+                    ],
+                    "supplier_legal_name": [
+                        {
+                            "page": 1,
+                            "quote": "Supplier: ABC Engineering Ltd",
+                        }
+                    ],
+                },
+            }
+        )
+
+    def test_valid_evidence_is_accepted(self):
+
+        page_texts = {
+            1: (
+                "SUPPLIER INVOICE\n"
+                "Invoice Number: DEMO-001\n"
+                "Supplier: ABC Engineering Ltd"
+            )
+        }
+
+        findings = verify_extraction_evidence(
+            self.extraction,
+            page_texts,
+        )
+
+        self.assertEqual(findings, [])
+
+    def test_missing_page_is_flagged(self):
+
+        findings = verify_extraction_evidence(
+            self.extraction,
+            {},
+        )
+
+        self.assertEqual(len(findings), 2)
+
+        self.assertTrue(
+            all(
+                finding.code == "EVIDENCE_PAGE_NOT_FOUND"
+                for finding in findings
+            )
+        )
+
+    def test_missing_quote_is_flagged(self):
+
+        page_texts = {
+            1: "Invoice Number: DIFFERENT-001"
+        }
+
+        findings = verify_extraction_evidence(
+            self.extraction,
+            page_texts,
+        )
+
+        codes = {
+            finding.code
+            for finding in findings
+        }
+
+        self.assertIn(
+            "EVIDENCE_QUOTE_NOT_FOUND",
+            codes,
+        )
+
+    def test_page_without_searchable_text_requires_ocr(self):
+
+        findings = verify_extraction_evidence(
+            self.extraction,
+            {
+                1: "",
+            },
+        )
+
+        codes = {
+            finding.code
+            for finding in findings
+        }
+
+        self.assertIn(
+            "EVIDENCE_PAGE_REQUIRES_OCR",
+            codes,
+        )
+
+    def test_whitespace_and_case_differences_are_accepted(self):
+
+        page_texts = {
+            1: (
+                "INVOICE NUMBER:\n"
+                "   DEMO-001"
+            )
+        }
+
+        extraction = InvoiceExtractionResult.model_validate(
+            {
+                "field_evidence": {
+                    "invoice_number": [
+                        {
+                            "page": 1,
+                            "quote": "Invoice Number: DEMO-001",
+                        }
+                    ]
+                }
+            }
+        )
+
+        findings = verify_extraction_evidence(
+            extraction,
+            page_texts,
+        )
+
+        self.assertEqual(findings, [])

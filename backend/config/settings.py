@@ -153,3 +153,23 @@ REST_FRAMEWORK = {
         "rest_framework.authentication.BasicAuthentication",
     ],
 }
+
+GROQ_API_KEY = env.str(
+    "GROQ_API_KEY",
+    default="",
+)
+
+GROQ_MODEL = env.str(
+    "GROQ_MODEL",
+    default="openai/gpt-oss-20b",
+)
+
+GROQ_TIMEOUT_SECONDS = env.int(
+    "GROQ_TIMEOUT_SECONDS",
+    default=60,
+)
+
+GROQ_MAX_RETRIES = env.int(
+    "GROQ_MAX_RETRIES",
+    default=2,
+)
