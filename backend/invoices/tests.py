@@ -1,5 +1,5 @@
 from decimal import Decimal
-from unittest.mock import patch
+from unittest.mock import patch, Mock
 
 from django.urls import reverse
 from django.test import SimpleTestCase
@@ -15,6 +15,12 @@ from invoices.services.extraction import (
     InvoiceExtractionError,
     InvoiceExtractionService,
     InvalidExtractionResponse,
+)
+from invoices.providers.groq_provider import (
+    GroqInvoiceExtractionProvider,
+    GroqProviderError,
+    build_groq_strict_schema,
+    normalize_groq_extraction,
 )
 from invoices.services.validation import (
     validate_invoice_extraction,
@@ -51,6 +57,387 @@ from invoices.services.processing import (
 )
 from invoices.services.evidence import verify_extraction_evidence
 from invoices.services.review import synchronize_validation_issues
+
+
+class AuthenticationAPITests(TestCase):
+
+    def setUp(self):
+        self.user = get_user_model().objects.create_user(
+            username="auth_test_user",
+            email="auth@example.com",
+            password="test-password-123",
+            first_name="Finance",
+            last_name="Operator",
+        )
+
+        self.organization = Organization.objects.create(
+            name="Authentication Test Company",
+            slug="authentication-test-company",
+        )
+
+        self.membership = OrganizationMembership.objects.create(
+            organization=self.organization,
+            user=self.user,
+            role=OrganizationMembership.Role.OWNER,
+            is_active=True,
+        )
+
+        self.other_organization = Organization.objects.create(
+            name="Inactive Membership Company",
+            slug="inactive-membership-company",
+        )
+
+        OrganizationMembership.objects.create(
+            organization=self.other_organization,
+            user=self.user,
+            role=OrganizationMembership.Role.READ_ONLY,
+            is_active=False,
+        )
+
+        self.client = APIClient(enforce_csrf_checks=True)
+
+        self.csrf_url = reverse("auth-csrf")
+        self.login_url = reverse("auth-login")
+        self.logout_url = reverse("auth-logout")
+        self.me_url = reverse("auth-me")
+
+    def obtain_csrf_token(self):
+        response = self.client.get(self.csrf_url)
+
+        self.assertEqual(response.status_code, 200)
+        self.assertIn("csrfToken", response.data)
+        self.assertIn("csrftoken", self.client.cookies)
+
+        return response.data["csrfToken"]
+
+    def login_user(self):
+        csrf_token = self.obtain_csrf_token()
+
+        return self.client.post(
+            self.login_url,
+            {
+                "username": "auth_test_user",
+                "password": "test-password-123",
+            },
+            format="json",
+            HTTP_X_CSRFTOKEN=csrf_token,
+        )
+
+    def test_csrf_endpoint_returns_token(self):
+        response = self.client.get(self.csrf_url)
+
+        self.assertEqual(response.status_code, 200)
+        self.assertTrue(response.data["csrfToken"])
+        self.assertIn("csrftoken", self.client.cookies)
+
+    def test_login_requires_csrf_token(self):
+        response = self.client.post(
+            self.login_url,
+            {
+                "username": "auth_test_user",
+                "password": "test-password-123",
+            },
+            format="json",
+        )
+
+        self.assertEqual(response.status_code, 403)
+
+    def test_login_succeeds_with_valid_credentials_and_csrf(self):
+        response = self.login_user()
+
+        self.assertEqual(response.status_code, 200)
+
+        self.assertEqual(
+            response.data["message"],
+            "Login successful.",
+        )
+
+        self.assertEqual(
+            response.data["user"]["username"],
+            "auth_test_user",
+        )
+
+        self.assertTrue(response.data["csrfToken"])
+
+        self.assertTrue(
+            self.client.cookies.get("sessionid")
+        )
+
+    def test_login_rejects_invalid_credentials(self):
+        csrf_token = self.obtain_csrf_token()
+
+        response = self.client.post(
+            self.login_url,
+            {
+                "username": "auth_test_user",
+                "password": "incorrect-password",
+            },
+            format="json",
+            HTTP_X_CSRFTOKEN=csrf_token,
+        )
+
+        self.assertEqual(response.status_code, 400)
+
+        self.assertFalse(
+            self.client.cookies.get("sessionid")
+        )
+
+    def test_login_rejects_missing_credentials(self):
+        csrf_token = self.obtain_csrf_token()
+
+        response = self.client.post(
+            self.login_url,
+            {},
+            format="json",
+            HTTP_X_CSRFTOKEN=csrf_token,
+        )
+
+        self.assertEqual(response.status_code, 400)
+
+    def test_current_user_requires_authentication(self):
+        response = self.client.get(self.me_url)
+
+        self.assertEqual(response.status_code, 403)
+
+    def test_current_user_returns_only_active_organizations(self):
+        login_response = self.login_user()
+
+        self.assertEqual(login_response.status_code, 200)
+
+        response = self.client.get(self.me_url)
+
+        self.assertEqual(response.status_code, 200)
+
+        user_data = response.data["user"]
+
+        self.assertEqual(
+            user_data["username"],
+            "auth_test_user",
+        )
+
+        self.assertEqual(len(user_data["organizations"]), 1)
+
+        organization = user_data["organizations"][0]
+
+        self.assertEqual(
+            organization["id"],
+            str(self.organization.id),
+        )
+
+        self.assertEqual(
+            organization["role"],
+            OrganizationMembership.Role.OWNER,
+        )
+
+    def test_logout_requires_csrf_token(self):
+        login_response = self.login_user()
+
+        self.assertEqual(login_response.status_code, 200)
+
+        response = self.client.post(
+            self.logout_url,
+            {},
+            format="json",
+        )
+
+        self.assertEqual(response.status_code, 403)
+
+    def test_logout_ends_authenticated_session(self):
+        login_response = self.login_user()
+
+        self.assertEqual(login_response.status_code, 200)
+
+        csrf_token = login_response.data["csrfToken"]
+
+        logout_response = self.client.post(
+            self.logout_url,
+            {},
+            format="json",
+            HTTP_X_CSRFTOKEN=csrf_token,
+        )
+
+        self.assertEqual(logout_response.status_code, 200)
+
+        current_user_response = self.client.get(self.me_url)
+
+        self.assertEqual(
+            current_user_response.status_code,
+            403,
+        )
+
+
+class GroqStrictOutputTests(SimpleTestCase):
+
+    def test_strict_schema_requires_every_property(self):
+        original_schema = InvoiceExtractionResult.model_json_schema()
+
+        schema = build_groq_strict_schema(original_schema)
+
+        self.assertEqual(
+            set(schema["required"]),
+            set(schema["properties"]),
+        )
+
+        self.assertEqual(
+            schema["properties"]["field_confidence"]["type"],
+            "array",
+        )
+
+        self.assertEqual(
+            schema["properties"]["field_evidence"]["type"],
+            "array",
+        )
+
+        def inspect_objects(node):
+            if isinstance(node, dict):
+
+                if node.get("type") == "object" or "properties" in node:
+                    properties = node.get("properties", {})
+
+                    self.assertIs(
+                        node.get("additionalProperties"),
+                        False,
+                    )
+
+                    self.assertEqual(
+                        set(node.get("required", [])),
+                        set(properties),
+                    )
+
+                for value in node.values():
+                    inspect_objects(value)
+
+            elif isinstance(node, list):
+                for item in node:
+                    inspect_objects(item)
+
+        inspect_objects(schema)
+
+    def test_original_pydantic_schema_is_not_modified(self):
+        original_schema = InvoiceExtractionResult.model_json_schema()
+
+        original_confidence_schema = original_schema["properties"][
+            "field_confidence"
+        ].copy()
+
+        build_groq_strict_schema(original_schema)
+
+        self.assertEqual(
+            original_schema["properties"]["field_confidence"],
+            original_confidence_schema,
+        )
+
+    def test_normalize_confidence_and_evidence_arrays(self):
+        payload = {
+            "field_confidence": [
+                {
+                    "field": "total_amount",
+                    "confidence": 0.99,
+                }
+            ],
+            "field_evidence": [
+                {
+                    "field": "total_amount",
+                    "evidence": [
+                        {
+                            "page": 1,
+                            "quote": "Total (NGN): 322,500.00",
+                        }
+                    ],
+                }
+            ],
+        }
+
+        result = normalize_groq_extraction(payload)
+
+        self.assertEqual(
+            result["field_confidence"],
+            {"total_amount": 0.99},
+        )
+
+        self.assertEqual(
+            result["field_evidence"]["total_amount"][0]["page"],
+            1,
+        )
+
+    def test_duplicate_confidence_fields_are_rejected(self):
+        payload = {
+            "field_confidence": [
+                {"field": "total_amount", "confidence": 0.9},
+                {"field": "total_amount", "confidence": 0.8},
+            ],
+            "field_evidence": [],
+        }
+
+        with self.assertRaises(GroqProviderError):
+            normalize_groq_extraction(payload)
+
+    def test_invalid_evidence_structure_is_rejected(self):
+        payload = {
+            "field_confidence": [],
+            "field_evidence": "invalid",
+        }
+
+        with self.assertRaises(GroqProviderError):
+            normalize_groq_extraction(payload)
+
+    def test_provider_uses_groq_strict_structured_output(self):
+        with patch(
+            "invoices.providers.groq_provider.Groq"
+        ) as groq_factory:
+
+            message = Mock()
+            message.content = (
+                '{"field_confidence": [], "field_evidence": []}'
+            )
+            message.refusal = None
+
+            choice = Mock()
+            choice.message = message
+            choice.finish_reason = "stop"
+
+            groq_factory.return_value.chat.completions.create.return_value.choices = [
+                choice
+            ]
+
+            provider = GroqInvoiceExtractionProvider(
+                api_key="test-key",
+                model="openai/gpt-oss-20b",
+            )
+
+            result = provider.extract_invoice(
+                document_text="Sample invoice text.",
+                instructions="Extract invoice information.",
+                response_schema=InvoiceExtractionResult.model_json_schema(),
+            )
+
+            call_kwargs = (
+                groq_factory.return_value
+                .chat.completions.create.call_args.kwargs
+            )
+
+            response_format = call_kwargs["response_format"]
+
+            self.assertIs(
+                response_format["json_schema"]["strict"],
+                True,
+            )
+
+            self.assertEqual(
+                result["field_confidence"],
+                {},
+            )
+
+            self.assertEqual(
+                result["field_evidence"],
+                {},
+            )
+
+            self.assertEqual(
+                call_kwargs["max_completion_tokens"],
+                4096,
+            )
+
 
 class InvoiceExtractionSchemaTests(SimpleTestCase):
 
@@ -1307,6 +1694,355 @@ class InvoiceQueueAPITests(TestCase):
             event.status,
             OutboxEvent.Status.PENDING,
         )
+
+
+
+class InvoiceListAPITests(TestCase):
+
+    def setUp(self):
+        self.user = get_user_model().objects.create_user(
+            username="list_operator",
+            password="test-password-123",
+        )
+
+        self.organization = Organization.objects.create(
+            name="Invoice List Company",
+            slug="invoice-list-company",
+        )
+
+        self.membership = OrganizationMembership.objects.create(
+            organization=self.organization,
+            user=self.user,
+            role=OrganizationMembership.Role.OWNER,
+        )
+
+        self.other_organization = Organization.objects.create(
+            name="Another Company",
+            slug="another-invoice-company",
+        )
+
+        self.vendor = Vendor.objects.create(
+            organization=self.organization,
+            legal_name="ABC Engineering Limited",
+            display_name="ABC Engineering",
+            is_active=True,
+        )
+
+        self.client = APIClient()
+        self.client.force_authenticate(user=self.user)
+
+        self.list_url = reverse(
+            "invoice-list",
+            kwargs={
+                "organization_id": self.organization.id,
+            },
+        )
+
+    def create_invoice(
+        self,
+        invoice_number,
+        *,
+        organization=None,
+        vendor=None,
+        invoice_date=None,
+        status=None,
+    ):
+        return Invoice.objects.create(
+            organization=organization or self.organization,
+            vendor=vendor,
+            invoice_number=invoice_number,
+            invoice_date=invoice_date,
+            currency="NGN",
+            total_amount=Decimal("1000.00"),
+            status=status or Invoice.Status.UPLOADED,
+        )
+
+    def test_active_member_can_list_organization_invoices(self):
+        invoice = self.create_invoice("INV-001")
+
+        response = self.client.get(self.list_url)
+
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual(response.data["count"], 1)
+
+        result = response.data["results"][0]
+
+        self.assertEqual(result["id"], str(invoice.id))
+        self.assertEqual(result["invoice_number"], "INV-001")
+        self.assertEqual(
+            result["vendor"],
+            None,
+        )
+        self.assertEqual(result["currency"], "NGN")
+        self.assertEqual(result["total_amount"], "1000.00")
+
+    def test_read_only_member_can_list_invoices(self):
+        self.membership.role = OrganizationMembership.Role.READ_ONLY
+        self.membership.save()
+
+        self.create_invoice("INV-READ-001")
+
+        response = self.client.get(self.list_url)
+
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual(response.data["count"], 1)
+
+    def test_inactive_member_cannot_list_invoices(self):
+        self.membership.is_active = False
+        self.membership.save()
+
+        response = self.client.get(self.list_url)
+
+        self.assertEqual(response.status_code, 404)
+
+    def test_foreign_organization_invoices_are_not_returned(self):
+        own_invoice = self.create_invoice("OWN-001")
+
+        foreign_invoice = self.create_invoice(
+            "FOREIGN-001",
+            organization=self.other_organization,
+        )
+
+        response = self.client.get(self.list_url)
+
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual(response.data["count"], 1)
+
+        returned_ids = {
+            item["id"]
+            for item in response.data["results"]
+        }
+
+        self.assertIn(str(own_invoice.id), returned_ids)
+        self.assertNotIn(str(foreign_invoice.id), returned_ids)
+
+    def test_member_cannot_access_another_organization_list(self):
+        foreign_url = reverse(
+            "invoice-list",
+            kwargs={
+                "organization_id": self.other_organization.id,
+            },
+        )
+
+        response = self.client.get(foreign_url)
+
+        self.assertEqual(response.status_code, 404)
+
+    def test_search_matches_invoice_number_and_vendor_names(self):
+        invoice = self.create_invoice(
+            "ACME-001",
+            vendor=self.vendor,
+        )
+
+        self.create_invoice("OTHER-001")
+
+        search_queries = [
+            "ACME-001",
+            "ABC Engineering",
+            "ABC Engineering Limited",
+            "abc engineering",
+        ]
+
+        for query in search_queries:
+            with self.subTest(search=query):
+                response = self.client.get(
+                    self.list_url,
+                    {"search": query},
+                )
+
+                self.assertEqual(response.status_code, 200)
+                self.assertEqual(response.data["count"], 1)
+
+                self.assertEqual(
+                    response.data["results"][0]["id"],
+                    str(invoice.id),
+                )
+
+    def test_status_filter_returns_matching_invoices(self):
+        self.create_invoice(
+            "REVIEW-001",
+            status=Invoice.Status.NEEDS_REVIEW,
+        )
+
+        self.create_invoice(
+            "APPROVED-001",
+            status=Invoice.Status.APPROVED,
+        )
+
+        response = self.client.get(
+            self.list_url,
+            {"status": Invoice.Status.NEEDS_REVIEW},
+        )
+
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual(response.data["count"], 1)
+
+        self.assertEqual(
+            response.data["results"][0]["status"],
+            Invoice.Status.NEEDS_REVIEW,
+        )
+
+    def test_invalid_status_filter_returns_400(self):
+        response = self.client.get(
+            self.list_url,
+            {"status": "not_a_real_status"},
+        )
+
+        self.assertEqual(response.status_code, 400)
+        self.assertIn("status", response.data)
+
+    def test_invoice_date_range_filter(self):
+        self.create_invoice(
+            "NOV-001",
+            invoice_date="2026-11-01",
+        )
+
+        self.create_invoice(
+            "NOV-002",
+            invoice_date="2026-11-15",
+        )
+
+        self.create_invoice(
+            "DEC-001",
+            invoice_date="2026-12-01",
+        )
+
+        response = self.client.get(
+            self.list_url,
+            {
+                "invoice_date_from": "2026-11-01",
+                "invoice_date_to": "2026-11-30",
+            },
+        )
+
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual(response.data["count"], 2)
+
+        returned_numbers = {
+            item["invoice_number"]
+            for item in response.data["results"]
+        }
+
+        self.assertEqual(
+            returned_numbers,
+            {"NOV-001", "NOV-002"},
+        )
+
+    def test_invalid_invoice_date_returns_400(self):
+        response = self.client.get(
+            self.list_url,
+            {"invoice_date_from": "not-a-date"},
+        )
+
+        self.assertEqual(response.status_code, 400)
+        self.assertIn("invoice_date_from", response.data)
+
+    def test_start_date_after_end_date_returns_400(self):
+        response = self.client.get(
+            self.list_url,
+            {
+                "invoice_date_from": "2026-11-30",
+                "invoice_date_to": "2026-11-01",
+            },
+        )
+
+        self.assertEqual(response.status_code, 400)
+
+    def test_search_status_and_date_filters_can_be_combined(self):
+        matching_invoice = self.create_invoice(
+            "ABC-NOV-001",
+            vendor=self.vendor,
+            invoice_date="2026-11-15",
+            status=Invoice.Status.NEEDS_REVIEW,
+        )
+
+        self.create_invoice(
+            "ABC-DEC-001",
+            vendor=self.vendor,
+            invoice_date="2026-12-01",
+            status=Invoice.Status.NEEDS_REVIEW,
+        )
+
+        self.create_invoice(
+            "ABC-NOV-002",
+            vendor=self.vendor,
+            invoice_date="2026-11-15",
+            status=Invoice.Status.APPROVED,
+        )
+
+        response = self.client.get(
+            self.list_url,
+            {
+                "search": "ABC",
+                "status": Invoice.Status.NEEDS_REVIEW,
+                "invoice_date_from": "2026-11-01",
+                "invoice_date_to": "2026-11-30",
+            },
+        )
+
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual(response.data["count"], 1)
+
+        self.assertEqual(
+            response.data["results"][0]["id"],
+            str(matching_invoice.id),
+        )
+
+    def test_default_pagination_returns_twenty_invoices(self):
+        for number in range(23):
+            self.create_invoice(
+                f"PAGINATION-{number:03d}"
+            )
+
+        response = self.client.get(self.list_url)
+
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual(response.data["count"], 23)
+        self.assertEqual(len(response.data["results"]), 20)
+
+        self.assertIsNotNone(response.data["next"])
+        self.assertIsNone(response.data["previous"])
+
+        second_page = self.client.get(
+            self.list_url,
+            {"page": 2},
+        )
+
+        self.assertEqual(second_page.status_code, 200)
+        self.assertEqual(len(second_page.data["results"]), 3)
+
+        self.assertIsNone(second_page.data["next"])
+        self.assertIsNotNone(second_page.data["previous"])
+
+    def test_custom_page_size_is_supported(self):
+        for number in range(5):
+            self.create_invoice(f"CUSTOM-PAGE-{number:03d}")
+
+        response = self.client.get(
+            self.list_url,
+            {"page_size": 2},
+        )
+
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual(response.data["count"], 5)
+        self.assertEqual(len(response.data["results"]), 2)
+        self.assertIsNotNone(response.data["next"])
+
+    def test_invoice_without_vendor_is_included(self):
+        invoice = self.create_invoice("UNASSIGNED-001")
+
+        response = self.client.get(self.list_url)
+
+        self.assertEqual(response.status_code, 200)
+
+        result = next(
+            item
+            for item in response.data["results"]
+            if item["id"] == str(invoice.id)
+        )
+
+        self.assertIsNone(result["vendor"])
+
 
 
 class InvoiceOutboxTests(TestCase):

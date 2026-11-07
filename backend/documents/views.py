@@ -11,6 +11,8 @@ from rest_framework.permissions import IsAuthenticated
 from rest_framework.response import Response
 from rest_framework.views import APIView
 
+from django.http import FileResponse
+
 from organizations.models import OrganizationMembership
 from documents.models import Document
 from documents.services import (
@@ -176,3 +178,79 @@ class InvoiceDocumentUploadAPIView(APIView):
             },
             status=status.HTTP_201_CREATED,
         )
+
+
+
+class InvoiceDocumentPreviewAPIView(APIView):
+    """
+    Stream an organization's PDF document to an authenticated member.
+
+    Access is scoped by active organization membership and document
+    ownership. The original storage URL is never exposed.
+    """
+
+    authentication_classes = [
+        SessionAuthentication,
+        BasicAuthentication,
+    ]
+
+    permission_classes = [IsAuthenticated]
+
+    def get(self, request, organization_id, document_id):
+
+        membership = OrganizationMembership.objects.filter(
+            organization_id=organization_id,
+            user=request.user,
+            is_active=True,
+        ).first()
+
+        if membership is None:
+            return Response(
+                {"detail": "Organization not found or access denied."},
+                status=status.HTTP_404_NOT_FOUND,
+            )
+
+        document = Document.objects.filter(
+            pk=document_id,
+            organization_id=organization_id,
+        ).first()
+
+        if document is None:
+            return Response(
+                {"detail": "Document not found."},
+                status=status.HTTP_404_NOT_FOUND,
+            )
+
+        # Only serve documents that are recorded as PDFs.
+        if (
+            document.content_type != "application/pdf"
+            or not document.file
+        ):
+            return Response(
+                {"detail": "PDF document is unavailable."},
+                status=status.HTTP_404_NOT_FOUND,
+            )
+
+        try:
+            file_handle = document.file.open("rb")
+
+        except (FileNotFoundError, OSError):
+            return Response(
+                {"detail": "The stored PDF file could not be found."},
+                status=status.HTTP_404_NOT_FOUND,
+            )
+
+        response = FileResponse(
+            file_handle,
+            as_attachment=False,
+            filename=document.original_filename,
+            content_type="application/pdf",
+        )
+
+        response["Cache-Control"] = "private, no-store"
+        response["X-Content-Type-Options"] = "nosniff"
+
+        # Permit embedding in the same-origin FIN-01 review page.
+        response["X-Frame-Options"] = "SAMEORIGIN"
+
+        return response

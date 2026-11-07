@@ -1,10 +1,179 @@
 import json
 import logging
+from copy import deepcopy
 
 from groq import APIError, Groq
 
 
 logger = logging.getLogger(__name__)
+
+
+def _prepare_strict_schema_node(node):
+    """
+    Recursively prepare a JSON Schema object for Groq strict mode.
+
+    All properties must be required, and all objects must be closed.
+    Application-level Pydantic validation remains authoritative.
+    """
+
+    if not isinstance(node, dict):
+        return
+
+    # These are not needed by the model-facing schema.
+    # The original Pydantic model retains its validation constraints.
+    for keyword in (
+        "title",
+        "default",
+        "minLength",
+        "maxLength",
+    ):
+        node.pop(keyword, None)
+
+    if node.get("type") == "object" or "properties" in node:
+        properties = node.get("properties", {})
+
+        node["additionalProperties"] = False
+        node["required"] = list(properties.keys())
+
+    # Visit nested schemas, array items, unions and definitions.
+    for value in node.values():
+        if isinstance(value, dict):
+            _prepare_strict_schema_node(value)
+
+        elif isinstance(value, list):
+            for item in value:
+                if isinstance(item, dict):
+                    _prepare_strict_schema_node(item)
+
+
+def build_groq_strict_schema(response_schema):
+    """
+    Build a provider-specific schema without changing the
+    application's InvoiceExtractionResult schema.
+    """
+
+    schema = deepcopy(response_schema)
+
+    properties = schema.get("properties")
+
+    if not isinstance(properties, dict):
+        raise ValueError(
+            "Invoice extraction schema must contain root properties."
+        )
+
+    # Convert dynamic confidence dictionary into an explicit array.
+    properties["field_confidence"] = {
+        "type": "array",
+        "description": (
+            "Confidence scores for extracted invoice fields. "
+            "Return an empty array when no confidence scores are available."
+        ),
+        "items": {
+            "type": "object",
+            "properties": {
+                "field": {
+                    "type": "string",
+                },
+                "confidence": {
+                    "type": "number",
+                    "minimum": 0,
+                    "maximum": 1,
+                },
+            },
+            "required": [
+                "field",
+                "confidence",
+            ],
+            "additionalProperties": False,
+        },
+    }
+
+    # Convert dynamic evidence dictionary into an explicit array.
+    properties["field_evidence"] = {
+        "type": "array",
+        "description": (
+            "Evidence grouped by extracted invoice field. "
+            "Return an empty array when no evidence is available."
+        ),
+        "items": {
+            "type": "object",
+            "properties": {
+                "field": {
+                    "type": "string",
+                },
+                "evidence": {
+                    "type": "array",
+                    "items": {
+                        "$ref": "#/$defs/SourceEvidence",
+                    },
+                },
+            },
+            "required": [
+                "field",
+                "evidence",
+            ],
+            "additionalProperties": False,
+        },
+    }
+
+    _prepare_strict_schema_node(schema)
+
+    return schema
+
+
+def normalize_groq_extraction(payload):
+    """
+    Convert Groq's array-based representation back into
+    the dictionaries expected by InvoiceExtractionResult.
+    """
+
+    normalized = dict(payload)
+
+    mappings = {
+        "field_confidence": "confidence",
+        "field_evidence": "evidence",
+    }
+
+    for field_name, value_name in mappings.items():
+
+        records = normalized.get(field_name)
+
+        if not isinstance(records, list):
+            raise GroqProviderError(
+                f"Groq returned an invalid {field_name} structure."
+            )
+
+        restored = {}
+
+        for record in records:
+
+            if not isinstance(record, dict):
+                raise GroqProviderError(
+                    f"Groq returned an invalid entry in {field_name}."
+                )
+
+            field = record.get("field")
+
+            if not isinstance(field, str) or not field.strip():
+                raise GroqProviderError(
+                    f"Groq returned an invalid field name in {field_name}."
+                )
+
+            if field in restored:
+                raise GroqProviderError(
+                    f"Groq returned duplicate entries for {field}."
+                )
+
+            if value_name not in record:
+                raise GroqProviderError(
+                    f"Groq omitted {value_name} for {field}."
+                )
+
+            restored[field] = record[value_name]
+
+        normalized[field_name] = restored
+
+    return normalized
 
 
 class GroqProviderError(Exception):
@@ -54,6 +223,23 @@ class GroqInvoiceExtractionProvider:
                 "Document text cannot be empty."
             )
 
+        groq_schema = build_groq_strict_schema(response_schema)
+
+        provider_instructions = instructions + """
+
+        GROQ RESPONSE FORMAT:
+
+        - Return every property defined in the response schema.
+        - Use null for unavailable nullable values.
+        - field_confidence must be an array of objects containing
+        field and confidence.
+        - field_evidence must be an array of objects containing
+        field and evidence.
+        - Use an empty array when no confidence or evidence entries
+        are available.
+        - Do not invent extracted values or supporting evidence.
+        """
+
         try:
 
             response = self.client.chat.completions.create(
@@ -63,7 +249,7 @@ class GroqInvoiceExtractionProvider:
                 messages=[
                     {
                         "role": "system",
-                        "content": instructions,
+                        "content": provider_instructions,
                     },
                     {
                         "role": "user",
@@ -83,11 +269,11 @@ class GroqInvoiceExtractionProvider:
                     "type": "json_schema",
                     "json_schema": {
                         "name": "invoice_extraction",
-                        "strict": False,
-                        "schema": response_schema,
+                        "strict": True,
+                        "schema": groq_schema,
                     },
                 },
-
+                max_completion_tokens=4096,
                 temperature=0,
             )
 
@@ -140,4 +326,4 @@ class GroqInvoiceExtractionProvider:
                 "Groq response must be a JSON object."
             )
 
-        return result
+        return normalize_groq_extraction(result)

@@ -4,6 +4,11 @@ from uuid import uuid4
 from django.db import transaction
 from django.utils import timezone
 
+from django.db.models import Q
+from django.utils.dateparse import parse_date
+
+from rest_framework.pagination import PageNumberPagination
+
 from rest_framework import status
 from rest_framework.authentication import (
     BasicAuthentication,
@@ -310,6 +315,197 @@ class InvoiceProcessingAPIView(OrganizationInvoiceAPIView):
             status=status.HTTP_202_ACCEPTED,
         )
 
+
+class InvoiceListPagination(PageNumberPagination):
+    page_size = 20
+    page_size_query_param = "page_size"
+    max_page_size = 100
+
+
+class InvoiceListAPIView(OrganizationInvoiceAPIView):
+
+    def get(self, request, organization_id):
+
+        membership = self.get_membership(
+            request,
+            organization_id,
+        )
+
+        if membership is None:
+            return Response(
+                {"detail": "Organization not found or access denied."},
+                status=status.HTTP_404_NOT_FOUND,
+            )
+
+        queryset = (
+            Invoice.objects
+            .filter(organization_id=organization_id)
+            .select_related("vendor", "source_document")
+            .order_by("-created_at", "-id")
+        )
+
+        # Search by invoice number or supplier name.
+        search = request.query_params.get("search", "").strip()
+
+        if search:
+            queryset = queryset.filter(
+                Q(invoice_number__icontains=search)
+                | Q(vendor__legal_name__icontains=search)
+                | Q(vendor__display_name__icontains=search)
+            )
+
+        # Filter by invoice status.
+        status_filter = request.query_params.get("status", "").strip()
+
+        if status_filter:
+            valid_statuses = {
+                value for value, _ in Invoice.Status.choices
+            }
+
+            if status_filter not in valid_statuses:
+                return Response(
+                    {
+                        "status": [
+                            "Invalid invoice status."
+                        ]
+                    },
+                    status=status.HTTP_400_BAD_REQUEST,
+                )
+
+            queryset = queryset.filter(status=status_filter)
+
+        # Parse optional date filters.
+        date_from_raw = request.query_params.get(
+            "invoice_date_from"
+        )
+
+        date_to_raw = request.query_params.get(
+            "invoice_date_to"
+        )
+
+        date_from = None
+        date_to = None
+
+        if date_from_raw:
+            date_from = parse_date(date_from_raw)
+
+            if date_from is None:
+                return Response(
+                    {
+                        "invoice_date_from": [
+                            "Use the YYYY-MM-DD date format."
+                        ]
+                    },
+                    status=status.HTTP_400_BAD_REQUEST,
+                )
+
+        if date_to_raw:
+            date_to = parse_date(date_to_raw)
+
+            if date_to is None:
+                return Response(
+                    {
+                        "invoice_date_to": [
+                            "Use the YYYY-MM-DD date format."
+                        ]
+                    },
+                    status=status.HTTP_400_BAD_REQUEST,
+                )
+
+        if date_from and date_to and date_from > date_to:
+            return Response(
+                {
+                    "detail": (
+                        "invoice_date_from cannot be after "
+                        "invoice_date_to."
+                    )
+                },
+                status=status.HTTP_400_BAD_REQUEST,
+            )
+
+        if date_from:
+            queryset = queryset.filter(
+                invoice_date__gte=date_from
+            )
+
+        if date_to:
+            queryset = queryset.filter(
+                invoice_date__lte=date_to
+            )
+
+        # Paginate results.
+        paginator = InvoiceListPagination()
+
+        page = paginator.paginate_queryset(
+            queryset,
+            request,
+            view=self,
+        )
+
+        results = []
+
+        for invoice in page:
+
+            vendor = invoice.vendor
+            document = invoice.source_document
+
+            results.append(
+                {
+                    "id": str(invoice.id),
+                    "invoice_number": invoice.invoice_number,
+                    "vendor": (
+                        {
+                            "id": str(vendor.id),
+                            "name": (
+                                vendor.display_name
+                                or vendor.legal_name
+                            ),
+                        }
+                        if vendor
+                        else None
+                    ),
+                    "invoice_date": (
+                        invoice.invoice_date.isoformat()
+                        if invoice.invoice_date
+                        else None
+                    ),
+                    "due_date": (
+                        invoice.due_date.isoformat()
+                        if invoice.due_date
+                        else None
+                    ),
+                    "currency": invoice.currency,
+                    "subtotal": (
+                        str(invoice.subtotal)
+                        if invoice.subtotal is not None
+                        else None
+                    ),
+                    "total_amount": (
+                        str(invoice.total_amount)
+                        if invoice.total_amount is not None
+                        else None
+                    ),
+                    "amount_due": (
+                        str(invoice.amount_due)
+                        if invoice.amount_due is not None
+                        else None
+                    ),
+                    "status": invoice.status,
+                    "document": (
+                        {
+                            "id": str(document.id),
+                            "filename": document.original_filename,
+                            "status": document.status,
+                        }
+                        if document
+                        else None
+                    ),
+                    "created_at": invoice.created_at.isoformat(),
+                }
+            )
+
+        return paginator.get_paginated_response(results)
+     
 
 class InvoiceProcessingStatusAPIView(OrganizationInvoiceAPIView):  
 

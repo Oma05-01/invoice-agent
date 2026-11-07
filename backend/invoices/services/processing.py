@@ -654,3 +654,4 @@ def process_invoice(
             )
 
         raise
+

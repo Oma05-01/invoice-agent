@@ -1,14 +1,15 @@
 from django.urls import path
 
 from invoices.views import (
+    InvoiceListAPIView,
     InvoiceProcessingAPIView,
     InvoiceProcessingStatusAPIView,
     InvoiceReviewDetailAPIView,
     InvoiceVendorResolutionAPIView,
     InvoiceLineItemCollectionAPIView,
     InvoiceLineItemDetailAPIView,
-    InvoiceValidationIssueIgnoreAPIView, 
-    InvoiceReviewSubmissionAPIView
+    InvoiceValidationIssueIgnoreAPIView,
+    InvoiceReviewSubmissionAPIView,
 )
 
 
@@ -55,6 +56,11 @@ urlpatterns = [
         "organizations/<uuid:organization_id>/invoices/<uuid:invoice_id>/submit-review/",
         InvoiceReviewSubmissionAPIView.as_view(),
         name="invoice-review-submit",
+    ),
+    path(
+        "organizations/<uuid:organization_id>/invoices/",
+        InvoiceListAPIView.as_view(),
+        name="invoice-list",
     ),
 ]
 

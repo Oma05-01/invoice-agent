@@ -2,7 +2,7 @@ import shutil
 import tempfile
 
 import pymupdf
-
+import uuid
 from django.contrib.auth import get_user_model
 from django.core.files.uploadedfile import SimpleUploadedFile
 from django.test import TestCase, override_settings
@@ -238,3 +238,229 @@ class InvoiceDocumentUploadTests(TestCase):
 
         self.assertEqual(Document.objects.count(), 2)
         self.assertEqual(Invoice.objects.count(), 2)
+
+
+
+class InvoiceDocumentPreviewTests(TestCase):
+
+    def setUp(self):
+        self.media_directory = tempfile.mkdtemp()
+
+        self.settings_override = override_settings(
+            MEDIA_ROOT=self.media_directory,
+        )
+        self.settings_override.enable()
+
+        self.user = User.objects.create_user(
+            username="preview_user",
+            password="test-password-123",
+        )
+
+        self.organization = Organization.objects.create(
+            name="Preview Test Company",
+            slug="preview-test-company",
+        )
+
+        self.membership = OrganizationMembership.objects.create(
+            organization=self.organization,
+            user=self.user,
+            role=OrganizationMembership.Role.OWNER,
+            is_active=True,
+        )
+
+        self.client = APIClient()
+        self.client.force_authenticate(user=self.user)
+
+        self.pdf_content = self.generate_pdf()
+        self.document = self.create_document()
+
+        self.url = reverse(
+            "invoice-document-preview",
+            kwargs={
+                "organization_id": self.organization.id,
+                "document_id": self.document.id,
+            },
+        )
+
+    def tearDown(self):
+        self.settings_override.disable()
+        shutil.rmtree(self.media_directory, ignore_errors=True)
+        super().tearDown()
+
+    @staticmethod
+    def generate_pdf():
+        pdf = pymupdf.open()
+        page = pdf.new_page()
+
+        page.insert_text(
+            (72, 72),
+            "SUPPLIER INVOICE\nInvoice Number: PREVIEW-001",
+        )
+
+        content = pdf.tobytes()
+        pdf.close()
+
+        return content
+
+    def create_document(self):
+        return Document.objects.create(
+            organization=self.organization,
+            uploaded_by=self.user,
+            original_filename="preview_invoice.pdf",
+            file=SimpleUploadedFile(
+                "preview_invoice.pdf",
+                self.pdf_content,
+                content_type="application/pdf",
+            ),
+            content_type="application/pdf",
+            file_size=len(self.pdf_content),
+            sha256=None,
+            source=Document.Source.UPLOAD,
+            status=Document.Status.PROCESSED,
+        )
+
+    def test_authorized_member_can_preview_pdf(self):
+        
+        response = self.client.get(self.url)
+        file_to_stream = getattr(response, "file_to_stream", None)
+
+        try:
+            self.assertEqual(response.status_code, 200)
+
+            self.assertEqual(
+                response["Content-Type"],
+                "application/pdf",
+            )
+
+            self.assertIn(
+                "inline",
+                response["Content-Disposition"],
+            )
+
+            self.assertEqual(
+                response["Cache-Control"],
+                "private, no-store",
+            )
+
+            self.assertEqual(
+                response["X-Frame-Options"],
+                "SAMEORIGIN",
+            )
+
+            content = b"".join(response.streaming_content)
+
+            self.assertEqual(content, self.pdf_content)
+
+        finally:
+            if file_to_stream is not None:
+                file_to_stream.close()
+
+    def test_read_only_member_can_preview_pdf(self):
+        self.membership.role = (
+            OrganizationMembership.Role.READ_ONLY
+        )
+        self.membership.save(update_fields=["role"])
+
+        response = self.client.get(self.url)
+        file_to_stream = getattr(response, "file_to_stream", None)
+
+        try:
+            self.assertEqual(response.status_code, 200)
+        finally:
+            if file_to_stream is not None:
+                file_to_stream.close()
+    
+    def test_inactive_member_cannot_preview_pdf(self):
+        self.membership.is_active = False
+        self.membership.save(update_fields=["is_active"])
+
+        response = self.client.get(self.url)
+
+        self.assertEqual(response.status_code, 404)
+
+    def test_user_without_membership_cannot_preview_pdf(self):
+        other_user = User.objects.create_user(
+            username="unauthorized_preview_user",
+            password="test-password-123",
+        )
+
+        self.client.force_authenticate(user=other_user)
+
+        response = self.client.get(self.url)
+
+        self.assertEqual(response.status_code, 404)
+
+    def test_other_organization_document_cannot_be_previewed(self):
+        other_organization = Organization.objects.create(
+            name="Another Preview Company",
+            slug="another-preview-company",
+        )
+
+        other_document = Document.objects.create(
+            organization=other_organization,
+            uploaded_by=self.user,
+            original_filename="other_invoice.pdf",
+            file=SimpleUploadedFile(
+                "other_invoice.pdf",
+                self.pdf_content,
+                content_type="application/pdf",
+            ),
+            content_type="application/pdf",
+            file_size=len(self.pdf_content),
+            status=Document.Status.PROCESSED,
+        )
+
+        foreign_url = reverse(
+            "invoice-document-preview",
+            kwargs={
+                "organization_id": self.organization.id,
+                "document_id": other_document.id,
+            },
+        )
+
+        response = self.client.get(foreign_url)
+
+        self.assertEqual(response.status_code, 404)
+
+    def test_missing_document_returns_404(self):
+        url = reverse(
+            "invoice-document-preview",
+            kwargs={
+                "organization_id": self.organization.id,
+                "document_id": uuid.uuid4(),
+            },
+        )
+
+        response = self.client.get(url)
+
+        self.assertEqual(response.status_code, 404)
+
+    def test_unauthenticated_user_cannot_preview_pdf(self):
+        anonymous_client = APIClient()
+
+        response = anonymous_client.get(self.url)
+
+        self.assertEqual(response.status_code, 403)
+
+    def test_missing_stored_file_returns_404(self):
+        missing_document = Document.objects.create(
+            organization=self.organization,
+            uploaded_by=self.user,
+            original_filename="missing_invoice.pdf",
+            file="documents/missing_invoice.pdf",
+            content_type="application/pdf",
+            file_size=100,
+            status=Document.Status.PROCESSED,
+        )
+
+        url = reverse(
+            "invoice-document-preview",
+            kwargs={
+                "organization_id": self.organization.id,
+                "document_id": missing_document.id,
+            },
+        )
+
+        response = self.client.get(url)
+
+        self.assertEqual(response.status_code, 404)
