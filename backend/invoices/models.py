@@ -6,7 +6,9 @@ from django.db.models import Q
 from organizations.models import TimeStampedUUIDModel, Organization
 from vendors.models import Vendor
 from documents.models import Document
+import uuid
 
+from django.utils import timezone
 
 class Invoice(TimeStampedUUIDModel):
 
@@ -280,6 +282,10 @@ class InvoiceValidationIssue(TimeStampedUUIDModel):
 
     details = models.JSONField(default=dict)
 
+    decision_reason = models.TextField(
+        blank=True,
+    )
+
     status = models.CharField(
         max_length=20,
         choices=Status.choices,
@@ -311,3 +317,87 @@ class InvoiceValidationIssue(TimeStampedUUIDModel):
 
     def __str__(self):
         return f"{self.code}: {self.invoice}"
+
+
+class OutboxEvent(models.Model):
+
+    class Status(models.TextChoices):
+        PENDING = "pending", "Pending"
+        DISPATCHING = "dispatching", "Dispatching"
+        PUBLISHED = "published", "Published"
+        FAILED = "failed", "Failed"
+
+    id = models.UUIDField(
+        primary_key=True,
+        default=uuid.uuid4,
+        editable=False,
+    )
+
+    event_type = models.CharField(
+        max_length=100,
+    )
+
+    aggregate_id = models.UUIDField(
+        db_index=True,
+    )
+
+    idempotency_key = models.CharField(
+        max_length=255,
+        unique=True,
+    )
+
+    payload = models.JSONField(default=dict)
+
+    status = models.CharField(
+        max_length=20,
+        choices=Status.choices,
+        default=Status.PENDING,
+    )
+
+    attempts = models.PositiveSmallIntegerField(
+        default=0,
+    )
+
+    available_at = models.DateTimeField(
+        default=timezone.now,
+    )
+
+    locked_at = models.DateTimeField(
+        null=True,
+        blank=True,
+    )
+
+    published_at = models.DateTimeField(
+        null=True,
+        blank=True,
+    )
+
+    last_error = models.TextField(blank=True)
+
+    created_at = models.DateTimeField(
+        auto_now_add=True,
+    )
+
+    updated_at = models.DateTimeField(
+        auto_now=True,
+    )
+
+    class Meta:
+        ordering = ["created_at"]
+
+        indexes = [
+            models.Index(
+                fields=["status", "available_at"],
+                name="outbox_status_available_idx",
+            ),
+            models.Index(
+                fields=["status", "locked_at"],
+                name="outbox_status_locked_idx",
+            ),
+        ]
+
+    def __str__(self):
+        return (
+            f"{self.event_type} "
+            f"({self.aggregate_id}) - {self.status}"
+        )
