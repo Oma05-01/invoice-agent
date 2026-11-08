@@ -56,6 +56,7 @@ INSTALLED_APPS = [
     "invoices.apps.InvoicesConfig",
     "approvals.apps.ApprovalsConfig",
     "auditlog.apps.AuditlogConfig",
+    "accounting.apps.AccountingConfig",
 ]
 
 MIDDLEWARE = [

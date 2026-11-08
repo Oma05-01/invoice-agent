@@ -1,7 +1,7 @@
 import logging
 from uuid import uuid4
 
-from django.db import transaction
+from django.db import transaction, IntegrityError
 from django.utils import timezone
 
 from django.db.models import Q
@@ -30,6 +30,7 @@ from invoices.services.review import (
     correct_invoice_header,
     InvoiceReviewStateError,
     InvoiceCorrectionNoChanges,
+    InvoiceDuplicateVendorInvoiceNumber,
 )
 
 from invoices.serializers import (VendorResolutionSerializer, InvoiceLineItemCorrectionSerializer,
@@ -1029,6 +1030,50 @@ class InvoiceVendorResolutionAPIView(OrganizationInvoiceAPIView):
                 status=status.HTTP_404_NOT_FOUND,
             )
 
+        except InvoiceDuplicateVendorInvoiceNumber as exc:
+            return Response(
+                {
+                    "code": "DUPLICATE_VENDOR_INVOICE_NUMBER",
+                    "detail": str(exc),
+                    "conflicting_invoice_id": str(
+                        exc.existing_invoice.id
+                    ),
+                },
+                status=status.HTTP_409_CONFLICT,
+            )
+
+        except IntegrityError as exc:
+            # The database constraint remains the final
+            # protection against concurrent assignments.
+            constraint_name = getattr(
+                getattr(exc.__cause__, "diag", None),
+                "constraint_name",
+                None,
+            )
+
+            if constraint_name != "unique_org_vendor_invoice_number":
+                raise
+
+            logger.warning(
+                "Concurrent duplicate vendor invoice assignment: "
+                "organization=%s invoice=%s vendor=%s",
+                organization_id,
+                invoice_id,
+                serializer.validated_data["vendor_id"],
+            )
+
+            return Response(
+                {
+                    "code": "DUPLICATE_VENDOR_INVOICE_NUMBER",
+                    "detail": (
+                        "This invoice number has already been "
+                        "assigned to another invoice for this "
+                        "vendor in this organization."
+                    ),
+                },
+                status=status.HTTP_409_CONFLICT,
+            )
+
         except InvoiceReviewStateError as exc:
             return Response(
                 {"detail": str(exc)},
@@ -1040,6 +1085,8 @@ class InvoiceVendorResolutionAPIView(OrganizationInvoiceAPIView):
                 {"detail": str(exc)},
                 status=status.HTTP_400_BAD_REQUEST,
             )
+
+        
 
         return Response(
             {

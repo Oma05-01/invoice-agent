@@ -1,6 +1,6 @@
 from decimal import Decimal
 from unittest.mock import patch, Mock
-
+from io import BytesIO
 from django.urls import reverse
 from django.test import SimpleTestCase
 from rest_framework.test import APIClient
@@ -990,6 +990,74 @@ class InvoiceEvidenceVerificationUnitTests(TestCase):
         )
         findings = verify_extraction_evidence(extraction, page_texts)
         self.assertEqual(findings, [])
+
+    def test_multiline_quote_accepts_interleaved_pdf_column_text(self):
+        extraction = InvoiceExtractionResult.model_validate(
+            {
+                "field_evidence": {
+                    "supplier_address": [
+                        {
+                            "page": 1,
+                            "quote": (
+                                "14 Industrial Avenue, Ikeja\n"
+                                "Lagos, Nigeria"
+                            ),
+                        }
+                    ]
+                }
+            }
+        )
+
+        page_texts = {
+            1: (
+                "14 Industrial Avenue, Ikeja\n"
+                "Invoice Number: DEMO-OUTBOX-001\n"
+                "Lagos, Nigeria"
+            )
+        }
+
+        findings = verify_extraction_evidence(
+            extraction,
+            page_texts,
+        )
+
+        self.assertEqual(findings, [])
+
+
+    def test_multiline_quote_rejects_excessive_intervening_text(self):
+        extraction = InvoiceExtractionResult.model_validate(
+            {
+                "field_evidence": {
+                    "supplier_address": [
+                        {
+                            "page": 1,
+                            "quote": "First address line\nSecond address line",
+                        }
+                    ]
+                }
+            }
+        )
+
+        page_texts = {
+            1: (
+                "First address line\n"
+                "Unrelated line one\n"
+                "Unrelated line two\n"
+                "Unrelated line three\n"
+                "Second address line"
+            )
+        }
+
+        findings = verify_extraction_evidence(
+            extraction,
+            page_texts,
+        )
+
+        self.assertEqual(len(findings), 1)
+        self.assertEqual(
+            findings[0].code,
+            "EVIDENCE_QUOTE_NOT_FOUND",
+        )
 
 
 class InvoiceEvidenceVerificationIntegrationTests(TestCase):
@@ -2967,6 +3035,45 @@ class InvoiceVendorResolutionAPITests(TestCase):
             InvoiceValidationIssue.Status.OPEN,
         )
 
+    def test_duplicate_vendor_invoice_number_returns_conflict(self):
+        existing_invoice = Invoice.objects.create(
+            organization=self.organization,
+            vendor=self.vendor,
+            invoice_number=self.invoice.invoice_number,
+            status=Invoice.Status.PENDING_APPROVAL,
+        )
+
+        response = self.assign_vendor()
+
+        self.assertEqual(response.status_code, 409)
+
+        self.assertEqual(
+            response.data["code"],
+            "DUPLICATE_VENDOR_INVOICE_NUMBER",
+        )
+
+        self.assertEqual(
+            response.data["conflicting_invoice_id"],
+            str(existing_invoice.id),
+        )
+
+        self.invoice.refresh_from_db()
+        self.issue.refresh_from_db()
+
+        # No partial assignment or validation resolution.
+        self.assertIsNone(self.invoice.vendor_id)
+
+        self.assertEqual(
+            self.issue.status,
+            InvoiceValidationIssue.Status.OPEN,
+        )
+
+        self.assertFalse(
+            InvoiceAuditEvent.objects.filter(
+                invoice=self.invoice,
+                action=InvoiceAuditEvent.Action.VENDOR_ASSIGNED,
+            ).exists()
+        )
 
 
 class InvoiceLineItemAPITests(TestCase):
@@ -4050,4 +4157,124 @@ class InvoiceReviewSubmissionAPITests(TestCase):
                 invoice=self.invoice,
             ).count(),
             1,
+        )
+
+    def test_submission_resolves_stale_evidence_issue_when_quote_matches_pdf(self):
+        quote = (
+            "14 Industrial Avenue, Ikeja\n"
+            "Lagos, Nigeria"
+        )
+
+        page_text = (
+            "14 Industrial Avenue, Ikeja\n"
+            "Invoice Number: SUBMIT-001\n"
+            "Lagos, Nigeria"
+        )
+
+        self.invoice.extracted_data = {
+            **self.invoice.extracted_data,
+            "field_evidence": {
+                "supplier_address": [
+                    {"page": 1, "quote": quote}
+                ],
+            },
+        }
+        self.invoice.save(update_fields=["extracted_data", "updated_at"])
+
+        issue = InvoiceValidationIssue.objects.create(
+            invoice=self.invoice,
+            code="EVIDENCE_QUOTE_NOT_FOUND",
+            severity=InvoiceValidationIssue.Severity.WARNING,
+            field_name="supplier_address",
+            message="The supplied quotation could not be found.",
+            details={"page": 1},
+            status=InvoiceValidationIssue.Status.OPEN,
+        )
+
+        with patch(
+            "django.db.models.fields.files.FieldFile.open",
+            return_value=BytesIO(b"mock-pdf"),
+        ), patch(
+            "invoices.services.review.extract_pdf_text",
+            return_value=Mock(page_texts={1: page_text}),
+        ):
+            response = self.submit()
+
+        self.assertEqual(response.status_code, 200, response.data)
+
+        issue.refresh_from_db()
+        self.invoice.refresh_from_db()
+
+        self.assertEqual(
+            issue.status,
+            InvoiceValidationIssue.Status.RESOLVED,
+        )
+        self.assertEqual(
+            issue.resolved_by,
+            self.user,
+        )
+        self.assertEqual(
+            self.invoice.status,
+            Invoice.Status.PENDING_APPROVAL,
+        )
+
+    def test_invalid_supplier_address_evidence_still_blocks_submission(self):
+        page_text = (
+            "14 Industrial Avenue, Ikeja\n"
+            "Invoice Number: SUBMIT-001\n"
+            "Lagos, Nigeria"
+        )
+
+        self.invoice.extracted_data = {
+            **self.invoice.extracted_data,
+            "field_evidence": {
+                "supplier_address": [
+                    {
+                        "page": 1,
+                        "quote": "999 Imaginary Road\nAbuja, Nigeria",
+                    }
+                ],
+            },
+        }
+        self.invoice.save(update_fields=["extracted_data", "updated_at"])
+
+        issue = InvoiceValidationIssue.objects.create(
+            invoice=self.invoice,
+            code="EVIDENCE_QUOTE_NOT_FOUND",
+            severity=InvoiceValidationIssue.Severity.WARNING,
+            field_name="supplier_address",
+            message="The supplied quotation could not be found.",
+            details={"page": 1},
+            status=InvoiceValidationIssue.Status.OPEN,
+        )
+
+        with patch(
+            "django.db.models.fields.files.FieldFile.open",
+            return_value=BytesIO(b"mock-pdf"),
+        ), patch(
+            "invoices.services.review.extract_pdf_text",
+            return_value=Mock(page_texts={1: page_text}),
+        ):
+            response = self.submit()
+
+        self.assertEqual(response.status_code, 409, response.data)
+
+        self.assertIn(
+            "EVIDENCE_QUOTE_NOT_FOUND",
+            [blocker["code"] for blocker in response.data["blockers"]],
+        )
+
+        issue.refresh_from_db()
+        self.invoice.refresh_from_db()
+
+        self.assertEqual(
+            issue.status,
+            InvoiceValidationIssue.Status.OPEN,
+        )
+        self.assertEqual(
+            self.invoice.status,
+            Invoice.Status.NEEDS_REVIEW,
+        )
+        self.assertFalse(
+            ApprovalRequest.objects.filter(invoice=self.invoice).exists()
         )

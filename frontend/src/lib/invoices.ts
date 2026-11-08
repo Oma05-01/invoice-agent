@@ -253,3 +253,276 @@ export async function assignInvoiceVendor(
 
   return data;
 }
+
+export interface InvoiceHeaderCorrections {
+  invoice_number: string;
+  invoice_date: string | null;
+  due_date: string | null;
+  currency: string | null;
+  subtotal: string | null;
+  other_charges: string | null;
+  total_amount: string | null;
+  amount_due: string | null;
+  description: string;
+  correction_reason: string;
+}
+
+export async function updateInvoiceHeader(
+  organizationId: string,
+  invoiceId: string,
+  corrections: InvoiceHeaderCorrections,
+) {
+  const csrfResponse = await fetch("/api/auth/csrf/", {
+    method: "GET",
+    credentials: "include",
+    cache: "no-store",
+  });
+
+  if (!csrfResponse.ok) {
+    throw new Error("Unable to obtain a security token.");
+  }
+
+  const csrfData = (await csrfResponse.json()) as {
+    csrfToken: string;
+  };
+
+  const response = await fetch(
+    `/api/organizations/${encodeURIComponent(organizationId)}/invoices/${encodeURIComponent(invoiceId)}/review/`,
+    {
+      method: "PATCH",
+      credentials: "include",
+      headers: {
+        "Content-Type": "application/json",
+        Accept: "application/json",
+        "X-CSRFToken": csrfData.csrfToken,
+      },
+      body: JSON.stringify(corrections),
+    },
+  );
+
+  const data = await response.json().catch(() => ({}));
+
+  if (!response.ok) {
+    const message =
+      data.detail ??
+      (typeof data === "object"
+        ? JSON.stringify(data)
+        : "Unable to save invoice corrections.");
+
+    throw new Error(message);
+  }
+
+  return data;
+}
+
+export interface InvoiceLineItemCorrections {
+  description?: string;
+  quantity?: string | null;
+  unit_price?: string | null;
+  tax_rate?: string | null;
+  line_total?: string | null;
+  ledger_code?: string;
+  correction_reason: string;
+}
+
+export interface InvoiceLineItemMutationResponse {
+  message: string;
+  line_item?: Record<string, unknown>;
+  line_item_id?: string;
+  validation?: {
+    new_findings: number;
+    automatically_resolved_issue_ids: string[];
+  };
+}
+
+async function performInvoiceMutation<T>(
+  url: string,
+  method: "POST" | "PATCH" | "DELETE",
+  payload: object,
+): Promise<T> {
+  const csrfResponse = await fetch("/api/auth/csrf/", {
+    method: "GET",
+    credentials: "include",
+    cache: "no-store",
+  });
+
+  if (!csrfResponse.ok) {
+    throw new Error("Unable to obtain a security token.");
+  }
+
+  const csrfData = (await csrfResponse.json()) as {
+    csrfToken: string;
+  };
+
+  const response = await fetch(url, {
+    method,
+    credentials: "include",
+    headers: {
+      "Content-Type": "application/json",
+      Accept: "application/json",
+      "X-CSRFToken": csrfData.csrfToken,
+    },
+    body: JSON.stringify(payload),
+  });
+
+  const data: unknown = await response.json().catch(() => null);
+
+  if (!response.ok) {
+    let message = "The invoice line-item operation failed.";
+
+    if (
+      typeof data === "object" &&
+      data !== null &&
+      "detail" in data &&
+      typeof data.detail === "string"
+    ) {
+      message = data.detail;
+    } else if (data !== null) {
+      message = JSON.stringify(data);
+    }
+
+    throw new Error(message);
+  }
+
+  return data as T;
+}
+
+export async function addInvoiceLineItem(
+  organizationId: string,
+  invoiceId: string,
+  corrections: InvoiceLineItemCorrections & {
+    description: string;
+  },
+): Promise<InvoiceLineItemMutationResponse> {
+  return performInvoiceMutation(
+    `/api/organizations/${encodeURIComponent(organizationId)}/invoices/${encodeURIComponent(invoiceId)}/line-items/`,
+    "POST",
+    corrections,
+  );
+}
+
+export async function updateInvoiceLineItem(
+  organizationId: string,
+  invoiceId: string,
+  lineItemId: string,
+  corrections: InvoiceLineItemCorrections,
+): Promise<InvoiceLineItemMutationResponse> {
+  return performInvoiceMutation(
+    `/api/organizations/${encodeURIComponent(organizationId)}/invoices/${encodeURIComponent(invoiceId)}/line-items/${encodeURIComponent(lineItemId)}/`,
+    "PATCH",
+    corrections,
+  );
+}
+
+export async function deleteInvoiceLineItem(
+  organizationId: string,
+  invoiceId: string,
+  lineItemId: string,
+  correctionReason: string,
+): Promise<InvoiceLineItemMutationResponse> {
+  return performInvoiceMutation(
+    `/api/organizations/${encodeURIComponent(organizationId)}/invoices/${encodeURIComponent(invoiceId)}/line-items/${encodeURIComponent(lineItemId)}/`,
+    "DELETE",
+    {
+      correction_reason: correctionReason,
+    },
+  );
+}
+
+export interface InvoiceSubmissionBlocker {
+  code: string;
+  field_name: string;
+  message: string;
+}
+
+export interface InvoiceSubmissionResponse {
+  message: string;
+  invoice_id: string;
+  approval_request_id: string;
+  status: string;
+  automatically_resolved_issue_ids: string[];
+}
+
+export class InvoiceSubmissionError extends Error {
+  blockers: InvoiceSubmissionBlocker[];
+
+  constructor(
+    message: string,
+    blockers: InvoiceSubmissionBlocker[] = [],
+  ) {
+    super(message);
+    this.name = "InvoiceSubmissionError";
+    this.blockers = blockers;
+  }
+}
+
+export async function submitInvoiceForApproval(
+  organizationId: string,
+  invoiceId: string,
+  submissionNote: string,
+): Promise<InvoiceSubmissionResponse> {
+  const csrfResponse = await fetch("/api/auth/csrf/", {
+    method: "GET",
+    credentials: "include",
+    cache: "no-store",
+  });
+
+  if (!csrfResponse.ok) {
+    throw new Error("Unable to obtain a security token.");
+  }
+
+  const csrfData = (await csrfResponse.json()) as {
+    csrfToken: string;
+  };
+
+  const response = await fetch(
+    `/api/organizations/${encodeURIComponent(organizationId)}/invoices/${encodeURIComponent(invoiceId)}/submit-review/`,
+    {
+      method: "POST",
+      credentials: "include",
+      headers: {
+        "Content-Type": "application/json",
+        Accept: "application/json",
+        "X-CSRFToken": csrfData.csrfToken,
+      },
+      body: JSON.stringify({
+        submission_note: submissionNote.trim(),
+      }),
+    },
+  );
+
+  const data: unknown = await response.json().catch(() => null);
+
+  if (!response.ok) {
+    const record =
+      typeof data === "object" && data !== null
+        ? (data as Record<string, unknown>)
+        : {};
+
+    const blockers = Array.isArray(record.blockers)
+      ? record.blockers.filter(
+          (item): item is InvoiceSubmissionBlocker =>
+            typeof item === "object" &&
+            item !== null &&
+            "code" in item &&
+            "field_name" in item &&
+            "message" in item &&
+            typeof item.code === "string" &&
+            typeof item.field_name === "string" &&
+            typeof item.message === "string",
+        )
+      : [];
+
+    const message =
+      typeof record.message === "string"
+        ? record.message
+        : typeof record.detail === "string"
+          ? record.detail
+          : "Unable to submit this invoice for approval.";
+
+    throw new InvoiceSubmissionError(message, blockers);
+  }
+
+  return data as InvoiceSubmissionResponse;
+}
+

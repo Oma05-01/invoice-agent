@@ -14,6 +14,10 @@ from invoices.models import (
     InvoiceValidationIssue,
     InvoiceLineItem
 )
+import logging
+
+from documents.extraction import extract_pdf_text
+from invoices.services.evidence import verify_extraction_evidence
 from invoices.schemas import InvoiceExtractionResult
 from invoices.services.validation import validate_invoice_extraction
 from approvals.models import ApprovalRequest
@@ -27,10 +31,19 @@ VALIDATION_CODES = {
     "AMOUNT_DUE_MISMATCH",
 }
 
+EVIDENCE_VALIDATION_CODES = {
+    "EVIDENCE_PAGE_NOT_FOUND",
+    "EVIDENCE_PAGE_REQUIRES_OCR",
+    "EVIDENCE_QUOTE_NOT_FOUND",
+}
+
 NON_IGNORABLE_ISSUE_CODES = {
     "UNKNOWN_VENDOR",
     "MISSING_REQUIRED_FIELD",
 }
+
+logger = logging.getLogger(__name__)
+
 
 class InvoiceIssueDecisionError(Exception):
     pass
@@ -46,6 +59,15 @@ class InvoiceReviewStateError(Exception):
 
 class InvoiceCorrectionNoChanges(Exception):
     pass
+
+class InvoiceDuplicateVendorInvoiceNumber(Exception):
+    def __init__(self, existing_invoice):
+        self.existing_invoice = existing_invoice
+
+        super().__init__(
+            f"Invoice number '{existing_invoice.invoice_number}' "
+            "is already assigned to this vendor in this organization."
+        )
 
 
 def serialize_audit_value(value):
@@ -133,18 +155,57 @@ def _line_item_snapshot(item):
 
 def _revalidate_review_invoice(*, invoice, actor):
     """
-    Re-run deterministic validation against the current
-    operational invoice and line-item records.
+    Re-run deterministic financial and source-evidence validation
+    against the current operational invoice and original document.
     """
 
     extraction = build_validation_payload(invoice)
 
     findings = validate_invoice_extraction(extraction)
 
+    managed_codes = set(VALIDATION_CODES)
+
+    document = (
+        invoice.source_document
+        if invoice.source_document_id
+        else None
+    )
+
+    # Only update evidence findings when the original document
+    # is available and its text can be extracted successfully.
+    if (
+        document is not None
+        and document.status == Document.Status.PROCESSED
+        and document.file
+    ):
+        try:
+            with document.file.open("rb") as document_stream:
+                document_result = extract_pdf_text(
+                    document_stream.read()
+                )
+
+            evidence_findings = verify_extraction_evidence(
+                extraction,
+                document_result.page_texts,
+            )
+
+            findings.extend(evidence_findings)
+            managed_codes.update(EVIDENCE_VALIDATION_CODES)
+
+        except Exception:
+            # Preserve existing evidence issues if verification
+            # could not be completed. Never resolve an issue merely
+            # because the source document could not be read.
+            logger.exception(
+                "Unable to reverify invoice source evidence: %s",
+                invoice.id,
+            )
+
     automatically_resolved = synchronize_validation_issues(
         invoice=invoice,
         findings=findings,
         actor=actor,
+        codes=managed_codes,
     )
 
     return findings, automatically_resolved
@@ -395,6 +456,7 @@ def synchronize_validation_issues(
     invoice,
     findings,
     actor,
+    codes=None,
 ):
     """
     Synchronize deterministic financial validation issues.
@@ -408,9 +470,11 @@ def synchronize_validation_issues(
         InvoiceValidationIssue.objects
         .select_for_update()
         .filter(
-            invoice=invoice,
-            code__in=VALIDATION_CODES,
-        )
+        invoice=invoice,
+        code__in=(
+            VALIDATION_CODES if codes is None else codes
+        ),
+    )
     )
 
     issues_by_key = {
@@ -562,13 +626,8 @@ def correct_invoice_header(
     # Revalidate using corrected operational values and
     # the original extracted tax and line-item structure.
 
-    extraction = build_validation_payload(invoice)
-
-    findings = validate_invoice_extraction(extraction)
-
-    automatically_resolved = synchronize_validation_issues(
+    findings, automatically_resolved = _revalidate_review_invoice(
         invoice=invoice,
-        findings=findings,
         actor=actor,
     )
 
@@ -643,6 +702,27 @@ def assign_invoice_vendor(
         raise InvoiceCorrectionNoChanges(
             "This vendor is already assigned to the invoice."
         )
+
+    # Prevent the same vendor invoice number from being
+    # assigned to multiple invoices within one organization.
+
+    if invoice.invoice_number:
+        existing_invoice = (
+            Invoice.objects
+            .filter(
+                organization_id=organization_id,
+                vendor=vendor,
+                invoice_number=invoice.invoice_number,
+            )
+            .exclude(pk=invoice.pk)
+            .only("id", "invoice_number", "status")
+            .first()
+        )
+
+        if existing_invoice is not None:
+            raise InvoiceDuplicateVendorInvoiceNumber(
+                existing_invoice
+            )
 
     previous_vendor = None
 
@@ -857,16 +937,10 @@ def submit_invoice_for_approval(
 
     # Revalidate against current operational invoice data.
 
-    extraction = build_validation_payload(invoice)
-
-    findings = validate_invoice_extraction(extraction)
-
-    automatically_resolved = synchronize_validation_issues(
+    findings, automatically_resolved = _revalidate_review_invoice(
         invoice=invoice,
-        findings=findings,
         actor=actor,
     )
-
     issues = list(
         InvoiceValidationIssue.objects
         .select_for_update()
