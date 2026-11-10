@@ -1,5 +1,7 @@
+from django.db import IntegrityError, transaction
 from django.db.models import Q
 
+from rest_framework import status
 from rest_framework.authentication import (
     BasicAuthentication,
     SessionAuthentication,
@@ -10,29 +12,50 @@ from rest_framework.views import APIView
 
 from organizations.models import OrganizationMembership
 from vendors.models import Vendor
+from vendors.serializers import VendorCreateSerializer
+
+
+VENDOR_CREATE_ROLES = (
+    OrganizationMembership.Role.OWNER,
+    OrganizationMembership.Role.FINANCE_ADMIN,
+    OrganizationMembership.Role.FINANCE_OPERATOR,
+)
 
 
 class VendorListAPIView(APIView):
     """
-    Return active vendors belonging to an organization.
+    List active organization vendors and create new vendors.
 
-    All active organization members can view the vendor list,
-    including read-only members.
+    All active organization members can view the vendor list.
+    Only authorized finance roles can create vendors.
     """
 
     authentication_classes = [
         SessionAuthentication,
         BasicAuthentication,
     ]
+
     permission_classes = [IsAuthenticated]
+
+    def get_membership(self, request, organization_id):
+
+        return (
+            OrganizationMembership.objects
+            .filter(
+                organization_id=organization_id,
+                user=request.user,
+                is_active=True,
+            )
+            .select_related("organization")
+            .first()
+        )
 
     def get(self, request, organization_id):
 
-        membership = OrganizationMembership.objects.filter(
-            organization_id=organization_id,
-            user=request.user,
-            is_active=True,
-        ).first()
+        membership = self.get_membership(
+            request,
+            organization_id,
+        )
 
         if membership is None:
             return Response(
@@ -41,7 +64,7 @@ class VendorListAPIView(APIView):
                         "Organization not found or access denied."
                     )
                 },
-                status=404,
+                status=status.HTTP_404_NOT_FOUND,
             )
 
         queryset = Vendor.objects.filter(
@@ -49,7 +72,10 @@ class VendorListAPIView(APIView):
             is_active=True,
         )
 
-        search = request.query_params.get("search", "").strip()
+        search = request.query_params.get(
+            "search",
+            "",
+        ).strip()
 
         if search:
             queryset = queryset.filter(
@@ -87,4 +113,75 @@ class VendorListAPIView(APIView):
                 "has_more": count > len(results),
                 "results": results,
             }
+        )
+
+    def post(self, request, organization_id):
+
+        membership = self.get_membership(
+            request,
+            organization_id,
+        )
+
+        if membership is None:
+            return Response(
+                {
+                    "detail": (
+                        "Organization not found or access denied."
+                    )
+                },
+                status=status.HTTP_404_NOT_FOUND,
+            )
+
+        if membership.role not in VENDOR_CREATE_ROLES:
+            return Response(
+                {
+                    "detail": (
+                        "You do not have permission to create vendors."
+                    )
+                },
+                status=status.HTTP_403_FORBIDDEN,
+            )
+
+        serializer = VendorCreateSerializer(
+            data=request.data,
+            context={
+                "organization": membership.organization,
+            },
+        )
+
+        serializer.is_valid(raise_exception=True)
+
+        try:
+            with transaction.atomic():
+                vendor = serializer.save(
+                    organization_id=organization_id,
+                )
+
+        except IntegrityError as exc:
+
+            constraint_name = getattr(
+                getattr(exc.__cause__, "diag", None),
+                "constraint_name",
+                None,
+            )
+
+            if constraint_name == "unique_org_vendor_code":
+                return Response(
+                    {
+                        "detail": (
+                            "This vendor code is already in use "
+                            "in this organization."
+                        )
+                    },
+                    status=status.HTTP_409_CONFLICT,
+                )
+
+            raise
+
+        return Response(
+            {
+                "message": "Vendor created successfully.",
+                "vendor": VendorCreateSerializer(vendor).data,
+            },
+            status=status.HTTP_201_CREATED,
         )

@@ -3,9 +3,9 @@ from django.contrib.auth import get_user_model
 from django.core.exceptions import ValidationError
 from django.test import TestCase
 from django.urls import reverse
-
+from accounting.models import JournalEntry, JournalLine
 from rest_framework.test import APIClient
-
+from decimal import Decimal
 from approvals.models import ApprovalRequest, ApprovalDecision
 from auditlog.models import InvoiceAuditEvent
 from invoices.models import Invoice
@@ -156,6 +156,40 @@ class ApprovalWorkflowAPITests(TestCase):
         self.assertEqual(
             decision.outcome,
             ApprovalDecision.Outcome.APPROVED,
+        )
+
+        journal = JournalEntry.objects.get(
+            source_invoice=self.invoice,
+        )
+
+        self.assertEqual(
+            journal.status,
+            JournalEntry.Status.DRAFT,
+        )
+
+        self.assertEqual(
+            journal.approval_decision,
+            decision,
+        )
+
+        self.assertEqual(
+            journal.created_by,
+            self.approver,
+        )
+
+        self.assertEqual(
+            journal.lines.count(),
+            2,
+        )
+
+        self.assertEqual(
+            journal.lines.get(line_number=1).debit,
+            Decimal("250000.00"),
+        )
+
+        self.assertEqual(
+            journal.lines.get(line_number=2).credit,
+            Decimal("250000.00"),
         )
 
     def test_approval_creates_audit_event(self):

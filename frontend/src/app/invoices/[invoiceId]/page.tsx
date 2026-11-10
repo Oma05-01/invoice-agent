@@ -16,6 +16,7 @@ import {
   fetchInvoiceReview,
   getInvoiceDocumentPreviewUrl,
   fetchVendors,
+   createVendor,
   assignInvoiceVendor,
   updateInvoiceHeader,
   type Vendor,
@@ -1028,6 +1029,21 @@ function VendorAssignmentSection({
   const [error, setError] = useState("");
   const [success, setSuccess] = useState("");
 
+    const [showCreateForm, setShowCreateForm] = useState(false);
+
+  const [newVendorLegalName, setNewVendorLegalName] = useState(
+    typeof extractedSupplier.legal_name === "string"
+      ? extractedSupplier.legal_name
+      : "",
+  );
+
+  const [newVendorDisplayName, setNewVendorDisplayName] = useState("");
+  const [newVendorCode, setNewVendorCode] = useState("");
+  const [newVendorTin, setNewVendorTin] = useState("");
+  const [newVendorEmail, setNewVendorEmail] = useState("");
+  const [newVendorPhone, setNewVendorPhone] = useState("");
+  const [newVendorAddress, setNewVendorAddress] = useState("");
+
   useEffect(() => {
     let active = true;
 
@@ -1108,6 +1124,115 @@ function VendorAssignmentSection({
     }
   }
 
+    async function handleCreateVendor(
+    event: FormEvent<HTMLFormElement>,
+  ) {
+    event.preventDefault();
+
+    const legalName = newVendorLegalName.trim();
+
+    if (!legalName) {
+      setError("Vendor legal name is required.");
+      return;
+    }
+
+    setSaving(true);
+    setError("");
+    setSuccess("");
+
+    let createdVendor: Vendor;
+
+    // Stage 1: Create the vendor.
+    try {
+      const result = await createVendor(
+        organizationId,
+        {
+          legal_name: legalName,
+          display_name: newVendorDisplayName.trim(),
+          vendor_code: newVendorCode.trim(),
+          tax_identification_number: newVendorTin.trim(),
+          email: newVendorEmail.trim(),
+          phone: newVendorPhone.trim(),
+          address: newVendorAddress.trim(),
+        },
+      );
+
+      createdVendor = result.vendor;
+
+      // Make the new vendor immediately available
+      // in the existing vendor-selection list.
+      setVendors((current) => {
+        const alreadyExists = current.some(
+          (vendor) => vendor.id === createdVendor.id,
+        );
+
+        if (alreadyExists) {
+          return current;
+        }
+
+        return [...current, createdVendor].sort(
+          (a, b) => a.legal_name.localeCompare(b.legal_name),
+        );
+      });
+
+      setSelectedVendorId(createdVendor.id);
+
+      setShowCreateForm(false);
+
+    } catch (err) {
+      setError(
+        err instanceof Error
+          ? err.message
+          : "Unable to create vendor.",
+      );
+
+      setSaving(false);
+      return;
+    }
+
+    // Stage 2: Assign the successfully created vendor.
+    const assignmentReason =
+      "New vendor created after verifying the supplier details against the invoice.";
+
+    setCorrectionReason(assignmentReason);
+
+    try {
+      await assignInvoiceVendor(
+        organizationId,
+        invoiceId,
+        createdVendor.id,
+        assignmentReason,
+      );
+    } catch (err) {
+      setError(
+        `Vendor created successfully, but invoice assignment failed: ${
+          err instanceof Error
+            ? err.message
+            : "Unknown error."
+        } The vendor remains selected below. Use Assign vendor to retry.`,
+      );
+
+      setSaving(false);
+      return;
+    }
+
+    setSuccess("Vendor created and assigned successfully.");
+
+    setCorrectionReason("");
+    setSelectedVendorId("");
+    setSearch("");
+
+    try {
+      await onAssigned();
+    } catch {
+      setError(
+        "Vendor was assigned successfully, but the invoice could not refresh. Reload the page.",
+      );
+    } finally {
+      setSaving(false);
+    }
+  }
+
   const selectedVendor = vendors.find(
     (vendor) => vendor.id === selectedVendorId,
   );
@@ -1137,15 +1262,33 @@ function VendorAssignmentSection({
           Supplier verification
         </h2>
 
-        {currentVendorId ? (
-          <span className="rounded-full bg-green-50 px-3 py-1 text-xs font-medium text-green-700">
-            Vendor matched
-          </span>
-        ) : (
-          <span className="rounded-full bg-amber-50 px-3 py-1 text-xs font-medium text-amber-700">
-            Unmatched supplier
-          </span>
-        )}
+        <div className="flex flex-wrap items-center gap-2">
+          {currentVendorId ? (
+            <span className="rounded-full bg-green-50 px-3 py-1 text-xs font-medium text-green-700">
+              Vendor matched
+            </span>
+          ) : (
+            <>
+              <span className="rounded-full bg-amber-50 px-3 py-1 text-xs font-medium text-amber-700">
+                Unmatched supplier
+              </span>
+
+              <button
+                type="button"
+                onClick={() => {
+                  setShowCreateForm((current) => !current);
+                  setError("");
+                  setSuccess("");
+                }}
+                className="rounded-lg border border-blue-200 px-3 py-1.5 text-xs font-semibold text-blue-700 hover:bg-blue-50"
+              >
+                {showCreateForm
+                  ? "Cancel creation"
+                  : "Create vendor"}
+              </button>
+            </>
+          )}
+        </div>
       </div>
 
       {/* Extracted supplier */}
@@ -1186,6 +1329,185 @@ function VendorAssignmentSection({
         <p className="text-xs font-medium text-gray-500">
           Currently assigned vendor
         </p>
+
+          {showCreateForm && !currentVendorId && (
+            <form
+              onSubmit={handleCreateVendor}
+              className="mt-5 space-y-4 rounded-xl border border-blue-200 bg-blue-50/50 p-4"
+            >
+              <div>
+                <h3 className="font-semibold text-gray-900">
+                  Create new vendor
+                </h3>
+
+                <p className="mt-1 text-xs text-gray-600">
+                  Confirm the supplier&apos;s registered details before
+                  creating the vendor record. The new vendor will
+                  be assigned to this invoice automatically.
+                </p>
+              </div>
+
+              <div>
+                <label
+                  htmlFor="new-vendor-legal-name"
+                  className="mb-1 block text-sm font-medium text-gray-700"
+                >
+                  Legal name *
+                </label>
+
+                <input
+                  id="new-vendor-legal-name"
+                  type="text"
+                  required
+                  maxLength={255}
+                  value={newVendorLegalName}
+                  onChange={(event) =>
+                    setNewVendorLegalName(event.target.value)
+                  }
+                  className="h-11 w-full rounded-lg border border-gray-200 bg-white px-3 text-sm outline-none focus:border-blue-500"
+                />
+              </div>
+
+              <div>
+                <label
+                  htmlFor="new-vendor-display-name"
+                  className="mb-1 block text-sm font-medium text-gray-700"
+                >
+                  Display name
+                </label>
+
+                <input
+                  id="new-vendor-display-name"
+                  type="text"
+                  maxLength={255}
+                  value={newVendorDisplayName}
+                  onChange={(event) =>
+                    setNewVendorDisplayName(event.target.value)
+                  }
+                  placeholder="Optional trading or shortened name"
+                  className="h-11 w-full rounded-lg border border-gray-200 bg-white px-3 text-sm outline-none focus:border-blue-500"
+                />
+              </div>
+
+              <div className="grid gap-4 sm:grid-cols-2">
+                <div>
+                  <label
+                    htmlFor="new-vendor-code"
+                    className="mb-1 block text-sm font-medium text-gray-700"
+                  >
+                    Vendor code
+                  </label>
+
+                  <input
+                    id="new-vendor-code"
+                    type="text"
+                    maxLength={50}
+                    value={newVendorCode}
+                    onChange={(event) =>
+                      setNewVendorCode(event.target.value)
+                    }
+                    placeholder="Optional"
+                    className="h-11 w-full rounded-lg border border-gray-200 bg-white px-3 text-sm outline-none focus:border-blue-500"
+                  />
+                </div>
+
+                <div>
+                  <label
+                    htmlFor="new-vendor-tin"
+                    className="mb-1 block text-sm font-medium text-gray-700"
+                  >
+                    Tax identification number
+                  </label>
+
+                  <input
+                    id="new-vendor-tin"
+                    type="text"
+                    maxLength={50}
+                    value={newVendorTin}
+                    onChange={(event) =>
+                      setNewVendorTin(event.target.value)
+                    }
+                    placeholder="Optional"
+                    className="h-11 w-full rounded-lg border border-gray-200 bg-white px-3 text-sm outline-none focus:border-blue-500"
+                  />
+                </div>
+
+                <div>
+                  <label
+                    htmlFor="new-vendor-email"
+                    className="mb-1 block text-sm font-medium text-gray-700"
+                  >
+                    Email
+                  </label>
+
+                  <input
+                    id="new-vendor-email"
+                    type="email"
+                    value={newVendorEmail}
+                    onChange={(event) =>
+                      setNewVendorEmail(event.target.value)
+                    }
+                    placeholder="Optional"
+                    className="h-11 w-full rounded-lg border border-gray-200 bg-white px-3 text-sm outline-none focus:border-blue-500"
+                  />
+                </div>
+
+                <div>
+                  <label
+                    htmlFor="new-vendor-phone"
+                    className="mb-1 block text-sm font-medium text-gray-700"
+                  >
+                    Phone
+                  </label>
+
+                  <input
+                    id="new-vendor-phone"
+                    type="tel"
+                    maxLength={30}
+                    value={newVendorPhone}
+                    onChange={(event) =>
+                      setNewVendorPhone(event.target.value)
+                    }
+                    placeholder="Optional"
+                    className="h-11 w-full rounded-lg border border-gray-200 bg-white px-3 text-sm outline-none focus:border-blue-500"
+                  />
+                </div>
+              </div>
+
+              <div>
+                <label
+                  htmlFor="new-vendor-address"
+                  className="mb-1 block text-sm font-medium text-gray-700"
+                >
+                  Address
+                </label>
+
+                <textarea
+                  id="new-vendor-address"
+                  rows={2}
+                  value={newVendorAddress}
+                  onChange={(event) =>
+                    setNewVendorAddress(event.target.value)
+                  }
+                  placeholder="Optional"
+                  className="w-full rounded-lg border border-gray-200 bg-white p-3 text-sm outline-none focus:border-blue-500"
+                />
+              </div>
+
+              <button
+                type="submit"
+                disabled={
+                  saving ||
+                  !newVendorLegalName.trim()
+                }
+                className="inline-flex items-center justify-center rounded-lg bg-blue-600 px-4 py-2.5 text-sm font-semibold text-white hover:bg-blue-700 disabled:cursor-not-allowed disabled:opacity-50"
+              >
+                {saving
+                  ? "Creating and assigning..."
+                  : "Create vendor and assign to invoice"}
+              </button>
+            </form>
+          )}
 
         <p className="mt-1 text-sm font-semibold text-gray-900">
           {matchedVendorName

@@ -149,3 +149,125 @@ class VendorListAPITests(APITestCase):
 
         self.assertEqual(response.status_code, 200)
 
+    def test_owner_can_create_vendor(self):
+
+        response = self.client.post(
+            self.url,
+            {
+                "legal_name": "Sunridge Electrical & Maintenance Ltd",
+                "display_name": "Sunridge Electrical & Maintenance",
+                "vendor_code": "SUN-2026-001",
+                "tax_identification_number": "",
+                "email": "",
+                "phone": "",
+                "address": "",
+            },
+            format="json",
+        )
+
+        self.assertEqual(response.status_code, 201)
+
+        vendor = Vendor.objects.get(
+            pk=response.data["vendor"]["id"],
+            organization=self.organization,
+        )
+
+        self.assertEqual(
+            vendor.legal_name,
+            "Sunridge Electrical & Maintenance Ltd",
+        )
+
+        self.assertEqual(
+            Vendor.objects.filter(
+                organization=self.organization
+            ).count(),
+            2,
+        )
+
+    def test_finance_operator_can_create_vendor(self):
+
+        self.membership.role = (
+            OrganizationMembership.Role.FINANCE_OPERATOR
+        )
+
+        self.membership.save(update_fields=["role"])
+
+        response = self.client.post(
+            self.url,
+            {
+                "legal_name": "New Supplier Ltd",
+            },
+            format="json",
+        )
+
+        self.assertEqual(response.status_code, 201)
+
+    def test_read_only_member_cannot_create_vendor(self):
+
+        self.membership.role = (
+            OrganizationMembership.Role.READ_ONLY
+        )
+
+        self.membership.save(update_fields=["role"])
+
+        response = self.client.post(
+            self.url,
+            {
+                "legal_name": "Unauthorized Supplier Ltd",
+            },
+            format="json",
+        )
+
+        self.assertEqual(response.status_code, 403)
+
+        self.assertFalse(
+            Vendor.objects.filter(
+                organization=self.organization,
+                legal_name="Unauthorized Supplier Ltd",
+            ).exists()
+        )
+
+    def test_duplicate_legal_name_is_rejected(self):
+
+        response = self.client.post(
+            self.url,
+            {
+                "legal_name": "ABC Engineering Ltd",
+            },
+            format="json",
+        )
+
+        self.assertEqual(response.status_code, 400)
+
+    def test_duplicate_tin_is_rejected(self):
+
+        response = self.client.post(
+            self.url,
+            {
+                "legal_name": "Another Engineering Company Ltd",
+                "tax_identification_number": "12345678",
+            },
+            format="json",
+        )
+
+        self.assertEqual(response.status_code, 400)
+
+    def test_user_without_membership_cannot_create_vendor(self):
+
+        other_user = User.objects.create_user(
+            username="unauthorized_vendor_creator",
+            password="test-password-123",
+        )
+
+        self.client.force_authenticate(user=other_user)
+
+        response = self.client.post(
+            self.url,
+            {
+                "legal_name": "Unauthorized Supplier Ltd",
+            },
+            format="json",
+        )
+
+        self.assertEqual(response.status_code, 404)
+

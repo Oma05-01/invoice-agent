@@ -1,4 +1,5 @@
-from dataclasses import dataclass
+
+from dataclasses import dataclass, field
 
 import pymupdf
 
@@ -18,6 +19,16 @@ class PDFExtractionResult:
     pages_with_text: tuple[int, ...]
     pages_requiring_ocr: tuple[int, ...]
     page_texts: dict[int, str]
+
+    # Preserve word positions for layout-aware extraction.
+    page_words: dict[int, tuple[tuple, ...]] = field(
+        default_factory=dict
+    )
+
+    # Preserve page dimensions for relative layout calculations.
+    page_sizes: dict[int, tuple[float, float]] = field(
+        default_factory=dict
+    )
 
 
 def extract_pdf_text(content: bytes) -> PDFExtractionResult:
@@ -51,7 +62,10 @@ def extract_pdf_text(content: bytes) -> PDFExtractionResult:
         extracted_pages = []
         pages_with_text = []
         pages_requiring_ocr = []
+
         page_texts = {}
+        page_words = {}
+        page_sizes = {}
 
         for page_number, page in enumerate(pdf, start=1):
 
@@ -60,7 +74,22 @@ def extract_pdf_text(content: bytes) -> PDFExtractionResult:
                 sort=True,
             ).strip()
 
+            # Preserve the page dimensions.
+            page_sizes[page_number] = (
+                page.rect.width,
+                page.rect.height,
+            )
+
+            # Keep the original text extraction unchanged.
             page_texts[page_number] = page_text
+
+            # Preserve individual words and their coordinates.
+            page_words[page_number] = tuple(
+                page.get_text(
+                    "words",
+                    sort=True,
+                )
+            )
 
             if page_text:
                 pages_with_text.append(page_number)
@@ -83,7 +112,10 @@ def extract_pdf_text(content: bytes) -> PDFExtractionResult:
             pages_with_text=tuple(pages_with_text),
             pages_requiring_ocr=tuple(pages_requiring_ocr),
             page_texts=page_texts,
+            page_words=page_words,
+            page_sizes=page_sizes,
         )
 
     finally:
         pdf.close()
+

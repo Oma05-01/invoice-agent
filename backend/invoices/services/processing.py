@@ -13,7 +13,7 @@ from documents.extraction import (
     OCRRequiredError,
     DocumentExtractionError,
 )
-
+from auditlog.models import InvoiceAuditEvent
 from vendors.models import Vendor
 
 from invoices.models import (
@@ -36,7 +36,9 @@ from invoices.services.validation import (
 from invoices.services.provider_factory import (
     build_invoice_extraction_service,
 )
-
+from invoices.services.invoice_number_recovery import (
+    recover_split_invoice_number,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -57,6 +59,40 @@ def normalize_name(value: str) -> str:
         " ",
         value,
     ).strip().casefold()
+
+
+SUPPLIER_NAME_SUFFIXES = {
+    "ltd",
+    "limited",
+    "llc",
+    "plc",
+    "inc",
+    "incorporated",
+    "corp",
+    "corporation",
+    "company",
+    "co",
+    "invoice",
+}
+
+
+def _supplier_name_tokens(value: str) -> list[str]:
+    """
+    Convert a supplier name into ordered comparison tokens.
+
+    Remove terminal legal suffixes and document labels,
+    while preserving the original order of meaningful words.
+    """
+
+    tokens = re.findall(
+        r"[a-z0-9]+",
+        value.casefold(),
+    )
+
+    while tokens and tokens[-1] in SUPPLIER_NAME_SUFFIXES:
+        tokens.pop()
+
+    return tokens
 
 
 def _claim_invoice(invoice_id):
@@ -174,6 +210,11 @@ def _match_supplier(
     """
     Match an extracted supplier against existing active vendors.
 
+    Matching priority:
+    1. Exact TIN.
+    2. Exact normalized legal/display name.
+    3. Unique, sufficiently distinctive ordered name prefix.
+
     No supplier is automatically created.
     Ambiguous or conflicting matches require human review.
     """
@@ -190,29 +231,36 @@ def _match_supplier(
     supplier_name = extraction.supplier_legal_name
 
     if not supplier_name:
-
         return None, [
             ValidationFinding(
                 code="UNKNOWN_VENDOR",
                 severity="warning",
                 field_name="supplier_legal_name",
-                message="Supplier identification information is missing.",
+                message=(
+                    "Supplier identification information is missing."
+                ),
             )
-        ]
+        ], None
 
     normalized_name = normalize_name(supplier_name)
 
-    # First attempt an exact TIN match.
+    # ---------------------------------------------------------
+    # 1. Exact TIN matching takes priority.
+    # ---------------------------------------------------------
 
     if extraction.supplier_tin:
+
+        extracted_tin = extraction.supplier_tin.strip().casefold()
 
         tin_matches = [
             vendor
             for vendor in suppliers
             if (
                 vendor.tax_identification_number.strip()
-                and vendor.tax_identification_number.strip().casefold()
-                == extraction.supplier_tin.strip().casefold()
+                and (
+                    vendor.tax_identification_number.strip().casefold()
+                    == extracted_tin
+                )
             )
         ]
 
@@ -222,9 +270,12 @@ def _match_supplier(
 
             known_names = {
                 normalize_name(vendor.legal_name),
-                normalize_name(vendor.display_name)
-                if vendor.display_name else "",
             }
+
+            if vendor.display_name:
+                known_names.add(
+                    normalize_name(vendor.display_name)
+                )
 
             if normalized_name not in known_names:
 
@@ -240,7 +291,7 @@ def _match_supplier(
                     )
                 )
 
-            return vendor, findings
+            return vendor, findings, "exact_tin"
 
         if len(tin_matches) > 1:
 
@@ -254,9 +305,11 @@ def _match_supplier(
                         "the extracted supplier TIN."
                     ),
                 )
-            ]
+            ], None
 
-    # Fall back to an exact normalized name match.
+    # ---------------------------------------------------------
+    # 2. Exact normalized name matching.
+    # ---------------------------------------------------------
 
     name_matches = []
 
@@ -298,9 +351,9 @@ def _match_supplier(
                         "the registered TIN."
                     ),
                 )
-            ]
+            ], None
 
-        return vendor, findings
+        return vendor, findings, "exact_name"
 
     if len(name_matches) > 1:
 
@@ -314,7 +367,100 @@ def _match_supplier(
                     "the extracted supplier name."
                 ),
             )
-        ]
+        ], None
+
+    # ---------------------------------------------------------
+    # 3. Ordered supplier-name prefix matching.
+    # ---------------------------------------------------------
+
+    extracted_tokens = _supplier_name_tokens(supplier_name)
+
+    # Require at least two meaningful tokens and ten characters.
+    # This avoids automatically matching short, generic names.
+    is_strong_prefix = (
+        len(extracted_tokens) >= 2
+        and sum(len(token) for token in extracted_tokens) >= 10
+    )
+
+    if is_strong_prefix:
+
+        prefix_matches = []
+
+        for vendor in suppliers:
+
+            candidate_names = [
+                vendor.legal_name,
+            ]
+
+            if vendor.display_name:
+                candidate_names.append(vendor.display_name)
+
+            vendor_matches = False
+
+            for candidate_name in candidate_names:
+
+                vendor_tokens = _supplier_name_tokens(
+                    candidate_name
+                )
+
+                if (
+                    len(vendor_tokens) >= len(extracted_tokens)
+                    and vendor_tokens[:len(extracted_tokens)]
+                    == extracted_tokens
+                ):
+                    vendor_matches = True
+                    break
+
+            if vendor_matches:
+                prefix_matches.append(vendor)
+
+        # Only assign a vendor when exactly one vendor matches.
+        if len(prefix_matches) == 1:
+
+            vendor = prefix_matches[0]
+
+            # Never automatically accept a conflicting registered TIN.
+            if (
+                extraction.supplier_tin
+                and vendor.tax_identification_number
+                and (
+                    extraction.supplier_tin.strip().casefold()
+                    != vendor.tax_identification_number.strip().casefold()
+                )
+            ):
+
+                return None, [
+                    ValidationFinding(
+                        code="SUPPLIER_TIN_MISMATCH",
+                        severity="warning",
+                        field_name="supplier_tin",
+                        message=(
+                            "Supplier name resembles an existing vendor, "
+                            "but the extracted TIN differs from "
+                            "the registered TIN."
+                        ),
+                    )
+                ], None
+
+            return vendor, findings, "ordered_name_prefix"
+
+        if len(prefix_matches) > 1:
+
+            return None, [
+                ValidationFinding(
+                    code="AMBIGUOUS_VENDOR",
+                    severity="warning",
+                    field_name="supplier_legal_name",
+                    message=(
+                        "Multiple existing vendors match "
+                        "the extracted supplier-name prefix."
+                    ),
+                )
+            ], None
+
+    # ---------------------------------------------------------
+    # 4. No reliable match.
+    # ---------------------------------------------------------
 
     return None, [
         ValidationFinding(
@@ -325,7 +471,7 @@ def _match_supplier(
                 "No existing vendor matches the extracted supplier."
             ),
         )
-    ]
+    ], None
 
 
 def _calculate_tax_amount(extraction):
@@ -571,7 +717,6 @@ def process_invoice(
     invoice_id, document_id = _claim_invoice(invoice_id)
 
     try:
-
         document = Document.objects.get(
             pk=document_id
         )
@@ -584,7 +729,6 @@ def process_invoice(
         # unless a service was explicitly injected.
 
         if extraction_service is None:
-
             extraction_service = (
                 build_invoice_extraction_service()
             )
@@ -595,22 +739,90 @@ def process_invoice(
             document_text=document_result.text
         )
 
-        # 4. Verify source evidence.
+        # 4. Recover invoice numbers split across PDF header rows.
+        # layout-aware PDF recovery service.
+
+        recovery = recover_split_invoice_number(
+            document_result.page_words,
+            document_result.page_sizes,
+        )
+
+        recovery_audit = None
+
+        if recovery is not None:
+
+            original_invoice_number = extraction.invoice_number
+
+            payload = extraction.model_dump(mode="python")
+
+            original_model_confidence = (
+                payload.get("field_confidence") or {}
+            ).get("invoice_number")
+
+            # Replace the AI-extracted number with the
+            # independently recovered PDF value.
+
+            payload["invoice_number"] = recovery["invoice_number"]
+
+            # Preserve every PDF fragment as separate evidence.
+            field_evidence = dict(
+                payload.get("field_evidence") or {}
+            )
+
+            field_evidence["invoice_number"] = [
+                {
+                    "page": recovery["page"],
+                    "quote": fragment,
+                }
+                for fragment in recovery["fragments"]
+            ]
+
+            payload["field_evidence"] = field_evidence
+
+            # The recovered value is deterministic, not an
+            # AI confidence-scored extraction.
+
+            field_confidence = dict(
+                payload.get("field_confidence") or {}
+            )
+
+            field_confidence.pop("invoice_number", None)
+
+            payload["field_confidence"] = field_confidence
+
+            extraction = type(extraction).model_validate(payload)
+
+            # Preserve the original AI value when recovery
+            # actually changes the invoice number.
+
+            if original_invoice_number != recovery["invoice_number"]:
+                recovery_audit = {
+                    "before": original_invoice_number,
+                    "after": recovery["invoice_number"],
+                    "page": recovery["page"],
+                    "fragments": recovery["fragments"],
+                    "method": recovery["method"],
+                    "original_model_confidence": (
+                        original_model_confidence
+                    ),
+                }
+
+        # 5. Verify source evidence.
 
         evidence_findings = verify_extraction_evidence(
             extraction,
             document_result.page_texts,
         )
 
-        # 5. Run deterministic financial validation.
+        # 6. Run deterministic financial validation.
 
         financial_findings = validate_invoice_extraction(
             extraction
         )
 
-        # 6. Match the supplier against registered vendors.
+        # 7. Match the supplier against registered vendors.
 
-        vendor, vendor_findings = _match_supplier(
+        vendor, vendor_findings, vendor_match_method = _match_supplier(
             document.organization_id,
             extraction,
         )
@@ -621,15 +833,89 @@ def process_invoice(
             + vendor_findings
         )
 
-        # 7. Persist all processing results atomically.
+        # 8. Persist processing results and the recovery audit
+        # event in the same database transaction.
 
-        return _persist_extraction(
-            invoice_id=invoice_id,
-            document_id=document_id,
-            extraction=extraction,
-            vendor=vendor,
-            findings=all_findings,
-        )
+        with transaction.atomic():
+
+            current_invoice = (
+                Invoice.objects
+                .select_related("vendor")
+                .get(pk=invoice_id)
+            )
+
+            previous_vendor_name = (
+                current_invoice.vendor.legal_name
+                if current_invoice.vendor_id
+                else None
+            )
+
+            result = _persist_extraction(
+                invoice_id=invoice_id,
+                document_id=document.id,
+                extraction=extraction,
+                vendor=vendor,
+                findings=all_findings,
+            )
+
+            if (
+                vendor is not None
+                and vendor_match_method == "ordered_name_prefix"
+                and current_invoice.vendor_id != vendor.pk
+            ):
+                InvoiceAuditEvent.objects.create(
+                    organization_id=current_invoice.organization_id,
+                    invoice=current_invoice,
+                    actor=None,
+                    action=InvoiceAuditEvent.Action.FIELD_UPDATED,
+                    changes={
+                        "vendor": {
+                            "before": previous_vendor_name,
+                            "after": vendor.legal_name,
+                        }
+                    },
+                    metadata={
+                        "operation": "deterministic_vendor_matching",
+                        "method": "ordered_name_prefix",
+                        "extracted_supplier_name": (
+                            extraction.supplier_legal_name
+                        ),
+                        "matched_vendor_id": str(vendor.pk),
+                    },
+                )
+
+            if recovery_audit is not None:
+                persisted_invoice = Invoice.objects.get(
+                    pk=invoice_id
+                )
+
+                InvoiceAuditEvent.objects.create(
+                    organization_id=persisted_invoice.organization_id,
+                    invoice=persisted_invoice,
+                    actor=None,
+                    action=InvoiceAuditEvent.Action.FIELD_UPDATED,
+                    changes={
+                        "invoice_number": {
+                            "before": recovery_audit["before"],
+                            "after": recovery_audit["after"],
+                        }
+                    },
+                    metadata={
+                        "operation": (
+                            "deterministic_invoice_number_recovery"
+                        ),
+                        "method": recovery_audit["method"],
+                        "page": recovery_audit["page"],
+                        "evidence": recovery_audit["fragments"],
+                        "original_model_confidence": (
+                            recovery_audit[
+                                "original_model_confidence"
+                            ]
+                        ),
+                    },
+                )
+
+        return result
 
     except Exception as exc:
 

@@ -33,4 +33,5 @@ urlpatterns = [
         name="auth-me",
     ),
     path("api/", include("vendors.urls")),
+    path("api/", include("accounting.urls")),
 ]

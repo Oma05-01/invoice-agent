@@ -7,7 +7,36 @@ from pydantic import (
     Field,
     field_validator,
 )
+import re
 
+_GROUPED_DECIMAL_PATTERN = re.compile(
+    r"^[+-]?\d{1,3}(?:,\d{3})+(?:\.\d+)?$"
+)
+
+
+def _normalize_decimal_string(value):
+    """
+    Remove valid thousands separators from decimal strings.
+
+    Examples:
+        "580,000.00" -> "580000.00"
+        "25000.00"   -> "25000.00"
+
+    Invalid grouping is deliberately left unchanged so that
+    Pydantic rejects it during Decimal validation.
+    """
+    if not isinstance(value, str):
+        return value
+
+    value = value.strip()
+
+    if "," not in value:
+        return value
+
+    if _GROUPED_DECIMAL_PATTERN.fullmatch(value):
+        return value.replace(",", "")
+
+    return value
 
 ConfidenceScore = Annotated[
     float,
@@ -57,6 +86,14 @@ class ExtractedTax(BaseModel):
     rate_percent: Decimal | None = None
 
     amount: Decimal | None = None
+    @field_validator(
+        "rate_percent",
+        "amount",
+        mode="before",
+    )
+    @classmethod
+    def normalize_decimal_fields(cls, value):
+        return _normalize_decimal_string(value)
 
 
 class ExtractedLineItem(BaseModel):
@@ -76,6 +113,16 @@ class ExtractedLineItem(BaseModel):
     line_total: Decimal | None = None
 
     suggested_expense_category: str | None = None
+    @field_validator(
+        "quantity",
+        "unit_price",
+        "tax_rate_percent",
+        "line_total",
+        mode="before",
+    )
+    @classmethod
+    def normalize_decimal_fields(cls, value):
+        return _normalize_decimal_string(value)
 
 
 class InvoiceExtractionResult(BaseModel):
@@ -147,6 +194,17 @@ class InvoiceExtractionResult(BaseModel):
     extraction_warnings: list[str] = Field(
         default_factory=list,
     )
+
+    @field_validator(
+        "subtotal",
+        "other_charges",
+        "total_amount",
+        "amount_due",
+        mode="before",
+    )
+    @classmethod
+    def normalize_decimal_fields(cls, value):
+        return _normalize_decimal_string(value)
 
     @field_validator("currency")
     @classmethod

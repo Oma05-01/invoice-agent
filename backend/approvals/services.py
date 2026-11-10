@@ -7,6 +7,8 @@ from auditlog.services import record_invoice_event
 from invoices.models import Invoice
 from organizations.models import OrganizationMembership
 
+from accounting.services import create_draft_journal_for_approved_invoice
+
 
 RETURN_TO_REVIEW_ROLES = (
     OrganizationMembership.Role.OWNER,
@@ -199,6 +201,17 @@ def decide_approval_request(
         ]
     )
 
+    journal_entry = None
+
+    if outcome == ApprovalDecision.Outcome.APPROVED:
+        journal_entry, journal_created = (
+            create_draft_journal_for_approved_invoice(
+                invoice=invoice,
+                approval_decision=decision,
+                actor=actor,
+            )
+        )
+
     # Record the decision in the invoice audit history.
 
     audit_action = (
@@ -227,6 +240,9 @@ def decide_approval_request(
             "outcome": outcome,
             "comment": comment,
             "submitted_by_id": str(approval_request.submitted_by_id),
+            "journal_entry_id": (
+                str(journal_entry.id) if journal_entry else None
+            ),
         },
     )
 
@@ -378,3 +394,4 @@ def return_rejected_invoice_to_review(
     )
 
     return invoice, approval_request, decision
+

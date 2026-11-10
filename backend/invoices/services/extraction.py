@@ -50,10 +50,14 @@ STRICT RULES:
 12. Do not calculate or modify invoice totals.
 13. Extract individual line items where available.
 14. Provide source evidence for important extracted fields.
-15. Evidence must contain an exact quotation from the document.
+15. Evidence must be an exact, contiguous quotation from the
+    supplied document text. Do not combine words or labels
+    from separate columns, separate lines or distant parts
+    of the page.
 16. Page references must correspond to the supplied page markers.
 17. Confidence scores must be between 0 and 1.
-18. Return monetary amounts, quantities and tax rates as decimal strings,
+18. Return monetary amounts, quantities and tax rates as decimal
+    strings without thousands separators (for example, 580000.00),
     not floating-point numbers.
 19. Do not use the organisation's default currency to fill in a
     missing invoice currency.
@@ -68,6 +72,10 @@ The document is the source of truth.
     document. Do not assume missing other charges are zero.
 25. Evidence for each field must directly support that field.
     Do not use a quotation labelled Total as evidence for Amount Due.
+26. For currency, quote only the exact printed currency marker
+    or code, such as "(NGN)" or "NGN". Do not combine a column
+    heading such as "UNIT PRICE" with a currency marker unless
+    that combined phrase appears contiguously in the source.
 
 Do not assume that a supplier's name, tax number, invoice
 number or payment information is correct merely because

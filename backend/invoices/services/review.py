@@ -22,6 +22,10 @@ from invoices.schemas import InvoiceExtractionResult
 from invoices.services.validation import validate_invoice_extraction
 from approvals.models import ApprovalRequest
 
+from invoices.services.invoice_number_recovery import (
+    recover_split_invoice_number,
+)
+
 VALIDATION_CODES = {
     "MISSING_REQUIRED_FIELD",
     "DUE_DATE_BEFORE_INVOICE_DATE",
@@ -157,6 +161,12 @@ def _revalidate_review_invoice(*, invoice, actor):
     """
     Re-run deterministic financial and source-evidence validation
     against the current operational invoice and original document.
+
+    Where the invoice number can be independently recovered from
+    the PDF and matches the current operational value, use the
+    recovered PDF fragments for evidence verification.
+
+    The original AI extraction is never modified.
     """
 
     extraction = build_validation_payload(invoice)
@@ -171,8 +181,7 @@ def _revalidate_review_invoice(*, invoice, actor):
         else None
     )
 
-    # Only update evidence findings when the original document
-    # is available and its text can be extracted successfully.
+    # Reverify evidence against the original document.
     if (
         document is not None
         and document.status == Document.Status.PROCESSED
@@ -184,18 +193,65 @@ def _revalidate_review_invoice(*, invoice, actor):
                     document_stream.read()
                 )
 
+            # Independently recover the invoice number using
+            # the shared layout-aware recovery service.
+            recovery = recover_split_invoice_number(
+                document_result.page_words,
+                document_result.page_sizes,
+            )
+
+            operational_invoice_number = (
+                str(invoice.invoice_number or "").strip()
+            )
+
+            # Only replace the temporary evidence when the
+            # recovered number exactly matches the corrected
+            # operational invoice number.
+            if (
+                recovery is not None
+                and operational_invoice_number
+                == recovery["invoice_number"]
+            ):
+                payload = extraction.model_dump(
+                    mode="python"
+                )
+
+                field_evidence = dict(
+                    payload.get("field_evidence") or {}
+                )
+
+                # Store every recovered fragment as a separate
+                # quotation from the original PDF page.
+                field_evidence["invoice_number"] = [
+                    {
+                        "page": recovery["page"],
+                        "quote": fragment,
+                    }
+                    for fragment in recovery["fragments"]
+                ]
+
+                payload["field_evidence"] = field_evidence
+
+                extraction = InvoiceExtractionResult.model_validate(
+                    payload
+                )
+
+            # Verify all evidence, including recovered invoice-number
+            # fragments, against the actual extracted PDF text.
             evidence_findings = verify_extraction_evidence(
                 extraction,
                 document_result.page_texts,
             )
 
             findings.extend(evidence_findings)
-            managed_codes.update(EVIDENCE_VALIDATION_CODES)
+
+            managed_codes.update(
+                EVIDENCE_VALIDATION_CODES
+            )
 
         except Exception:
-            # Preserve existing evidence issues if verification
-            # could not be completed. Never resolve an issue merely
-            # because the source document could not be read.
+            # Do not resolve existing evidence issues merely
+            # because document extraction or recovery failed.
             logger.exception(
                 "Unable to reverify invoice source evidence: %s",
                 invoice.id,

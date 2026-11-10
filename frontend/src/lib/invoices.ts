@@ -205,6 +205,78 @@ export async function fetchVendors(
   return response.json() as Promise<VendorListResponse>;
 }
 
+export interface VendorCreatePayload {
+  legal_name: string;
+  display_name?: string;
+  vendor_code?: string;
+  tax_identification_number?: string;
+  email?: string;
+  phone?: string;
+  address?: string;
+}
+
+export interface VendorCreateResponse {
+  message: string;
+  vendor: Vendor;
+}
+
+export async function createVendor(
+  organizationId: string,
+  vendor: VendorCreatePayload,
+): Promise<VendorCreateResponse> {
+  // Obtain a fresh CSRF token.
+  const csrfResponse = await fetch("/api/auth/csrf/", {
+    method: "GET",
+    credentials: "include",
+    cache: "no-store",
+  });
+
+  if (!csrfResponse.ok) {
+    throw new Error("Unable to obtain a security token.");
+  }
+
+  const csrfData = (await csrfResponse.json()) as {
+    csrfToken: string;
+  };
+
+  const response = await fetch(
+    `/api/organizations/${encodeURIComponent(organizationId)}/vendors/`,
+    {
+      method: "POST",
+      credentials: "include",
+      headers: {
+        "Content-Type": "application/json",
+        Accept: "application/json",
+        "X-CSRFToken": csrfData.csrfToken,
+      },
+      body: JSON.stringify(vendor),
+    },
+  );
+
+  const data = await response.json().catch(() => ({}));
+
+  if (!response.ok) {
+    const message =
+      typeof data.detail === "string"
+        ? data.detail
+        : Object.entries(data)
+            .map(([field, errors]) => {
+              const errorText = Array.isArray(errors)
+                ? errors.join(" ")
+                : String(errors);
+
+              return `${field}: ${errorText}`;
+            })
+            .join(" ");
+
+    throw new Error(
+      message || "Unable to create vendor.",
+    );
+  }
+
+  return data as VendorCreateResponse;
+}
+
 export async function assignInvoiceVendor(
   organizationId: string,
   invoiceId: string,

@@ -54,6 +54,7 @@ from documents.extraction import OCRRequiredError
 from invoices.services.processing import (
     process_invoice,
     InvoiceProcessingStateError,
+    _match_supplier,
 )
 from invoices.services.evidence import verify_extraction_evidence
 from invoices.services.review import synchronize_validation_issues
@@ -511,6 +512,94 @@ class InvoiceExtractionSchemaTests(SimpleTestCase):
             "VAT",
         )
 
+    
+    def test_comma_formatted_decimal_values_are_normalized(self):
+        payload = self.valid_payload()
+
+        payload["subtotal"] = "580,000.00"
+        payload["taxes"][0]["amount"] = "43,500.00"
+        payload["other_charges"] = "0.00"
+        payload["total_amount"] = "623,500.00"
+        payload["amount_due"] = "623,500.00"
+
+        payload["line_items"][0].update({
+            "unit_price": "25,000.00",
+            "line_total": "400,000.00",
+        })
+
+        result = InvoiceExtractionResult.model_validate(payload)
+
+        self.assertEqual(
+            result.subtotal,
+            Decimal("580000.00"),
+        )
+        self.assertEqual(
+            result.taxes[0].amount,
+            Decimal("43500.00"),
+        )
+        self.assertEqual(
+            result.other_charges,
+            Decimal("0.00"),
+        )
+        self.assertEqual(
+            result.total_amount,
+            Decimal("623500.00"),
+        )
+        self.assertEqual(
+            result.amount_due,
+            Decimal("623500.00"),
+        )
+        self.assertEqual(
+            result.line_items[0].unit_price,
+            Decimal("25000.00"),
+        )
+        self.assertEqual(
+            result.line_items[0].line_total,
+            Decimal("400000.00"),
+        )
+
+    def test_large_grouped_decimal_is_normalized(self):
+        result = InvoiceExtractionResult.model_validate({
+            "subtotal": "1,234,567.89",
+        })
+
+        self.assertEqual(
+            result.subtotal,
+            Decimal("1234567.89"),
+        )
+
+    def test_malformed_decimal_grouping_is_rejected(self):
+        invalid_values = [
+            "58,00.00",
+            "12,34,567.00",
+        ]
+
+        for value in invalid_values:
+            with self.subTest(value=value):
+                with self.assertRaises(ValidationError):
+                    InvoiceExtractionResult.model_validate({
+                        "subtotal": value,
+                    })
+
+    def test_malformed_nested_decimal_is_rejected(self):
+        with self.assertRaises(ValidationError):
+            InvoiceExtractionResult.model_validate({
+                "taxes": [{
+                    "name": "VAT",
+                    "tax_type": "VAT",
+                    "amount": "4,3,500.00",
+                }],
+            })
+
+        with self.assertRaises(ValidationError):
+            InvoiceExtractionResult.model_validate({
+                "line_items": [{
+                    "description": "Consulting",
+                    "unit_price": "25,00.00",
+                }],
+            })
+
+    
     def test_missing_values_remain_none(self):
 
         result = InvoiceExtractionResult.model_validate(
@@ -1059,6 +1148,59 @@ class InvoiceEvidenceVerificationUnitTests(TestCase):
             "EVIDENCE_QUOTE_NOT_FOUND",
         )
 
+    def test_non_contiguous_currency_quote_is_rejected(self):
+        extraction = InvoiceExtractionResult.model_validate({
+            "currency": "NGN",
+            "field_evidence": {
+                "currency": [{
+                    "page": 1,
+                    "quote": "UNIT PRICE (NGN)",
+                }]
+            },
+        })
+
+        page_texts = {
+            1: (
+                "UNIT PRICE        LINE TOTAL\n"
+                " (NGN)             (NGN)"
+            )
+        }
+
+        findings = verify_extraction_evidence(
+            extraction,
+            page_texts,
+        )
+
+        self.assertIn(
+            "EVIDENCE_QUOTE_NOT_FOUND",
+            {finding.code for finding in findings},
+        )
+
+    def test_exact_currency_marker_is_accepted(self):
+        extraction = InvoiceExtractionResult.model_validate({
+            "currency": "NGN",
+            "field_evidence": {
+                "currency": [{
+                    "page": 1,
+                    "quote": "(NGN)",
+                }]
+            },
+        })
+
+        page_texts = {
+            1: (
+                "UNIT PRICE        LINE TOTAL\n"
+                " (NGN)             (NGN)"
+            )
+        }
+
+        findings = verify_extraction_evidence(
+            extraction,
+            page_texts,
+        )
+
+        self.assertEqual(findings, [])
+
 
 class InvoiceEvidenceVerificationIntegrationTests(TestCase):
     """Integration tests verifying full PDF generation, storage, and processing matching."""
@@ -1384,6 +1526,275 @@ class InvoiceProcessingTests(TestCase):
                 ],
             },
         }
+
+    def make_supplier_extraction(
+            self,
+            supplier_name,
+            supplier_tin=None,
+        ):
+            payload = self.valid_extraction_payload()
+
+            payload["supplier_legal_name"] = supplier_name
+
+            if supplier_tin is not None:
+                payload["supplier_tin"] = supplier_tin
+
+            return InvoiceExtractionResult.model_validate(payload)
+
+    def test_unique_supplier_name_prefix_matches(self):
+
+        cases = [
+            (
+                "NORTHSTAR OFFICE SUPPLIES INVOICE",
+                "Northstar Office Supplies Ltd",
+                "Northstar Office Supplies",
+                "ordered_name_prefix",
+            ),
+            (
+                "MERIDIAN ADVISORY",
+                "Meridian Advisory Partners Ltd",
+                "Meridian Advisory Partners",
+                "ordered_name_prefix",
+            ),
+            (
+                "BRIGHTPATH LOGISTICS",
+                "BrightPath Logistics Services Ltd",
+                "BrightPath Logistics Services",
+                "ordered_name_prefix",
+            ),
+            (
+                "CEDARLINE TECHNOLOGY",
+                "Cedarline Technology Services Ltd",
+                "Cedarline Technology Services",
+                "ordered_name_prefix",
+            ),
+            (
+                "GREENFIELD CATERING &",
+                "Greenfield Catering & Events Ltd",
+                "Greenfield Catering & Events",
+                "ordered_name_prefix",
+            ),
+            (
+                "DELTAPRINT MEDIA HOUSE",
+                "DeltaPrint Media House Ltd",
+                "DeltaPrint Media House",
+                "exact_name",
+            ),
+        ]
+
+        for (
+            extracted_name,
+            legal_name,
+            display_name,
+            expected_method,
+        ) in cases:
+
+            with self.subTest(supplier=extracted_name):
+
+                vendor = Vendor.objects.create(
+                    organization=self.organization,
+                    legal_name=legal_name,
+                    display_name=display_name,
+                )
+
+                extraction = self.make_supplier_extraction(
+                    extracted_name
+                )
+
+                matched_vendor, findings, method = _match_supplier(
+                    self.organization.id,
+                    extraction,
+                )
+
+                self.assertEqual(
+                    matched_vendor,
+                    vendor,
+                )
+
+                self.assertEqual(
+                    findings,
+                    [],
+                )
+
+                self.assertEqual(
+                    method,
+                    expected_method,
+                )
+
+    def test_ambiguous_supplier_prefix_requires_review(self):
+
+        Vendor.objects.create(
+            organization=self.organization,
+            legal_name="Meridian Advisory Partners Ltd",
+            display_name="Meridian Advisory Partners",
+        )
+
+        Vendor.objects.create(
+            organization=self.organization,
+            legal_name="Meridian Advisory Group Ltd",
+            display_name="Meridian Advisory Group",
+        )
+
+        extraction = self.make_supplier_extraction(
+            "MERIDIAN ADVISORY"
+        )
+
+        vendor, findings, method = _match_supplier(
+            self.organization.id,
+            extraction,
+        )
+
+        self.assertIsNone(vendor)
+        self.assertIsNone(method)
+
+        self.assertIn(
+            "AMBIGUOUS_VENDOR",
+            [finding.code for finding in findings],
+        )
+
+    def test_prefix_match_with_conflicting_tin_requires_review(self):
+
+        Vendor.objects.create(
+            organization=self.organization,
+            legal_name="Meridian Advisory Partners Ltd",
+            display_name="Meridian Advisory Partners",
+            tax_identification_number="TIN-REGISTERED-001",
+        )
+
+        extraction = self.make_supplier_extraction(
+            "MERIDIAN ADVISORY",
+            supplier_tin="TIN-EXTRACTED-999",
+        )
+
+        vendor, findings, method = _match_supplier(
+            self.organization.id,
+            extraction,
+        )
+
+        self.assertIsNone(vendor)
+        self.assertIsNone(method)
+
+        self.assertIn(
+            "SUPPLIER_TIN_MISMATCH",
+            [finding.code for finding in findings],
+        )
+
+    def test_exact_tin_match_takes_priority(self):
+
+        vendor = Vendor.objects.create(
+            organization=self.organization,
+            legal_name="Registered Engineering Ltd",
+            display_name="Registered Engineering",
+            tax_identification_number="TIN-EXACT-001",
+        )
+
+        extraction = self.make_supplier_extraction(
+            "Different Extracted Company",
+            supplier_tin="TIN-EXACT-001",
+        )
+
+        matched_vendor, findings, method = _match_supplier(
+            self.organization.id,
+            extraction,
+        )
+
+        self.assertEqual(
+            matched_vendor,
+            vendor,
+        )
+
+        self.assertEqual(
+            method,
+            "exact_tin",
+        )
+
+        self.assertIn(
+            "SUPPLIER_NAME_MISMATCH",
+            [finding.code for finding in findings],
+        )
+
+    def test_ordered_name_prefix_match_creates_audit_event(self):
+
+        # Change the registered vendor name so the extracted name
+        # will no longer match it exactly.
+        self.vendor.legal_name = "ABC Engineering Services Ltd"
+        self.vendor.display_name = "ABC Engineering Services"
+
+        self.vendor.save(
+            update_fields=[
+                "legal_name",
+                "display_name",
+            ]
+        )
+
+        # The PDF and extraction payload still contain
+        # "ABC Engineering Ltd".
+        payload = self.valid_extraction_payload()
+
+        service = FakeExtractionService(payload)
+
+        invoice = process_invoice(
+            self.invoice.id,
+            extraction_service=service,
+        )
+
+        invoice.refresh_from_db()
+
+        # Confirm the correct vendor was assigned.
+        self.assertEqual(
+            invoice.vendor,
+            self.vendor,
+        )
+
+        # Retrieve field-update audit events.
+        audit_events = InvoiceAuditEvent.objects.filter(
+            invoice=invoice,
+            action=InvoiceAuditEvent.Action.FIELD_UPDATED,
+        )
+
+        vendor_events = [
+            event
+            for event in audit_events
+            if (
+                event.metadata.get("operation")
+                == "deterministic_vendor_matching"
+            )
+        ]
+
+        self.assertEqual(
+            len(vendor_events),
+            1,
+        )
+
+        event = vendor_events[0]
+
+        # Verify the recorded matching method.
+        self.assertEqual(
+            event.metadata["method"],
+            "ordered_name_prefix",
+        )
+
+        # Verify the extracted supplier name.
+        self.assertEqual(
+            event.metadata["extracted_supplier_name"],
+            "ABC Engineering Ltd",
+        )
+
+        # Verify the matched vendor ID.
+        self.assertEqual(
+            event.metadata["matched_vendor_id"],
+            str(self.vendor.pk),
+        )
+
+        # Verify the before-and-after vendor assignment.
+        self.assertIsNone(
+            event.changes["vendor"]["before"],
+        )
+
+        self.assertEqual(
+            event.changes["vendor"]["after"],
+            "ABC Engineering Services Ltd",
+        )
 
     def test_complete_invoice_processing(self):
 
