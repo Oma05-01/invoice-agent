@@ -10,7 +10,10 @@ import type {
   AccountLedgerResponse,
   TrialBalanceResponse,
   IncomeStatementResponse,
-    BalanceSheetResponse,
+  BalanceSheetResponse,
+  JournalAdjustmentRequest,
+  JournalAdjustmentResponse,
+  JournalEntryDateUpdateRequest,
 } from "@/types/accounting";
 
 async function getErrorMessage(
@@ -170,6 +173,18 @@ export async function updateJournalLine(
   );
 }
 
+export async function updateDraftJournalEntryDate(
+  organizationId: string,
+  journalEntryId: string,
+  payload: JournalEntryDateUpdateRequest,
+): Promise<JournalEntry> {
+  return accountingMutation<JournalEntry>(
+    `/api/organizations/${encodeURIComponent(organizationId)}/accounting/journals/${encodeURIComponent(journalEntryId)}/date/`,
+    "PATCH",
+    payload,
+  );
+}
+
 export async function postJournalEntry(
   organizationId: string,
   journalEntryId: string,
@@ -188,6 +203,18 @@ export async function reverseJournalEntry(
 ): Promise<JournalEntry> {
   return accountingMutation<JournalEntry>(
     `/api/organizations/${encodeURIComponent(organizationId)}/accounting/journals/${encodeURIComponent(journalEntryId)}/reverse/`,
+    "POST",
+    payload,
+  );
+}
+
+export async function createAdjustmentJournal(
+  organizationId: string,
+  journalEntryId: string,
+  payload: JournalAdjustmentRequest,
+): Promise<JournalAdjustmentResponse> {
+  return accountingMutation<JournalAdjustmentResponse>(
+    `/api/organizations/${encodeURIComponent(organizationId)}/accounting/journals/${encodeURIComponent(journalEntryId)}/adjustments/`,
     "POST",
     payload,
   );

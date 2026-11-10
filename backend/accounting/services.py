@@ -1,16 +1,27 @@
-from decimal import Decimal
+import uuid
+
+from datetime import date
+from decimal import Decimal, InvalidOperation
 
 from django.core.exceptions import ValidationError
 from django.db import transaction
 from django.utils import timezone
 
-from accounting.models import Account, JournalEntry, JournalLine
+from accounting.models import (
+    Account,
+    JournalAdjustment,
+    JournalEntry,
+    JournalLine,
+)
 from approvals.models import ApprovalDecision
 from invoices.models import Invoice
 from django.db.models import Max
 
 from auditlog.models import InvoiceAuditEvent
-from auditlog.services import record_invoice_event
+from auditlog.services import (
+    record_invoice_event,
+    record_journal_event,
+)
 from organizations.models import OrganizationMembership
 
 class AccountingError(Exception):
@@ -316,6 +327,25 @@ def create_draft_journal_for_approved_invoice(
         line.full_clean()
         line.save(force_insert=True)
 
+    record_journal_audit(
+        entry=entry,
+        actor=actor,
+        operation="journal_draft_created",
+        changes={
+            "journal_status": {
+                "before": None,
+                "after": entry.status,
+            }
+        },
+        metadata={
+            "total_debit": str(total_amount),
+            "total_credit": str(total_amount),
+            "line_count": len(lines),
+            "source_invoice_id": str(locked_invoice.id),
+        },
+        mirror_to_invoice=False,
+    )
+
     return entry, True
 
 def require_accounting_role(*, organization_id, actor, allowed_roles):
@@ -441,28 +471,38 @@ def record_journal_audit(
     operation,
     changes,
     metadata=None,
+    mirror_to_invoice=True,
 ):
     """
-    Attach accounting activity to the source invoice's audit history.
+    Record accounting activity against the journal.
 
-    Journals without a source invoice remain valid accounting records;
-    their dedicated audit history can be introduced separately.
+    When the journal belongs to an invoice, optionally mirror
+    the event into the invoice activity history.
     """
 
-    if not entry.source_invoice_id:
-        return
-
-    record_invoice_event(
-        invoice=entry.source_invoice,
+    journal_event = record_journal_event(
+        entry=entry,
         actor=actor,
-        action=InvoiceAuditEvent.Action.FIELD_UPDATED,
+        operation=operation,
         changes=changes,
-        metadata={
-            "operation": operation,
-            "journal_entry_id": str(entry.id),
-            **(metadata or {}),
-        },
+        metadata=metadata,
     )
+
+    if entry.source_invoice_id and mirror_to_invoice:
+        record_invoice_event(
+            invoice=entry.source_invoice,
+            actor=actor,
+            action=InvoiceAuditEvent.Action.FIELD_UPDATED,
+            changes=changes,
+            metadata={
+                "operation": operation,
+                "journal_entry_id": str(entry.id),
+                **(metadata or {}),
+            },
+        )
+
+    return journal_event
+
 
 @transaction.atomic
 def update_draft_journal_line(
@@ -599,6 +639,66 @@ def update_draft_journal_line(
     )
 
     return line
+
+
+@transaction.atomic
+def update_draft_journal_entry_date(
+    *,
+    organization_id,
+    journal_entry_id,
+    actor,
+    entry_date,
+    correction_reason,
+):
+    require_accounting_role(
+        organization_id=organization_id,
+        actor=actor,
+        allowed_roles=DRAFT_EDIT_ROLES,
+    )
+
+    if not correction_reason or not correction_reason.strip():
+        raise AccountingStateError(
+            "A correction reason is required."
+        )
+
+    if type(entry_date) is not date:
+        raise AccountingStateError(
+            "A valid journal entry date is required."
+        )
+
+    entry = get_locked_journal(
+        organization_id=organization_id,
+        journal_entry_id=journal_entry_id,
+    )
+
+    if entry.status != JournalEntry.Status.DRAFT:
+        raise AccountingStateError(
+            "Only draft journal dates can be changed."
+        )
+
+    previous_date = entry.entry_date.isoformat()
+
+    entry.entry_date = entry_date
+    entry.full_clean()
+    entry.save(update_fields=["entry_date", "updated_at"])
+
+    record_journal_audit(
+        entry=entry,
+        actor=actor,
+        operation="journal_entry_date_updated",
+        changes={
+            "entry_date": {
+                "before": previous_date,
+                "after": entry.entry_date.isoformat(),
+            }
+        },
+        metadata={
+            "correction_reason": correction_reason.strip(),
+        },
+    )
+
+    return entry
+
 
 @transaction.atomic
 def post_journal_entry(
@@ -764,6 +864,23 @@ def reverse_journal_entry(
         reversal_line.full_clean()
         reversal_line.save(force_insert=True)
 
+    record_journal_audit(
+        entry=reversal,
+        actor=actor,
+        operation="journal_reversal_created",
+        changes={
+            "journal_status": {
+                "before": None,
+                "after": reversal.status,
+            }
+        },
+        metadata={
+            "reversal_of_id": str(original.id),
+            "reversal_reason": reversal_reason,
+            "line_count": len(original_lines),
+        },
+    )
+
     previous_status = original.status
 
     original.status = JournalEntry.Status.REVERSED
@@ -788,4 +905,236 @@ def reverse_journal_entry(
     )
 
     return reversal
+
+@transaction.atomic
+def create_adjustment_journal(
+    *,
+    organization_id,
+    original_journal_id,
+    actor,
+    entry_date,
+    reason,
+    lines,
+    description="",
+):
+    """
+    Create a standalone draft journal correcting an existing
+    posted or reversed journal.
+
+    The adjustment is linked to its original journal through
+    JournalAdjustment.
+
+    Posting remains a separate authorized operation.
+    """
+
+    # 1. Check creation permissions.
+    require_accounting_role(
+        organization_id=organization_id,
+        actor=actor,
+        allowed_roles=DRAFT_EDIT_ROLES,
+    )
+
+    # 2. Validate the reason.
+    if not isinstance(reason, str) or not reason.strip():
+        raise AccountingStateError(
+            "An adjustment reason is required."
+        )
+
+    # 3. Validate the effective accounting date.
+    if not isinstance(entry_date, date):
+        raise AccountingStateError(
+            "A valid adjustment entry date is required."
+        )
+
+    # 4. Validate the supplied journal lines.
+    if not isinstance(lines, (list, tuple)) or len(lines) < 2:
+        raise AccountingStateError(
+            "An adjustment must contain at least two journal lines."
+        )
+
+    # 5. Retrieve and lock the original journal.
+    original = get_locked_journal(
+        organization_id=organization_id,
+        journal_entry_id=original_journal_id,
+    )
+
+    if original.status not in (
+        JournalEntry.Status.POSTED,
+        JournalEntry.Status.REVERSED,
+    ):
+        raise AccountingStateError(
+            "Only posted or reversed journals can be adjusted."
+        )
+
+    if original.reversal_of_id:
+        raise AccountingStateError(
+            "An adjustment must reference an original journal, "
+            "not a reversal entry."
+        )
+
+    # 6. Resolve and validate accounts and amounts.
+    prepared_lines = []
+
+    for index, line_data in enumerate(lines, start=1):
+        if not isinstance(line_data, dict):
+            raise AccountingStateError(
+                f"Adjustment line {index} must be an object."
+            )
+
+        account_id = line_data.get("account_id")
+
+        account = (
+            Account.objects
+            .select_for_update()
+            .filter(
+                pk=account_id,
+                organization_id=organization_id,
+            )
+            .first()
+        )
+
+        if account is None:
+            raise AccountingStateError(
+                f"Adjustment line {index} references an "
+                "account that does not belong to this organization."
+            )
+
+        if not account.is_active:
+            raise AccountingStateError(
+                f"Account {account.code} is inactive."
+            )
+
+        try:
+            debit = Decimal(
+                str(line_data.get("debit", "0.00"))
+            )
+
+            credit = Decimal(
+                str(line_data.get("credit", "0.00"))
+            )
+
+        except (InvalidOperation, TypeError, ValueError) as exc:
+            raise AccountingStateError(
+                f"Adjustment line {index} has an invalid amount."
+            ) from exc
+
+        validate_journal_line_amounts(
+            debit=debit,
+            credit=credit,
+            allow_zero=False,
+        )
+
+        prepared_lines.append({
+            "account": account,
+            "debit": debit,
+            "credit": credit,
+            "description": str(
+                line_data.get("description") or ""
+            ).strip(),
+        })
+
+    # 7. Create the standalone draft journal.
+    original_reference = (
+        original.reference or str(original.id)
+    )
+
+    reference = (
+        f"ADJ-{original_reference}-"
+        f"{uuid.uuid4().hex[:10]}"
+    )[:100]
+
+    journal_description = (
+        description.strip()
+        if isinstance(description, str) and description.strip()
+        else f"Adjustment of {original_reference}"
+    )
+
+    entry = JournalEntry(
+        organization_id=organization_id,
+        entry_date=entry_date,
+        currency=original.currency,
+        reference=reference,
+        description=journal_description,
+        status=JournalEntry.Status.DRAFT,
+        created_by=actor,
+    )
+
+    entry.full_clean()
+    entry.save(force_insert=True)
+
+    # 8. Create the journal lines.
+    journal_lines = []
+
+    for index, item in enumerate(prepared_lines, start=1):
+        line = JournalLine(
+            entry=entry,
+            line_number=index,
+            account=item["account"],
+            description=item["description"],
+            debit=item["debit"],
+            credit=item["credit"],
+        )
+
+        line.full_clean()
+        line.save(force_insert=True)
+
+        journal_lines.append(line)
+
+    # 9. Validate the complete journal before accepting the draft.
+    total_debit, total_credit = validate_journal_for_posting(
+        entry,
+        journal_lines,
+    )
+
+    # 10. Create the explicit adjustment relationship.
+    adjustment = JournalAdjustment(
+        organization_id=organization_id,
+        original_journal=original,
+        adjustment_journal=entry,
+        reason=reason.strip(),
+        created_by=actor,
+    )
+
+    adjustment.full_clean()
+    adjustment.save(force_insert=True)
+
+    # 11. Audit the standalone adjustment journal.
+    record_journal_audit(
+        entry=entry,
+        actor=actor,
+        operation="adjustment_draft_created",
+        changes={
+            "journal_status": {
+                "before": None,
+                "after": entry.status,
+            }
+        },
+        metadata={
+            "adjustment_id": str(adjustment.id),
+            "original_journal_id": str(original.id),
+            "original_reference": original.reference,
+            "adjustment_reason": reason.strip(),
+            "entry_date": entry.entry_date.isoformat(),
+            "total_debit": str(total_debit),
+            "total_credit": str(total_credit),
+            "line_count": len(journal_lines),
+        },
+        mirror_to_invoice=False,
+    )
+
+    # 12. Also record the adjustment against the original journal.
+    record_journal_audit(
+        entry=original,
+        actor=actor,
+        operation="journal_adjustment_created",
+        changes={},
+        metadata={
+            "adjustment_id": str(adjustment.id),
+            "adjustment_journal_id": str(entry.id),
+            "adjustment_reference": entry.reference,
+            "adjustment_reason": reason.strip(),
+        },
+    )
+
+    return entry
 

@@ -4,8 +4,13 @@ from django.utils import timezone
 
 from django.contrib.auth import get_user_model
 from django.test import TestCase
-
-from accounting.models import Account, JournalEntry, JournalLine
+from auditlog.models import JournalAuditEvent
+from accounting.models import (
+    Account,
+    JournalAdjustment,
+    JournalEntry,
+    JournalLine,
+)
 
 from accounting.services import (
     DEFAULT_CHART_OF_ACCOUNTS,
@@ -18,6 +23,8 @@ from accounting.services import (
     update_draft_journal_line,
     post_journal_entry,
     reverse_journal_entry,
+    record_journal_audit,
+    create_adjustment_journal
 )
 
 from approvals.models import ApprovalRequest, ApprovalDecision
@@ -629,6 +636,349 @@ class AccountingJournalLifecycleTests(TestCase):
             1,
         )
 
+    def test_invoice_draft_creation_records_journal_audit(self):
+        entry = self.create_draft()
+
+        event = JournalAuditEvent.objects.get(
+            journal_entry=entry,
+            operation="journal_draft_created",
+        )
+
+        self.assertEqual(event.actor, self.admin)
+        self.assertEqual(
+            event.changes["journal_status"]["after"],
+            JournalEntry.Status.DRAFT,
+        )
+        self.assertEqual(
+            event.metadata["source_invoice_id"],
+            str(self.invoice.id),
+        )
+        self.assertEqual(event.metadata["line_count"], 2)
+
+    def test_posting_records_journal_audit(self):
+        entry = self.create_draft()
+        self.post_entry(entry)
+
+        event = JournalAuditEvent.objects.get(
+            journal_entry=entry,
+            operation="journal_posted",
+        )
+
+        self.assertEqual(event.actor, self.admin)
+        self.assertEqual(
+            event.changes["journal_status"]["before"],
+            JournalEntry.Status.DRAFT,
+        )
+        self.assertEqual(
+            event.changes["journal_status"]["after"],
+            JournalEntry.Status.POSTED,
+        )
+
+    def test_reversal_records_audit_for_both_entries(self):
+        entry = self.create_draft()
+        self.post_entry(entry)
+
+        reversal = reverse_journal_entry(
+            organization_id=self.organization.id,
+            journal_entry_id=entry.id,
+            actor=self.admin,
+            reversal_reason="Testing journal audit history.",
+        )
+
+        reversal_event = JournalAuditEvent.objects.get(
+            journal_entry=reversal,
+            operation="journal_reversal_created",
+        )
+
+        original_event = JournalAuditEvent.objects.get(
+            journal_entry=entry,
+            operation="journal_reversed",
+        )
+
+        self.assertEqual(reversal_event.actor, self.admin)
+        self.assertEqual(
+            reversal_event.metadata["reversal_of_id"],
+            str(entry.id),
+        )
+        self.assertEqual(original_event.actor, self.admin)
+
+    def test_standalone_journal_can_be_audited_without_invoice(self):
+        entry = JournalEntry(
+            organization=self.organization,
+            entry_date=date(2026, 11, 10),
+            currency="NGN",
+            reference="MANUAL-AUDIT-001",
+            description="Standalone journal audit test.",
+            status=JournalEntry.Status.DRAFT,
+            created_by=self.admin,
+        )
+
+        entry.full_clean()
+        entry.save(force_insert=True)
+
+        event = record_journal_audit(
+            entry=entry,
+            actor=self.admin,
+            operation="adjustment_draft_created",
+            changes={
+                "journal_status": {
+                    "before": None,
+                    "after": JournalEntry.Status.DRAFT,
+                }
+            },
+            metadata={
+                "adjustment_reason": "Testing standalone journal auditing.",
+            },
+        )
+
+        self.assertIsNotNone(event)
+        self.assertEqual(event.journal_entry, entry)
+        self.assertEqual(event.actor, self.admin)
+        self.assertEqual(
+            event.metadata["adjustment_reason"],
+            "Testing standalone journal auditing.",
+        )
+
+    def test_finance_operator_can_create_balanced_adjustment(self):
+        original = self.create_draft()
+        self.post_entry(original)
+
+        # Simulate an original journal that has already been reversed.
+        reverse_journal_entry(
+            organization_id=self.organization.id,
+            journal_entry_id=original.id,
+            actor=self.admin,
+            reversal_reason="Testing adjustment after reversal.",
+        )
+
+        adjustment = create_adjustment_journal(
+            organization_id=self.organization.id,
+            original_journal_id=original.id,
+            actor=self.operator,
+            entry_date=date(2026, 10, 31),
+            reason="Correct ClearWave expense classification.",
+            description="ClearWave expense reclassification.",
+            lines=[
+                {
+                    "account_id": self.accounts["5100"].id,
+                    "debit": "752500.00",
+                    "credit": "0.00",
+                    "description": "Professional services expense",
+                },
+                {
+                    "account_id": self.accounts["5000"].id,
+                    "debit": "0.00",
+                    "credit": "752500.00",
+                    "description": "Reclassification from unclassified expense",
+                },
+            ],
+        )
+
+        adjustment.refresh_from_db()
+
+        self.assertEqual(
+            adjustment.status,
+            JournalEntry.Status.DRAFT,
+        )
+        self.assertEqual(
+            adjustment.entry_date,
+            date(2026, 10, 31),
+        )
+        self.assertEqual(
+            adjustment.currency,
+            original.currency,
+        )
+        self.assertIsNone(adjustment.source_invoice_id)
+        self.assertIsNone(adjustment.approval_decision_id)
+        self.assertIsNone(adjustment.reversal_of_id)
+
+        adjustment_record = JournalAdjustment.objects.get(
+            adjustment_journal=adjustment,
+        )
+
+        self.assertEqual(
+            adjustment_record.original_journal,
+            original,
+        )
+        self.assertEqual(
+            adjustment_record.reason,
+            "Correct ClearWave expense classification.",
+        )
+        self.assertEqual(
+            adjustment_record.created_by,
+            self.operator,
+        )
+
+        debit_total = sum(
+            line.debit
+            for line in adjustment.lines.all()
+        )
+        credit_total = sum(
+            line.credit
+            for line in adjustment.lines.all()
+        )
+
+        self.assertEqual(debit_total, Decimal("752500.00"))
+        self.assertEqual(credit_total, Decimal("752500.00"))
+
+        self.assertTrue(
+            JournalAuditEvent.objects.filter(
+                journal_entry=adjustment,
+                operation="adjustment_draft_created",
+            ).exists()
+        )
+
+        self.assertTrue(
+            JournalAuditEvent.objects.filter(
+                journal_entry=original,
+                operation="journal_adjustment_created",
+            ).exists()
+        )
+
+    def test_unbalanced_adjustment_is_rolled_back(self):
+        original = self.create_draft()
+        self.post_entry(original)
+
+        journal_count_before = JournalEntry.objects.count()
+
+        with self.assertRaises(AccountingStateError):
+            create_adjustment_journal(
+                organization_id=self.organization.id,
+                original_journal_id=original.id,
+                actor=self.operator,
+                entry_date=date(2026, 10, 31),
+                reason="Test unbalanced adjustment.",
+                lines=[
+                    {
+                        "account_id": self.accounts["5100"].id,
+                        "debit": "100000.00",
+                        "credit": "0.00",
+                    },
+                    {
+                        "account_id": self.accounts["5000"].id,
+                        "debit": "0.00",
+                        "credit": "90000.00",
+                    },
+                ],
+            )
+
+        self.assertEqual(
+            JournalEntry.objects.count(),
+            journal_count_before,
+        )
+
+        self.assertEqual(
+            JournalAdjustment.objects.count(),
+            0,
+        )
+
+    def test_adjustment_requires_posted_or_reversed_original(self):
+        original = self.create_draft()
+
+        with self.assertRaises(AccountingStateError):
+            create_adjustment_journal(
+                organization_id=self.organization.id,
+                original_journal_id=original.id,
+                actor=self.operator,
+                entry_date=date(2026, 10, 31),
+                reason="Attempt to adjust a draft.",
+                lines=[
+                    {
+                        "account_id": self.accounts["5100"].id,
+                        "debit": "100000.00",
+                        "credit": "0.00",
+                    },
+                    {
+                        "account_id": self.accounts["5000"].id,
+                        "debit": "0.00",
+                        "credit": "100000.00",
+                    },
+                ],
+            )
+
+        self.assertEqual(
+            JournalAdjustment.objects.count(),
+            0,
+        )
+
+    def test_reversal_entry_cannot_be_adjustment_target(self):
+        original = self.create_draft()
+        self.post_entry(original)
+
+        reversal = reverse_journal_entry(
+            organization_id=self.organization.id,
+            journal_entry_id=original.id,
+            actor=self.admin,
+            reversal_reason="Testing reversal target restriction.",
+        )
+
+        with self.assertRaises(AccountingStateError):
+            create_adjustment_journal(
+                organization_id=self.organization.id,
+                original_journal_id=reversal.id,
+                actor=self.operator,
+                entry_date=date(2026, 10, 31),
+                reason="Attempt to adjust reversal directly.",
+                lines=[
+                    {
+                        "account_id": self.accounts["5100"].id,
+                        "debit": "100000.00",
+                        "credit": "0.00",
+                    },
+                    {
+                        "account_id": self.accounts["5000"].id,
+                        "debit": "0.00",
+                        "credit": "100000.00",
+                    },
+                ],
+            )
+
+        self.assertEqual(
+            JournalAdjustment.objects.count(),
+            0,
+        )
+
+    def test_read_only_user_cannot_create_adjustment(self):
+        original = self.create_draft()
+        self.post_entry(original)
+
+        readonly_user = get_user_model().objects.create_user(
+            username="adjustment_readonly",
+            password="test-password-123",
+        )
+
+        OrganizationMembership.objects.create(
+            organization=self.organization,
+            user=readonly_user,
+            role=OrganizationMembership.Role.READ_ONLY,
+        )
+
+        with self.assertRaises(AccountingPermissionError):
+            create_adjustment_journal(
+                organization_id=self.organization.id,
+                original_journal_id=original.id,
+                actor=readonly_user,
+                entry_date=date(2026, 10, 31),
+                reason="Unauthorized adjustment.",
+                lines=[
+                    {
+                        "account_id": self.accounts["5100"].id,
+                        "debit": "100000.00",
+                        "credit": "0.00",
+                    },
+                    {
+                        "account_id": self.accounts["5000"].id,
+                        "debit": "0.00",
+                        "credit": "100000.00",
+                    },
+                ],
+            )
+
+        self.assertEqual(
+            JournalAdjustment.objects.count(),
+            0,
+        )
+
 class AccountingAPITests(TestCase):
 
     def setUp(self):
@@ -1172,6 +1522,302 @@ class AccountingAPITests(TestCase):
         )
 
         self.assertEqual(response.status_code, 400)
+
+    def create_posted_original_for_adjustment(self):
+        post_journal_entry(
+            organization_id=self.organization.id,
+            journal_entry_id=self.entry.id,
+            actor=self.admin,
+        )
+
+        self.entry.refresh_from_db()
+        return self.entry
+
+    def adjustment_payload(self):
+        return {
+            "entry_date": "2026-10-31",
+            "reason": "Correct expense account classification.",
+            "description": "Expense reclassification adjustment.",
+            "lines": [
+                {
+                    "account_id": str(self.accounts["5100"].id),
+                    "debit": "752500.00",
+                    "credit": "0.00",
+                    "description": "Professional services expense",
+                },
+                {
+                    "account_id": str(self.accounts["5000"].id),
+                    "debit": "0.00",
+                    "credit": "752500.00",
+                    "description": "Reclassification from unclassified expense",
+                },
+            ],
+        }
+
+    def adjustment_url(self, journal_id=None):
+        return reverse(
+            "accounting-journal-adjustment-create",
+            kwargs={
+                "organization_id": self.organization.id,
+                "journal_entry_id": journal_id or self.entry.id,
+            },
+        )
+
+    def test_finance_operator_can_create_adjustment_through_api(self):
+        original = self.create_posted_original_for_adjustment()
+        self.authenticate_as(self.operator)
+
+        response = self.client.post(
+            self.adjustment_url(original.id),
+            self.adjustment_payload(),
+            format="json",
+        )
+
+        self.assertEqual(response.status_code, 201)
+
+        journal_data = response.data["journal"]
+        adjustment_data = response.data["adjustment"]
+
+        adjustment = JournalEntry.objects.get(
+            pk=journal_data["id"],
+        )
+
+        self.assertEqual(
+            adjustment.status,
+            JournalEntry.Status.DRAFT,
+        )
+        self.assertEqual(
+            adjustment.entry_date,
+            date(2026, 10, 31),
+        )
+        self.assertEqual(adjustment.currency, "NGN")
+        self.assertIsNone(adjustment.source_invoice_id)
+
+        record = JournalAdjustment.objects.get(
+            adjustment_journal=adjustment,
+        )
+
+        self.assertEqual(record.original_journal, original)
+        self.assertEqual(
+            record.created_by,
+            self.operator,
+        )
+
+        self.assertEqual(
+            adjustment_data["original_journal_id"],
+            str(original.id),
+        )
+
+        self.assertEqual(
+            adjustment_data["reason"],
+            "Correct expense account classification.",
+        )
+
+        self.assertEqual(
+            len(journal_data["lines"]),
+            2,
+        )
+
+        self.assertTrue(
+            JournalAuditEvent.objects.filter(
+                journal_entry=adjustment,
+                operation="adjustment_draft_created",
+            ).exists()
+        )
+
+    def test_read_only_member_cannot_create_adjustment_through_api(self):
+        original = self.create_posted_original_for_adjustment()
+        self.authenticate_as(self.readonly)
+
+        response = self.client.post(
+            self.adjustment_url(original.id),
+            self.adjustment_payload(),
+            format="json",
+        )
+
+        self.assertEqual(response.status_code, 403)
+        self.assertEqual(
+            JournalAdjustment.objects.count(),
+            0,
+        )
+
+    def test_unbalanced_adjustment_is_rejected_through_api(self):
+        original = self.create_posted_original_for_adjustment()
+        self.authenticate_as(self.operator)
+
+        payload = self.adjustment_payload()
+        payload["lines"][1]["credit"] = "700000.00"
+
+        journal_count_before = JournalEntry.objects.count()
+
+        response = self.client.post(
+            self.adjustment_url(original.id),
+            payload,
+            format="json",
+        )
+
+        self.assertEqual(response.status_code, 400)
+
+        self.assertEqual(
+            JournalEntry.objects.count(),
+            journal_count_before,
+        )
+
+        self.assertEqual(
+            JournalAdjustment.objects.count(),
+            0,
+        )
+
+    def test_foreign_organization_account_is_rejected_through_api(self):
+        original = self.create_posted_original_for_adjustment()
+        self.authenticate_as(self.operator)
+
+        other_organization = Organization.objects.create(
+            name="Other Accounting Company",
+            slug="other-accounting-company",
+            default_currency="NGN",
+        )
+
+        other_accounts = initialize_chart_of_accounts(
+            organization=other_organization,
+        )
+
+        payload = self.adjustment_payload()
+
+        payload["lines"][0]["account_id"] = str(
+            other_accounts["5100"].id
+        )
+
+        journal_count_before = JournalEntry.objects.count()
+
+        response = self.client.post(
+            self.adjustment_url(original.id),
+            payload,
+            format="json",
+        )
+
+        self.assertEqual(response.status_code, 400)
+
+        self.assertEqual(
+            JournalEntry.objects.count(),
+            journal_count_before,
+        )
+
+        self.assertEqual(
+            JournalAdjustment.objects.count(),
+            0,
+        )
+
+    def test_missing_original_journal_returns_404(self):
+        self.authenticate_as(self.operator)
+
+        missing_journal_id = (
+            "00000000-0000-0000-0000-000000000001"
+        )
+
+        response = self.client.post(
+            self.adjustment_url(missing_journal_id),
+            self.adjustment_payload(),
+            format="json",
+        )
+
+        self.assertEqual(response.status_code, 404)
+        self.assertEqual(
+            JournalAdjustment.objects.count(),
+            0,
+        )
+
+    def test_finance_operator_can_update_draft_journal_date(self):
+        self.authenticate_as(self.operator)
+
+        url = reverse(
+            "accounting-journal-date-update",
+            kwargs={
+                "organization_id": self.organization.id,
+                "journal_entry_id": self.entry.id,
+            },
+        )
+
+        response = self.client.patch(
+            url,
+            {
+                "entry_date": "2026-11-10",
+                "correction_reason": (
+                    "Correct the date of the ClearWave post-reversal "
+                    "balance restoration adjustment."
+                ),
+            },
+            format="json",
+        )
+
+        self.assertEqual(response.status_code, 200)
+
+        self.entry.refresh_from_db()
+
+        self.assertEqual(
+            self.entry.entry_date,
+            date(2026, 11, 10),
+        )
+
+        self.assertTrue(
+            JournalAuditEvent.objects.filter(
+                journal_entry=self.entry,
+                operation="journal_entry_date_updated",
+            ).exists()
+        )
+
+
+    def test_read_only_member_cannot_update_draft_journal_date(self):
+        self.authenticate_as(self.readonly)
+
+        url = reverse(
+            "accounting-journal-date-update",
+            kwargs={
+                "organization_id": self.organization.id,
+                "journal_entry_id": self.entry.id,
+            },
+        )
+
+        response = self.client.patch(
+            url,
+            {
+                "entry_date": "2026-11-10",
+                "correction_reason": "Test permission restriction.",
+            },
+            format="json",
+        )
+
+        self.assertEqual(response.status_code, 403)
+
+
+    def test_posted_journal_date_cannot_be_updated(self):
+        self.authenticate_as(self.admin)
+
+        post_response = self.client.post(self.post_url)
+
+        self.assertEqual(post_response.status_code, 200)
+
+        self.authenticate_as(self.operator)
+
+        url = reverse(
+            "accounting-journal-date-update",
+            kwargs={
+                "organization_id": self.organization.id,
+                "journal_entry_id": self.entry.id,
+            },
+        )
+
+        response = self.client.patch(
+            url,
+            {
+                "entry_date": "2026-11-10",
+                "correction_reason": "Test posted journal protection.",
+            },
+            format="json",
+        )
+
+        self.assertEqual(response.status_code, 400)
+
 
 class AccountingReportingAPITests(TestCase):
 

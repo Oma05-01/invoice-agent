@@ -20,6 +20,8 @@ from accounting.serializers import (
     TrialBalanceQuerySerializer,
     IncomeStatementQuerySerializer,
     BalanceSheetQuerySerializer,
+    JournalAdjustmentCreateSerializer,
+    JournalEntryDateUpdateSerializer
 )
 from accounting.services import (
     AccountingConfigurationError,
@@ -30,6 +32,8 @@ from accounting.services import (
     require_accounting_role,
     reverse_journal_entry,
     update_draft_journal_line,
+    create_adjustment_journal,
+    update_draft_journal_entry_date
 )
 
 from accounting.reporting import (
@@ -400,6 +404,83 @@ class JournalEntryReverseAPIView(
         ) as exc:
             return accounting_error_response(exc)
 
+
+class JournalAdjustmentCreateAPIView(
+    OrganizationAccountingAPIView
+):
+    def post(
+        self,
+        request,
+        organization_id,
+        journal_entry_id,
+    ):
+        self.get_membership(request, organization_id)
+
+        serializer = JournalAdjustmentCreateSerializer(
+            data=request.data,
+        )
+        serializer.is_valid(raise_exception=True)
+
+        try:
+            entry = create_adjustment_journal(
+                organization_id=organization_id,
+                original_journal_id=journal_entry_id,
+                actor=request.user,
+                entry_date=serializer.validated_data["entry_date"],
+                reason=serializer.validated_data["reason"],
+                description=serializer.validated_data["description"],
+                lines=serializer.validated_data["lines"],
+            )
+
+            entry = (
+                JournalEntry.objects
+                .select_related(
+                    "created_by",
+                    "posted_by",
+                )
+                .prefetch_related(
+                    Prefetch(
+                        "lines",
+                        queryset=JournalLine.objects.select_related(
+                            "account"
+                        ).order_by("line_number"),
+                    )
+                )
+                .get(pk=entry.pk)
+            )
+
+            adjustment = entry.adjustment_record
+
+            return Response(
+                {
+                    "journal": JournalEntrySerializer(entry).data,
+                    "adjustment": {
+                        "id": str(adjustment.id),
+                        "original_journal_id": str(
+                            adjustment.original_journal_id
+                        ),
+                        "adjustment_journal_id": str(
+                            adjustment.adjustment_journal_id
+                        ),
+                        "reason": adjustment.reason,
+                    },
+                    "message": "Adjustment journal draft created successfully.",
+                },
+                status=status.HTTP_201_CREATED,
+            )
+
+        except JournalEntry.DoesNotExist:
+            raise NotFound("Original journal not found.")
+
+        except (
+            AccountingPermissionError,
+            AccountingStateError,
+            AccountingConfigurationError,
+            ValidationError,
+        ) as exc:
+            return accounting_error_response(exc)
+
+
 class AccountLedgerAPIView(OrganizationAccountingAPIView):
     """
     Return the transaction history and running balance
@@ -475,6 +556,7 @@ class TrialBalanceAPIView(OrganizationAccountingAPIView):
 
         return Response(report)
 
+
 class IncomeStatementAPIView(OrganizationAccountingAPIView):
     """
     Return revenue, expenses and net income for a date range.
@@ -531,3 +613,46 @@ class BalanceSheetAPIView(OrganizationAccountingAPIView):
         )
 
         return Response(report)
+
+class JournalEntryDateUpdateAPIView(
+    OrganizationAccountingAPIView
+):
+    def patch(
+        self,
+        request,
+        organization_id,
+        journal_entry_id,
+    ):
+        self.get_membership(request, organization_id)
+
+        serializer = JournalEntryDateUpdateSerializer(
+            data=request.data,
+        )
+        serializer.is_valid(raise_exception=True)
+
+        try:
+            entry = update_draft_journal_entry_date(
+                organization_id=organization_id,
+                journal_entry_id=journal_entry_id,
+                actor=request.user,
+                entry_date=serializer.validated_data["entry_date"],
+                correction_reason=serializer.validated_data[
+                    "correction_reason"
+                ],
+            )
+
+            return Response(
+                JournalEntrySerializer(entry).data
+            )
+
+        except JournalEntry.DoesNotExist:
+            raise NotFound("Journal entry not found.")
+
+        except (
+            AccountingPermissionError,
+            AccountingStateError,
+            AccountingConfigurationError,
+            ValidationError,
+        ) as exc:
+            return accounting_error_response(exc)
+

@@ -122,6 +122,34 @@ class ApprovalWorkflowAPITests(TestCase):
 
         self.assertIsNone(response.data["decision"])
 
+    def test_finance_operator_can_view_rejected_request_details(self):
+        self.approval_request.status = ApprovalRequest.Status.REJECTED
+        self.approval_request.save(update_fields=["status"])
+
+        self.invoice.status = Invoice.Status.REJECTED
+        self.invoice.save(update_fields=["status"])
+
+        self.client.force_authenticate(user=self.submitter)
+
+        response = self.client.get(self.detail_url)
+
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual(
+            response.data["approval_request"]["status"],
+            ApprovalRequest.Status.REJECTED,
+        )
+        self.assertEqual(
+            response.data["invoice"]["status"],
+            Invoice.Status.REJECTED,
+        )
+
+    def test_finance_operator_cannot_view_pending_request_details(self):
+        self.client.force_authenticate(user=self.submitter)
+
+        response = self.client.get(self.detail_url)
+
+        self.assertEqual(response.status_code, 403)
+
     def test_finance_reviewer_can_approve_invoice(self):
         response = self.client.post(
             self.approve_url,

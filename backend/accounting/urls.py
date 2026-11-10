@@ -12,6 +12,8 @@ from accounting.views import (
     TrialBalanceAPIView,
     IncomeStatementAPIView,
     BalanceSheetAPIView,
+    JournalAdjustmentCreateAPIView,
+    JournalEntryDateUpdateAPIView,
 )
 
 
@@ -71,5 +73,16 @@ urlpatterns = [
         BalanceSheetAPIView.as_view(),
         name="accounting-balance-sheet",
     ),
+    path(
+        "organizations/<uuid:organization_id>/accounting/journals/<uuid:journal_entry_id>/date/",
+        JournalEntryDateUpdateAPIView.as_view(),
+        name="accounting-journal-date-update",
+    ),
+    path(
+        "organizations/<uuid:organization_id>/accounting/journals/<uuid:journal_entry_id>/adjustments/",
+        JournalAdjustmentCreateAPIView.as_view(),
+        name="accounting-journal-adjustment-create",
+    ),
+
 ]
 

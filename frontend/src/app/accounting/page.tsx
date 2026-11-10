@@ -22,6 +22,7 @@ import { useAuth } from "@/components/auth-provider";
 import { ProtectedRoute } from "@/components/protected-route";
 import { JournalDetailPanel } from "@/components/accounting/journal-detail-panel";
 import { AccountingReports } from "@/components/accounting/accounting-reports";
+import { JournalAdjustmentForm } from "@/components/accounting/journal-adjustment-form";
 
 import {
   fetchAccountingAccounts,
@@ -772,7 +773,17 @@ function AccountingWorkspace() {
                 {/* Journal entries */}
                 {activeTab === "journals" && (
                   <div>
-
+                    {!loading && canEditDraft && (
+                      <JournalAdjustmentForm
+                        key={organizationId}
+                        organizationId={organizationId}
+                        journals={journals}
+                        accounts={accounts}
+                        canCreate={canEditDraft}
+                        onCreated={handleRefresh}
+                      />
+                    )}
+                  
                     <div className="flex flex-col justify-between gap-4 border-b border-slate-100 p-5 lg:flex-row lg:items-center">
 
                       <div>

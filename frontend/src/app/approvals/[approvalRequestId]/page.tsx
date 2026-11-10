@@ -36,6 +36,11 @@ const RETURN_ROLES = [
   "finance_operator",
 ];
 
+const DETAIL_ROLES = [
+  ...APPROVER_ROLES,
+  ...RETURN_ROLES,
+];
+
 type DecisionAction =
   | "approve"
   | "reject"
@@ -153,9 +158,9 @@ function ApprovalDetailWorkspace() {
         return;
       }
 
-      if (!membership || !APPROVER_ROLES.includes(role)) {
+      if (!membership || !DETAIL_ROLES.includes(role)) {
         setError(
-          "Your organization membership does not permit approval access.",
+          "Your organization membership does not permit access to this approval request.",
         );
         setLoading(false);
         return;

@@ -251,3 +251,81 @@ class BalanceSheetQuerySerializer(serializers.Serializer):
 
         return value
 
+class JournalAdjustmentLineInputSerializer(serializers.Serializer):
+    account_id = serializers.UUIDField()
+
+    debit = serializers.DecimalField(
+        max_digits=18,
+        decimal_places=2,
+        min_value=Decimal("0.00"),
+        required=False,
+        default=Decimal("0.00"),
+    )
+
+    credit = serializers.DecimalField(
+        max_digits=18,
+        decimal_places=2,
+        min_value=Decimal("0.00"),
+        required=False,
+        default=Decimal("0.00"),
+    )
+
+    description = serializers.CharField(
+        required=False,
+        allow_blank=True,
+        default="",
+    )
+
+    def validate(self, attrs):
+        debit = attrs["debit"]
+        credit = attrs["credit"]
+
+        if debit > 0 and credit > 0:
+            raise serializers.ValidationError(
+                "A journal line cannot contain both a debit and a credit."
+            )
+
+        if debit == 0 and credit == 0:
+            raise serializers.ValidationError(
+                "A journal line must contain a positive debit or credit."
+            )
+
+        return attrs
+
+
+class JournalAdjustmentCreateSerializer(serializers.Serializer):
+    entry_date = serializers.DateField()
+
+    reason = serializers.CharField(
+        allow_blank=False,
+        trim_whitespace=True,
+    )
+
+    description = serializers.CharField(
+        required=False,
+        allow_blank=True,
+        default="",
+    )
+
+    lines = JournalAdjustmentLineInputSerializer(
+        many=True,
+        allow_empty=False,
+    )
+
+    def validate_lines(self, value):
+        if len(value) < 2:
+            raise serializers.ValidationError(
+                "An adjustment must contain at least two journal lines."
+            )
+
+        return value
+
+class JournalEntryDateUpdateSerializer(serializers.Serializer):
+    entry_date = serializers.DateField()
+
+    correction_reason = serializers.CharField(
+        max_length=2000,
+        allow_blank=False,
+        trim_whitespace=True,
+    )
+

@@ -160,13 +160,16 @@ class ApprovalDetailAPIView(ApprovalAPIView):
         approval_request_id,
     ):
 
-        membership, error_response = self.get_approver_access(
+        membership = self.get_membership(
             request,
             organization_id,
         )
 
-        if error_response:
-            return error_response
+        if membership is None:
+            return Response(
+                {"detail": "Organization not found or access denied."},
+                status=status.HTTP_404_NOT_FOUND,
+            )
 
         approval_request = (
             ApprovalRequest.objects
@@ -187,6 +190,22 @@ class ApprovalDetailAPIView(ApprovalAPIView):
             return Response(
                 {"detail": "Approval request not found."},
                 status=status.HTTP_404_NOT_FOUND,
+            )
+
+        can_view_as_approver = (
+            membership.role in APPROVER_ROLES
+        )
+
+        can_view_for_return = (
+            membership.role in RETURN_TO_REVIEW_ROLES
+            and approval_request.status == ApprovalRequest.Status.REJECTED
+            and approval_request.invoice.status == Invoice.Status.REJECTED
+        )
+
+        if not (can_view_as_approver or can_view_for_return):
+            return Response(
+                {"detail": "You are not authorized to view this approval request."},
+                status=status.HTTP_403_FORBIDDEN,
             )
 
         decision = (

@@ -218,3 +218,33 @@ export interface BalanceSheetResponse {
   report_basis: string;
 }
 
+export interface JournalAdjustmentLineInput {
+  account_id: string;
+  debit: string;
+  credit: string;
+  description: string;
+}
+
+export interface JournalAdjustmentRequest {
+  entry_date: string;
+  reason: string;
+  description: string;
+  lines: JournalAdjustmentLineInput[];
+}
+
+export interface JournalAdjustmentResponse {
+  journal: JournalEntry;
+  adjustment: {
+    id: string;
+    original_journal_id: string;
+    adjustment_journal_id: string;
+    reason: string;
+  };
+  message: string;
+}
+
+export interface JournalEntryDateUpdateRequest {
+  entry_date: string;
+  correction_reason: string;
+}
+

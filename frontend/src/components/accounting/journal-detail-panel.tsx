@@ -16,6 +16,7 @@ import {
   postJournalEntry,
   reverseJournalEntry,
   updateJournalLine,
+  updateDraftJournalEntryDate,
 } from "@/lib/accounting";
 
 import type {
@@ -312,6 +313,11 @@ export function JournalDetailPanel({
   const [reversalReason, setReversalReason] = useState("");
   const [actionError, setActionError] = useState("");
   const [actionLoading, setActionLoading] = useState(false);
+  const [entryDate, setEntryDate] = useState(journal.entry_date);
+  const [dateCorrectionReason, setDateCorrectionReason] = useState("");
+  const [dateSaving, setDateSaving] = useState(false);
+  const [dateError, setDateError] = useState("");
+  const [dateSuccess, setDateSuccess] = useState(false);
 
   const totals = getTotals(journal.lines);
 
@@ -362,6 +368,50 @@ export function JournalDetailPanel({
       );
     } finally {
       setActionLoading(false);
+    }
+  }
+
+    async function handleDateUpdate(
+    event: FormEvent<HTMLFormElement>,
+  ) {
+    event.preventDefault();
+
+    if (!canEdit || dateSaving) return;
+
+    if (!entryDate || !dateCorrectionReason.trim()) {
+      setDateError(
+        "An entry date and correction reason are required.",
+      );
+      return;
+    }
+
+    setDateSaving(true);
+    setDateError("");
+    setDateSuccess(false);
+
+    try {
+      const updated = await updateDraftJournalEntryDate(
+        organizationId,
+        journal.id,
+        {
+          entry_date: entryDate,
+          correction_reason: dateCorrectionReason.trim(),
+        },
+      );
+
+      setEntryDate(updated.entry_date);
+      setDateCorrectionReason("");
+      setDateSuccess(true);
+
+      onChanged();
+    } catch (err) {
+      setDateError(
+        err instanceof Error
+          ? err.message
+          : "Unable to update the journal entry date.",
+      );
+    } finally {
+      setDateSaving(false);
     }
   }
 
@@ -416,6 +466,91 @@ export function JournalDetailPanel({
           )}
         </div>
       </div>
+
+            {canEdit && (
+        <form
+          onSubmit={handleDateUpdate}
+          className="rounded-lg border border-slate-200 bg-white p-4"
+        >
+          <h4 className="text-xs font-bold text-slate-800">
+            Draft journal date
+          </h4>
+
+          <p className="mt-1 text-xs text-slate-500">
+            Changes to the entry date are recorded in the journal audit history.
+          </p>
+
+          <div className="mt-3 grid gap-3 md:grid-cols-2">
+            <label className="block">
+              <span className="mb-1.5 block text-xs font-semibold text-slate-600">
+                Entry date
+              </span>
+
+              <input
+                type="date"
+                value={entryDate}
+                onChange={(event) => {
+                  setEntryDate(event.target.value);
+                  setDateError("");
+                  setDateSuccess(false);
+                }}
+                required
+                disabled={dateSaving}
+                className="h-10 w-full rounded-lg border border-slate-200 bg-white px-3 text-xs outline-none focus:border-blue-500 disabled:bg-slate-100"
+              />
+            </label>
+
+            <label className="block">
+              <span className="mb-1.5 block text-xs font-semibold text-slate-600">
+                Reason for date correction
+              </span>
+
+              <input
+                value={dateCorrectionReason}
+                onChange={(event) => {
+                  setDateCorrectionReason(event.target.value);
+                  setDateError("");
+                }}
+                required
+                maxLength={2000}
+                placeholder="Explain why the date is changing"
+                disabled={dateSaving}
+                className="h-10 w-full rounded-lg border border-slate-200 px-3 text-xs outline-none focus:border-blue-500 disabled:bg-slate-100"
+              />
+            </label>
+          </div>
+
+          {dateError && (
+            <p role="alert" className="mt-3 text-xs text-rose-700">
+              {dateError}
+            </p>
+          )}
+
+          {dateSuccess && (
+            <p className="mt-3 inline-flex items-center gap-1.5 text-xs text-emerald-700">
+              <CheckCircle2 size={13} />
+              Journal date updated and recorded in the audit history.
+            </p>
+          )}
+
+          <button
+            type="submit"
+            disabled={
+              dateSaving ||
+              !dateCorrectionReason.trim() ||
+              !entryDate
+            }
+            className="mt-3 inline-flex items-center gap-1.5 rounded-lg bg-blue-700 px-3 py-2 text-xs font-semibold text-white transition hover:bg-blue-800 disabled:cursor-not-allowed disabled:opacity-40"
+          >
+            {dateSaving ? (
+              <LoaderCircle size={13} className="animate-spin" />
+            ) : (
+              <Save size={13} />
+            )}
+            Save date correction
+          </button>
+        </form>
+      )}
 
       {journal.source_invoice_id && (
         <div className="rounded-lg border border-slate-200 bg-white p-3">

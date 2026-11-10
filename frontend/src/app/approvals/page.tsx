@@ -432,3 +432,4 @@ export default function ApprovalQueuePage() {
     </ProtectedRoute>
   );
 }
+

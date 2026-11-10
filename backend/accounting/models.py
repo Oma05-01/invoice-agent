@@ -318,3 +318,96 @@ class JournalLine(TimeStampedUUIDModel):
         return (
             f"{self.entry} - Line {self.line_number}"
         )
+
+class JournalAdjustment(TimeStampedUUIDModel):
+
+    organization = models.ForeignKey(
+        Organization,
+        on_delete=models.PROTECT,
+        related_name="journal_adjustments",
+    )
+
+    original_journal = models.ForeignKey(
+        JournalEntry,
+        on_delete=models.PROTECT,
+        related_name="adjustments",
+    )
+
+    adjustment_journal = models.OneToOneField(
+        JournalEntry,
+        on_delete=models.PROTECT,
+        related_name="adjustment_record",
+    )
+
+    reason = models.TextField()
+
+    created_by = models.ForeignKey(
+        settings.AUTH_USER_MODEL,
+        on_delete=models.SET_NULL,
+        null=True,
+        blank=True,
+        related_name="created_journal_adjustments",
+    )
+
+    class Meta:
+        ordering = ["-created_at"]
+
+        indexes = [
+            models.Index(
+                fields=["organization", "created_at"],
+                name="j_adj_org_created_idx",
+            ),
+            models.Index(
+                fields=["original_journal", "created_at"],
+                name="j_adj_original_created_idx",
+            ),
+        ]
+
+    def clean(self):
+        super().clean()
+
+        errors = {}
+
+        if self.original_journal_id and self.adjustment_journal_id:
+            if self.original_journal_id == self.adjustment_journal_id:
+                errors["adjustment_journal"] = (
+                    "An adjustment cannot reference itself."
+                )
+
+            if (
+                self.original_journal.organization_id
+                != self.organization_id
+                or self.adjustment_journal.organization_id
+                != self.organization_id
+            ):
+                errors["organization"] = (
+                    "Both journals must belong to the adjustment organization."
+                )
+
+            if (
+                self.original_journal.currency
+                != self.adjustment_journal.currency
+            ):
+                errors["adjustment_journal"] = (
+                    "The original and adjustment journals "
+                    "must use the same currency."
+                )
+
+            if (
+                self.adjustment_journal.source_invoice_id
+                or self.adjustment_journal.approval_decision_id
+                or self.adjustment_journal.reversal_of_id
+            ):
+                errors["adjustment_journal"] = (
+                    "An adjustment must be a standalone journal, "
+                    "not an invoice or reversal journal."
+                )
+
+        if errors:
+            raise ValidationError(errors)
+
+    def __str__(self):
+        return (
+            f"Adjustment of {self.original_journal.reference} "
+            f"by {self.adjustment_journal.reference}"
+        )
