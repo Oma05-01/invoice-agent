@@ -5,7 +5,7 @@ from django.urls import reverse
 from django.test import SimpleTestCase
 from rest_framework.test import APIClient
 from pydantic import ValidationError
-from datetime import timedelta
+from datetime import timedelta, date
 from rest_framework import status
 from django.utils import timezone
 from invoices.schemas import InvoiceExtractionResult
@@ -24,6 +24,10 @@ from invoices.providers.groq_provider import (
 )
 from invoices.services.validation import (
     validate_invoice_extraction,
+)
+from invoices.services.payment_terms import (
+    normalize_payment_terms,
+    resolve_due_date,
 )
 
 from invoices.services.outbox import (
@@ -440,6 +444,133 @@ class GroqStrictOutputTests(SimpleTestCase):
                 call_kwargs["max_completion_tokens"],
                 4096,
             )
+
+
+class PaymentTermsNormalizationTests(SimpleTestCase):
+
+    def test_normalizes_net_30(self):
+        result = normalize_payment_terms("Net 30")
+
+        self.assertEqual(result.days, 30)
+        self.assertEqual(result.basis, "unknown")
+
+    def test_normalizes_generic_days(self):
+        result = normalize_payment_terms("30 days")
+
+        self.assertEqual(result.days, 30)
+        self.assertEqual(result.basis, "unknown")
+
+    def test_recognizes_invoice_date_basis(self):
+        result = normalize_payment_terms(
+            "30 days from invoice date"
+        )
+
+        self.assertEqual(result.days, 30)
+        self.assertEqual(result.basis, "invoice_date")
+
+    def test_recognizes_receipt_date_basis(self):
+        result = normalize_payment_terms(
+            "14 days from receipt"
+        )
+
+        self.assertEqual(result.days, 14)
+        self.assertEqual(result.basis, "receipt_date")
+
+    def test_recognizes_month_end_terms(self):
+        result = normalize_payment_terms(
+            "Payment at month end"
+        )
+
+        self.assertIsNone(result.days)
+        self.assertEqual(result.basis, "month_end")
+
+    def test_compound_discount_terms_remain_unclassified(self):
+        result = normalize_payment_terms("2/10 Net 30")
+
+        self.assertIsNone(result.days)
+        self.assertEqual(result.basis, "unknown")
+
+    def test_unknown_terms_are_not_interpreted(self):
+        for value in (None, "", "Immediate", "Upon delivery"):
+            with self.subTest(value=value):
+                result = normalize_payment_terms(value)
+
+                self.assertIsNone(result.days)
+                self.assertEqual(result.basis, "unknown")
+
+    def test_calculates_due_date_from_invoice_date_terms(self):
+        terms = normalize_payment_terms(
+            "30 days from invoice date"
+        )
+
+        result = resolve_due_date(
+            explicit_due_date=None,
+            invoice_date=date(2026, 11, 6),
+            payment_terms=terms,
+        )
+
+        self.assertEqual(
+            result.due_date,
+            date(2026, 12, 6),
+        )
+
+        self.assertEqual(result.source, "calculated")
+
+    def test_explicit_due_date_takes_priority(self):
+        terms = normalize_payment_terms(
+            "30 days from invoice date"
+        )
+
+        explicit_date = date(2026, 11, 20)
+
+        result = resolve_due_date(
+            explicit_due_date=explicit_date,
+            invoice_date=date(2026, 11, 6),
+            payment_terms=terms,
+        )
+
+        self.assertEqual(result.due_date, explicit_date)
+        self.assertEqual(result.source, "document")
+
+    def test_receipt_terms_are_not_calculated_without_receipt_date(self):
+        terms = normalize_payment_terms(
+            "14 days from receipt"
+        )
+
+        result = resolve_due_date(
+            explicit_due_date=None,
+            invoice_date=date(2026, 11, 6),
+            payment_terms=terms,
+        )
+
+        self.assertIsNone(result.due_date)
+        self.assertEqual(result.source, "")
+
+    def test_net_30_does_not_calculate_due_date(self):
+        terms = normalize_payment_terms("Net 30")
+
+        result = resolve_due_date(
+            explicit_due_date=None,
+            invoice_date=date(2026, 11, 6),
+            payment_terms=terms,
+        )
+
+        self.assertIsNone(result.due_date)
+        self.assertEqual(result.source, "")
+
+    def test_missing_invoice_date_prevents_calculation(self):
+        terms = normalize_payment_terms(
+            "30 days from invoice date"
+        )
+
+        result = resolve_due_date(
+            explicit_due_date=None,
+            invoice_date=None,
+            payment_terms=terms,
+        )
+
+        self.assertIsNone(result.due_date)
+        self.assertEqual(result.source, "")
 
 
 class InvoiceExtractionSchemaTests(SimpleTestCase):
@@ -1012,6 +1143,87 @@ class InvoiceFinancialValidationTests(SimpleTestCase):
             {item.code for item in findings},
         )
 
+    def test_due_date_conflicting_with_payment_terms_is_flagged(self):
+        
+        extraction = self.make_extraction(
+            invoice_date="2026-11-06",
+            due_date="2026-12-10",
+            payment_terms="30 days from invoice date",
+        )
+
+        findings = validate_invoice_extraction(extraction)
+
+        conflict = next(
+            (
+                finding
+                for finding in findings
+                if finding.code == (
+                    "DUE_DATE_PAYMENT_TERMS_CONFLICT"
+                )
+            ),
+            None,
+        )
+
+        self.assertIsNotNone(conflict)
+
+        self.assertEqual(
+            conflict.severity,
+            "warning",
+        )
+
+        self.assertEqual(
+            conflict.field_name,
+            "due_date",
+        )
+
+        self.assertEqual(
+            conflict.details["extracted_due_date"],
+            "2026-12-10",
+        )
+
+        self.assertEqual(
+            conflict.details["implied_due_date"],
+            "2026-12-06",
+        )
+
+    def test_matching_due_date_and_payment_terms_do_not_conflict(self):
+
+        extraction = self.make_extraction(
+            invoice_date="2026-11-06",
+            due_date="2026-12-06",
+            payment_terms="30 days from invoice date",
+        )
+
+        findings = validate_invoice_extraction(extraction)
+
+        self.assertNotIn(
+            "DUE_DATE_PAYMENT_TERMS_CONFLICT",
+            {finding.code for finding in findings},
+        )
+
+    def test_uncertain_payment_terms_do_not_trigger_due_date_conflict(self):
+
+        for terms in (
+            "Net 30",
+            "14 days from receipt",
+        ):
+            with self.subTest(terms=terms):
+
+                extraction = self.make_extraction(
+                    invoice_date="2026-11-06",
+                    due_date="2026-12-10",
+                    payment_terms=terms,
+                )
+
+                findings = validate_invoice_extraction(
+                    extraction
+                )
+
+                self.assertNotIn(
+                    "DUE_DATE_PAYMENT_TERMS_CONFLICT",
+                    {finding.code for finding in findings},
+                )
+    
     def test_uncertain_tax_treatment_skips_total_validation(self):
 
         extraction = self.make_extraction(
@@ -2035,8 +2247,12 @@ class InvoiceProcessingTests(TestCase):
             Invoice.DueDateSource.DOCUMENT,
         )
 
-        # Normalization is intentionally not implemented yet.
-        self.assertIsNone(invoice.payment_terms_days)
+        # Net 30 has a known duration, but its starting date is unknown.
+        # The explicitly extracted due date takes precedence.
+        self.assertEqual(
+            invoice.payment_terms_days,
+            30,
+        )
 
         self.assertEqual(
             invoice.payment_terms_basis,
@@ -2153,6 +2369,68 @@ class InvoiceProcessingTests(TestCase):
                 invoice=invoice
             ).count(),
             0,
+        )
+
+    def test_payment_terms_calculate_due_date_from_invoice_date(self):
+
+        additional_text = (
+            "Payment Terms: 30 days from invoice date"
+        )
+
+        document = self.create_document(
+            self.generate_pdf(
+                additional_text=additional_text
+            )
+        )
+
+        invoice = Invoice.objects.create(
+            organization=self.organization,
+            source_document=document,
+        )
+
+        payload = self.valid_extraction_payload()
+
+        payload["payment_terms"] = (
+            "30 days from invoice date"
+        )
+
+        payload["field_evidence"]["payment_terms"] = [
+            {
+                "page": 1,
+                "quote": additional_text,
+            }
+        ]
+
+        invoice = process_invoice(
+            invoice.id,
+            extraction_service=FakeExtractionService(payload),
+        )
+
+        invoice.refresh_from_db()
+
+        self.assertEqual(
+            invoice.payment_terms,
+            "30 days from invoice date",
+        )
+
+        self.assertEqual(
+            invoice.payment_terms_days,
+            30,
+        )
+
+        self.assertEqual(
+            invoice.payment_terms_basis,
+            Invoice.PaymentTermsBasis.INVOICE_DATE,
+        )
+
+        self.assertEqual(
+            invoice.due_date,
+            date(2026, 12, 6),
+        )
+
+        self.assertEqual(
+            invoice.due_date_source,
+            Invoice.DueDateSource.CALCULATED,
         )
 
     def test_financial_validation_findings_are_persisted(self):
@@ -4973,7 +5251,11 @@ class InvoiceReviewSubmissionAPITests(TestCase):
             return_value=BytesIO(b"mock-pdf"),
         ), patch(
             "invoices.services.review.extract_pdf_text",
-            return_value=Mock(page_texts={1: page_text}),
+            return_value=Mock(
+                page_texts={1: page_text},
+                page_words={},
+                page_sizes={},
+            ),
         ):
             response = self.submit()
 

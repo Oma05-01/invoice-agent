@@ -208,4 +208,3 @@ class JournalAuditEvent(models.Model):
             f"{self.operation} - Journal "
             f"{self.journal_entry_id}"
         )
-

@@ -4,6 +4,12 @@ from typing import Literal
 
 from invoices.schemas import InvoiceExtractionResult
 
+from datetime import date
+
+from invoices.services.payment_terms import (
+    normalize_payment_terms,
+    resolve_due_date,
+)
 
 Severity = Literal["info", "warning", "error"]
 
@@ -89,29 +95,67 @@ def validate_invoice_extraction(
 
     if extraction.invoice_date and extraction.due_date:
 
-        from datetime import date
-
         invoice_date = date.fromisoformat(
             extraction.invoice_date
         )
 
-        due_date = date.fromisoformat(
+        explicit_due_date = date.fromisoformat(
             extraction.due_date
         )
 
-        if due_date < invoice_date:
+        # An invoice should not be due before it was issued.
+        if explicit_due_date < invoice_date:
             add_finding(
                 findings,
                 code="DUE_DATE_BEFORE_INVOICE_DATE",
                 severity="warning",
                 field_name="due_date",
-                message="The due date is earlier than the invoice date.",
+                message=(
+                    "The due date is earlier than "
+                    "the invoice date."
+                ),
                 details={
                     "invoice_date": extraction.invoice_date,
                     "due_date": extraction.due_date,
                 },
             )
 
+        # Compare the explicit due date against the date
+        # implied by clearly understood payment terms.
+        normalized_terms = normalize_payment_terms(
+            extraction.payment_terms
+        )
+
+        implied_resolution = resolve_due_date(
+            explicit_due_date=None,
+            invoice_date=invoice_date,
+            payment_terms=normalized_terms,
+        )
+
+        implied_due_date = implied_resolution.due_date
+
+        if (
+            implied_due_date is not None
+            and explicit_due_date != implied_due_date
+        ):
+            add_finding(
+                findings,
+                code="DUE_DATE_PAYMENT_TERMS_CONFLICT",
+                severity="warning",
+                field_name="due_date",
+                message=(
+                    "The extracted due date differs from "
+                    "the date implied by the payment terms."
+                ),
+                details={
+                    "invoice_date": extraction.invoice_date,
+                    "extracted_due_date": extraction.due_date,
+                    "implied_due_date": (
+                        implied_due_date.isoformat()
+                    ),
+                    "payment_terms": extraction.payment_terms,
+                },
+            )
     # -------------------------------------------------
     # 3. Individual line-item arithmetic
     # -------------------------------------------------

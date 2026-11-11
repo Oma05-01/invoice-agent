@@ -232,6 +232,96 @@ class Invoice(TimeStampedUUIDModel):
     def __str__(self):
         return self.invoice_number or f"Invoice {self.pk}"
 
+class InvoiceExtractionRun(TimeStampedUUIDModel):
+
+    class Status(models.TextChoices):
+        RUNNING = "running", "Running"
+        SUCCEEDED = "succeeded", "Succeeded"
+        FAILED = "failed", "Failed"
+
+    invoice = models.ForeignKey(
+        Invoice,
+        on_delete=models.CASCADE,
+        related_name="extraction_runs",
+    )
+
+    provider = models.CharField(
+        max_length=50,
+    )
+
+    model = models.CharField(
+        max_length=150,
+        blank=True,
+    )
+
+    prompt_version = models.CharField(
+        max_length=40,
+    )
+
+    schema_version = models.CharField(
+        max_length=40,
+    )
+
+    status = models.CharField(
+        max_length=20,
+        choices=Status.choices,
+        default=Status.RUNNING,
+    )
+
+    # Exact response content returned by the provider,
+    # before normalization or Pydantic validation.
+    raw_response = models.TextField(
+        blank=True,
+        default="",
+    )
+
+    # Structured data that passed Pydantic validation.
+    validated_data = models.JSONField(
+        null=True,
+        blank=True,
+    )
+
+    # Structured data after deterministic post-processing,
+    # such as invoice-number recovery.
+    postprocessed_data = models.JSONField(
+        null=True,
+        blank=True,
+    )
+
+    error_summary = models.TextField(
+        blank=True,
+        default="",
+    )
+
+    started_at = models.DateTimeField(
+        default=timezone.now,
+    )
+
+    completed_at = models.DateTimeField(
+        null=True,
+        blank=True,
+    )
+
+    class Meta:
+        ordering = ["-started_at"]
+
+        indexes = [
+            models.Index(
+                fields=["invoice", "started_at"],
+                name="extrun_inv_start_idx",
+            ),
+            models.Index(
+                fields=["status", "started_at"],
+                name="extrun_status_start_idx",
+            ),
+        ]
+
+    def __str__(self):
+        return (
+            f"{self.provider} extraction "
+            f"for {self.invoice_id} ({self.status})"
+        )
+    
 
 class InvoiceTaxComponent(TimeStampedUUIDModel):
 

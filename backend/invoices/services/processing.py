@@ -30,6 +30,11 @@ from invoices.services.evidence import (
     verify_extraction_evidence,
 )
 
+from invoices.services.payment_terms import (
+    normalize_payment_terms,
+    resolve_due_date,
+)
+
 from invoices.services.validation import (
     validate_invoice_extraction,
     ValidationFinding,
@@ -563,20 +568,38 @@ def _persist_extraction(
             else None
         )
 
-        invoice.due_date = (
+        # Normalize the original payment-term wording.
+        normalized_terms = normalize_payment_terms(
+            extraction.payment_terms
+        )
+
+        # Preserve an explicitly extracted due date.
+        explicit_due_date = (
             date.fromisoformat(extraction.due_date)
             if extraction.due_date
             else None
         )
 
-        invoice.due_date_source = (
-            Invoice.DueDateSource.DOCUMENT
-            if extraction.due_date
-            else ""
+        # Resolve the due date using deterministic rules.
+        due_date_resolution = resolve_due_date(
+            explicit_due_date=explicit_due_date,
+            invoice_date=invoice.invoice_date,
+            payment_terms=normalized_terms,
         )
-        
+
+        invoice.due_date = due_date_resolution.due_date
+        invoice.due_date_source = due_date_resolution.source
+
         invoice.payment_terms = (
             extraction.payment_terms or ""
+        )
+
+        invoice.payment_terms_days = (
+            normalized_terms.days
+        )
+
+        invoice.payment_terms_basis = (
+            normalized_terms.basis
         )
 
         invoice.payment_terms_source = (
@@ -585,16 +608,10 @@ def _persist_extraction(
             else ""
         )
 
-        # Payment-term normalization will be handled
-        # by a separate deterministic service.
-        invoice.payment_terms_days = None
-        invoice.payment_terms_basis = (
-            Invoice.PaymentTermsBasis.UNKNOWN
-        )
-
         invoice.purchase_order_number = (
             extraction.purchase_order_number or ""
         )
+
 
         invoice.currency = extraction.currency
 
