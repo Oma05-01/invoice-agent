@@ -1,5 +1,6 @@
 import logging
 import re
+from django.conf import settings
 
 from datetime import date
 from decimal import Decimal
@@ -22,6 +23,7 @@ from invoices.models import (
     InvoiceTaxComponent,
     InvoiceChargeComponent,
     InvoiceValidationIssue,
+    InvoiceExtractionRun,
 )
 
 from invoices.schemas import InvoiceExtractionResult
@@ -33,6 +35,11 @@ from invoices.services.evidence import (
 from invoices.services.payment_terms import (
     normalize_payment_terms,
     resolve_due_date,
+)
+
+from invoices.services.extraction import (
+    EXTRACTION_PROMPT_VERSION,
+    EXTRACTION_SCHEMA_VERSION,
 )
 
 from invoices.services.validation import (
@@ -820,19 +827,174 @@ def process_invoice(
 
         document_result = _read_document(document)
 
-        # 2. Build the configured real Groq service,
-        # unless a service was explicitly injected.
+         # 2. Identify the provider and extraction configuration.
 
         if extraction_service is None:
-            extraction_service = (
-                build_invoice_extraction_service()
+
+            initial_provider = "groq"
+            initial_model = (
+                getattr(settings, "GROQ_MODEL", "") or ""
             )
 
-        # 3. Extract structured invoice information.
+            initial_prompt_version = EXTRACTION_PROMPT_VERSION
+            initial_schema_version = EXTRACTION_SCHEMA_VERSION
 
-        extraction = extraction_service.extract(
-            document_text=document_result.text
+        else:
+
+            provider_instance = getattr(
+                extraction_service,
+                "provider",
+                extraction_service,
+            )
+
+            supports_metadata = callable(
+                getattr(
+                    extraction_service,
+                    "extract_with_metadata",
+                    None,
+                )
+            )
+
+            initial_provider = (
+                getattr(
+                    provider_instance,
+                    "provider_name",
+                    "custom",
+                )
+                or "custom"
+            )
+
+            initial_model = (
+                getattr(provider_instance, "model", "") or ""
+            )
+
+            initial_prompt_version = (
+                EXTRACTION_PROMPT_VERSION
+                if supports_metadata
+                else "not_applicable"
+            )
+
+            initial_schema_version = (
+                EXTRACTION_SCHEMA_VERSION
+                if supports_metadata
+                else "not_applicable"
+            )
+
+        # 3. Create a provenance record before extraction begins.
+
+        extraction_run = InvoiceExtractionRun.objects.create(
+            invoice_id=invoice_id,
+            provider=initial_provider,
+            model=initial_model,
+            prompt_version=initial_prompt_version,
+            schema_version=initial_schema_version,
+            status=InvoiceExtractionRun.Status.RUNNING,
         )
+
+        # 4. Execute extraction and record its outcome.
+
+        try:
+
+            if extraction_service is None:
+                extraction_service = (
+                    build_invoice_extraction_service()
+                )
+
+            metadata_extractor = getattr(
+                extraction_service,
+                "extract_with_metadata",
+                None,
+            )
+
+            if callable(metadata_extractor):
+
+                outcome = metadata_extractor(
+                    document_text=document_result.text
+                )
+
+                extraction = outcome.extraction
+
+                extraction_run.provider = outcome.provider
+                extraction_run.model = outcome.model
+                extraction_run.prompt_version = (
+                    outcome.prompt_version
+                )
+                extraction_run.schema_version = (
+                    outcome.schema_version
+                )
+                extraction_run.raw_response = (
+                    outcome.raw_response or ""
+                )
+
+            else:
+
+                # Preserve compatibility with the existing
+                # injected FakeExtractionService.
+                extraction = extraction_service.extract(
+                    document_text=document_result.text
+                )
+
+            extraction_run.validated_data = (
+                extraction.model_dump(mode="json")
+            )
+
+            extraction_run.status = (
+                InvoiceExtractionRun.Status.SUCCEEDED
+            )
+
+            extraction_run.completed_at = timezone.now()
+
+            extraction_run.save(
+                update_fields=[
+                    "provider",
+                    "model",
+                    "prompt_version",
+                    "schema_version",
+                    "raw_response",
+                    "validated_data",
+                    "status",
+                    "completed_at",
+                    "updated_at",
+                ]
+            )
+
+        except Exception as extraction_error:
+
+            # Preserve any original response attached to an
+            # extraction/provider validation exception.
+            extraction_run.raw_response = (
+                getattr(
+                    extraction_error,
+                    "raw_response",
+                    "",
+                )
+                or ""
+            )
+
+            extraction_run.status = (
+                InvoiceExtractionRun.Status.FAILED
+            )
+
+            # Avoid storing exception details that might
+            # inadvertently expose confidential invoice data.
+            extraction_run.error_summary = (
+                f"{type(extraction_error).__name__}: "
+                "Extraction failed before a valid result was produced."
+            )
+
+            extraction_run.completed_at = timezone.now()
+
+            extraction_run.save(
+                update_fields=[
+                    "raw_response",
+                    "status",
+                    "error_summary",
+                    "completed_at",
+                    "updated_at",
+                ]
+            )
+
+            raise
 
         # 4. Recover invoice numbers split across PDF header rows.
         # layout-aware PDF recovery service.
@@ -901,6 +1063,17 @@ def process_invoice(
                         original_model_confidence
                     ),
                 }
+
+        extraction_run.postprocessed_data = (
+            extraction.model_dump(mode="json")
+        )
+
+        extraction_run.save(
+            update_fields=[
+                "postprocessed_data",
+                "updated_at",
+            ]
+        )
 
         # 5. Verify source evidence.
 

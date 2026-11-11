@@ -26,3 +26,5 @@ backend/staticfiles/
 .coverage
 htmlcov/
 run.md
+# Local database backups
+/backend/backups/

@@ -4,6 +4,9 @@ from copy import deepcopy
 
 from groq import APIError, Groq
 
+from invoices.providers.contracts import (
+    ProviderExtractionResponse,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -179,6 +182,15 @@ def normalize_groq_extraction(payload):
 class GroqProviderError(Exception):
     """Raised when the Groq extraction request fails."""
 
+    def __init__(
+        self,
+        message,
+        *,
+        raw_response="",
+    ):
+        super().__init__(message)
+        self.raw_response = raw_response
+
 
 class GroqInvoiceExtractionProvider:
     """
@@ -187,7 +199,8 @@ class GroqInvoiceExtractionProvider:
     Uses structured outputs to request invoice information
     conforming to our Pydantic-generated JSON Schema.
     """
-
+    provider_name = "groq"
+    
     def __init__(
         self,
         *,
@@ -218,12 +231,30 @@ class GroqInvoiceExtractionProvider:
         response_schema: dict,
     ) -> dict:
 
+        result = self.extract_invoice_with_metadata(
+            document_text=document_text,
+            instructions=instructions,
+            response_schema=response_schema,
+        )
+
+        return result.data
+
+    def extract_invoice_with_metadata(
+        self,
+        *,
+        document_text: str,
+        instructions: str,
+        response_schema: dict,
+    ) -> ProviderExtractionResponse:
+
         if not document_text or not document_text.strip():
             raise ValueError(
                 "Document text cannot be empty."
             )
 
-        groq_schema = build_groq_strict_schema(response_schema)
+        groq_schema = build_groq_strict_schema(
+            response_schema
+        )
 
         provider_instructions = instructions + """
 
@@ -241,11 +272,8 @@ class GroqInvoiceExtractionProvider:
         """
 
         try:
-
             response = self.client.chat.completions.create(
-
                 model=self.model,
-
                 messages=[
                     {
                         "role": "system",
@@ -264,7 +292,6 @@ class GroqInvoiceExtractionProvider:
                         ),
                     },
                 ],
-
                 response_format={
                     "type": "json_schema",
                     "json_schema": {
@@ -278,7 +305,6 @@ class GroqInvoiceExtractionProvider:
             )
 
         except APIError as exc:
-
             logger.exception(
                 "Groq invoice extraction request failed."
             )
@@ -295,18 +321,20 @@ class GroqInvoiceExtractionProvider:
         choice = response.choices[0]
         message = choice.message
 
+        content = message.content or ""
+
         if choice.finish_reason == "length":
             raise GroqProviderError(
                 "Groq response was truncated. "
-                "The invoice may require a smaller extraction scope."
+                "The invoice may require a smaller extraction scope.",
+                raw_response=content,
             )
 
         if getattr(message, "refusal", None):
             raise GroqProviderError(
-                "Groq declined the extraction request."
+                "Groq declined the extraction request.",
+                raw_response=content,
             )
-
-        content = message.content
 
         if not content:
             raise GroqProviderError(
@@ -318,12 +346,29 @@ class GroqInvoiceExtractionProvider:
 
         except json.JSONDecodeError as exc:
             raise GroqProviderError(
-                "Groq returned an invalid JSON response."
+                "Groq returned an invalid JSON response.",
+                raw_response=content,
             ) from exc
 
         if not isinstance(result, dict):
             raise GroqProviderError(
-                "Groq response must be a JSON object."
+                "Groq response must be a JSON object.",
+                raw_response=content,
             )
 
-        return normalize_groq_extraction(result)
+        try:
+            normalized = normalize_groq_extraction(
+                result
+            )
+
+        except GroqProviderError as exc:
+            raise GroqProviderError(
+                str(exc),
+                raw_response=content,
+            ) from exc
+
+        return ProviderExtractionResponse(
+            data=normalized,
+            raw_response=content,
+        )
+    

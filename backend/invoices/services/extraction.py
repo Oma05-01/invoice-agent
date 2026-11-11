@@ -1,9 +1,15 @@
+from dataclasses import dataclass
 from typing import Any, Protocol
 
 from pydantic import ValidationError
 
 from invoices.schemas import InvoiceExtractionResult
+from invoices.providers.contracts import (
+    ProviderExtractionResponse,
+)
 
+EXTRACTION_PROMPT_VERSION = "invoice_prompt_v1"
+EXTRACTION_SCHEMA_VERSION = "invoice_schema_v1"
 
 class InvoiceExtractionError(Exception):
     """Base exception for invoice extraction failures."""
@@ -12,6 +18,14 @@ class InvoiceExtractionError(Exception):
 class InvalidExtractionResponse(InvoiceExtractionError):
     """Raised when the AI response violates our extraction schema."""
 
+    def __init__(
+        self,
+        message,
+        *,
+        raw_response="",
+    ):
+        super().__init__(message)
+        self.raw_response = raw_response
 
 class InvoiceExtractionProvider(Protocol):
     """
@@ -111,13 +125,22 @@ it resembles information from another invoice.
 Return only structured information matching the supplied schema.
 """
 
+@dataclass(frozen=True)
+class InvoiceExtractionOutcome:
+    extraction: InvoiceExtractionResult
+    provider: str
+    model: str
+    prompt_version: str
+    schema_version: str
+    raw_response: str
+
 
 class InvoiceExtractionService:
     """
     Coordinates extraction through a replaceable AI provider.
 
-    The service validates all provider responses before returning
-    them to the rest of the application.
+    Supports both the traditional extraction interface and
+    provenance-aware extraction.
     """
 
     def __init__(self, provider: InvoiceExtractionProvider):
@@ -127,31 +150,100 @@ class InvoiceExtractionService:
         self,
         document_text: str,
     ) -> InvoiceExtractionResult:
+        """
+        Preserve compatibility with existing callers.
+        """
+
+        outcome = self.extract_with_metadata(
+            document_text=document_text,
+        )
+
+        return outcome.extraction
+
+    def extract_with_metadata(
+        self,
+        document_text: str,
+    ) -> InvoiceExtractionOutcome:
 
         if not document_text or not document_text.strip():
             raise InvoiceExtractionError(
                 "Document text cannot be empty."
             )
 
+        raw_response = ""
+
+        response_schema = (
+            InvoiceExtractionResult.model_json_schema()
+        )
+
         try:
-            response = self.provider.extract_invoice(
-                document_text=document_text,
-                instructions=EXTRACTION_INSTRUCTIONS,
-                response_schema=(
-                    InvoiceExtractionResult.model_json_schema()
-                ),
+            metadata_extractor = getattr(
+                self.provider,
+                "extract_invoice_with_metadata",
+                None,
             )
+
+            if callable(metadata_extractor):
+
+                provider_result = metadata_extractor(
+                    document_text=document_text,
+                    instructions=EXTRACTION_INSTRUCTIONS,
+                    response_schema=response_schema,
+                )
+
+                if not isinstance(
+                    provider_result,
+                    ProviderExtractionResponse,
+                ):
+                    raise InvoiceExtractionError(
+                        "Provider returned an invalid metadata response."
+                    )
+
+                response = provider_result.data
+                raw_response = provider_result.raw_response
+
+            else:
+                # Backward compatibility for providers that
+                # implement only the original interface.
+                response = self.provider.extract_invoice(
+                    document_text=document_text,
+                    instructions=EXTRACTION_INSTRUCTIONS,
+                    response_schema=response_schema,
+                )
 
             if not isinstance(response, dict):
                 raise InvalidExtractionResponse(
-                    "Provider must return a JSON object."
+                    "Provider must return a JSON object.",
+                    raw_response=raw_response,
                 )
 
-            return InvoiceExtractionResult.model_validate(
-                response
+            validated_extraction = (
+                InvoiceExtractionResult.model_validate(
+                    response
+                )
+            )
+
+            return InvoiceExtractionOutcome(
+                extraction=validated_extraction,
+                provider=getattr(
+                    self.provider,
+                    "provider_name",
+                    "custom",
+                ),
+                model=getattr(
+                    self.provider,
+                    "model",
+                    "",
+                ),
+                prompt_version=EXTRACTION_PROMPT_VERSION,
+                schema_version=EXTRACTION_SCHEMA_VERSION,
+                raw_response=raw_response,
             )
 
         except ValidationError as exc:
             raise InvalidExtractionResponse(
-                "The AI response failed schema validation."
-            ) from exc
+                "The AI response failed schema validation.",
+                raw_response=raw_response,
+            ) from exc 
+
+            

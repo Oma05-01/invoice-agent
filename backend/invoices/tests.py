@@ -22,6 +22,10 @@ from invoices.providers.groq_provider import (
     build_groq_strict_schema,
     normalize_groq_extraction,
 )
+from invoices.providers.contracts import (
+    ProviderExtractionResponse,
+)
+
 from invoices.services.validation import (
     validate_invoice_extraction,
 )
@@ -445,6 +449,56 @@ class GroqStrictOutputTests(SimpleTestCase):
                 4096,
             )
 
+    def test_provider_metadata_preserves_original_response(self):
+
+        raw_response = (
+            '{"field_confidence": [], "field_evidence": []}'
+        )
+
+        with patch(
+            "invoices.providers.groq_provider.Groq"
+        ) as groq_factory:
+
+            message = Mock()
+            message.content = raw_response
+            message.refusal = None
+
+            choice = Mock()
+            choice.message = message
+            choice.finish_reason = "stop"
+
+            groq_factory.return_value.chat.completions.create.return_value.choices = [
+                choice
+            ]
+
+            provider = GroqInvoiceExtractionProvider(
+                api_key="test-key",
+                model="openai/gpt-oss-20b",
+            )
+
+            result = provider.extract_invoice_with_metadata(
+                document_text="Sample invoice text.",
+                instructions="Extract invoice information.",
+                response_schema=(
+                    InvoiceExtractionResult.model_json_schema()
+                ),
+            )
+
+        self.assertEqual(
+            result.raw_response,
+            raw_response,
+        )
+
+        self.assertEqual(
+            result.data["field_confidence"],
+            {},
+        )
+
+        self.assertEqual(
+            result.data["field_evidence"],
+            {},
+        )
+
 
 class PaymentTermsNormalizationTests(SimpleTestCase):
 
@@ -863,6 +917,7 @@ class InvoiceExtractionSchemaTests(SimpleTestCase):
                 ],
             })
 
+
 class FakeInvoiceExtractionProvider:
 
     def extract_invoice(
@@ -937,6 +992,127 @@ class InvoiceExtractionServiceTests(SimpleTestCase):
             service.extract(
                 "[PAGE 1]\nInvoice Number: DEMO-001"
             )
+
+    def test_extract_with_metadata_records_provider_and_model(self):
+
+        raw_response = '{"sample": "original provider response"}'
+
+        class MetadataProvider:
+
+            provider_name = "groq"
+            model = "openai/gpt-oss-20b"
+
+            def extract_invoice_with_metadata(
+                inner_self,
+                **kwargs,
+            ):
+                payload = FakeInvoiceExtractionProvider().extract_invoice(
+                    **kwargs
+                )
+
+                return ProviderExtractionResponse(
+                    data=payload,
+                    raw_response=raw_response,
+                )
+
+        service = InvoiceExtractionService(
+            provider=MetadataProvider(),
+        )
+
+        outcome = service.extract_with_metadata(
+            "[PAGE 1]\nInvoice Number: DEMO-001"
+        )
+
+        self.assertEqual(
+            outcome.extraction.invoice_number,
+            "DEMO-001",
+        )
+
+        self.assertEqual(
+            outcome.provider,
+            "groq",
+        )
+
+        self.assertEqual(
+            outcome.model,
+            "openai/gpt-oss-20b",
+        )
+
+        self.assertEqual(
+            outcome.raw_response,
+            raw_response,
+        )
+
+        self.assertEqual(
+            outcome.prompt_version,
+            "invoice_prompt_v1",
+        )
+
+        self.assertEqual(
+            outcome.schema_version,
+            "invoice_schema_v1",
+        )
+
+    def test_invalid_extraction_retains_raw_response(self):
+
+        raw_response = (
+            '{"invoice_number": "DEMO-001", "currency": "INVALID"}'
+        )
+
+        class InvalidMetadataProvider:
+
+            provider_name = "groq"
+            model = "openai/gpt-oss-20b"
+
+            def extract_invoice_with_metadata(
+                inner_self,
+                **kwargs,
+            ):
+                return ProviderExtractionResponse(
+                    data={
+                        "invoice_number": "DEMO-001",
+                        "currency": "INVALID",
+                    },
+                    raw_response=raw_response,
+                )
+
+        service = InvoiceExtractionService(
+            provider=InvalidMetadataProvider(),
+        )
+
+        with self.assertRaises(
+            InvalidExtractionResponse
+        ) as context:
+
+            service.extract_with_metadata(
+                "[PAGE 1]\nInvoice Number: DEMO-001"
+            )
+
+        self.assertEqual(
+            context.exception.raw_response,
+            raw_response,
+        )
+
+    def test_legacy_provider_supports_metadata_fallback(self):
+
+        outcome = self.service.extract_with_metadata(
+            "[PAGE 1]\nInvoice Number: DEMO-001"
+        )
+
+        self.assertEqual(
+            outcome.provider,
+            "custom",
+        )
+
+        self.assertEqual(
+            outcome.model,
+            "",
+        )
+
+        self.assertEqual(
+            outcome.raw_response,
+            "",
+        )
 
 
 class InvoiceFinancialValidationTests(SimpleTestCase):
@@ -2522,6 +2698,227 @@ class InvoiceProcessingTests(TestCase):
             1,
         )
 
+    def test_extraction_run_records_successful_provenance(self):
+
+        from invoices.models import InvoiceExtractionRun
+        from invoices.services.extraction import (
+            InvoiceExtractionOutcome,
+        )
+
+        document = self.create_document(
+            self.generate_pdf()
+        )
+
+        invoice = Invoice.objects.create(
+            organization=self.organization,
+            source_document=document,
+        )
+
+        payload = self.valid_extraction_payload()
+
+        raw_response = (
+            '{"invoice_number": "DEMO-002", '
+            '"currency": "NGN"}'
+        )
+
+        class MetadataFakeExtractionService:
+
+            def extract_with_metadata(
+                inner_self,
+                *,
+                document_text,
+            ):
+                assert "DEMO-002" in document_text
+
+                return InvoiceExtractionOutcome(
+                    extraction=InvoiceExtractionResult.model_validate(
+                        payload
+                    ),
+                    provider="groq",
+                    model="openai/gpt-oss-20b",
+                    prompt_version="invoice_prompt_v1",
+                    schema_version="invoice_schema_v1",
+                    raw_response=raw_response,
+                )
+
+        process_invoice(
+            invoice.id,
+            extraction_service=MetadataFakeExtractionService(),
+        )
+
+        run = InvoiceExtractionRun.objects.get(
+            invoice=invoice,
+        )
+
+        self.assertEqual(
+            run.status,
+            InvoiceExtractionRun.Status.SUCCEEDED,
+        )
+
+        self.assertEqual(run.provider, "groq")
+        self.assertEqual(run.model, "openai/gpt-oss-20b")
+
+        self.assertEqual(
+            run.prompt_version,
+            "invoice_prompt_v1",
+        )
+
+        self.assertEqual(
+            run.schema_version,
+            "invoice_schema_v1",
+        )
+
+        self.assertEqual(
+            run.raw_response,
+            raw_response,
+        )
+
+        self.assertEqual(
+            run.validated_data["invoice_number"],
+            "DEMO-002",
+        )
+
+        self.assertEqual(
+            run.postprocessed_data["invoice_number"],
+            "DEMO-002",
+        )
+
+        self.assertIsNotNone(run.started_at)
+        self.assertIsNotNone(run.completed_at)
+        self.assertEqual(run.error_summary, "")
+
+    def test_failed_extraction_records_provenance(self):
+
+        from invoices.models import InvoiceExtractionRun
+
+        document = self.create_document(
+            self.generate_pdf()
+        )
+
+        invoice = Invoice.objects.create(
+            organization=self.organization,
+            source_document=document,
+        )
+
+        raw_response = '{"invoice_number": invalid-json}'
+
+        class SyntheticProviderError(Exception):
+
+            def __init__(self):
+                super().__init__("Synthetic provider failure")
+                self.raw_response = raw_response
+
+        class FailingMetadataExtractionService:
+
+            def extract_with_metadata(
+                inner_self,
+                *,
+                document_text,
+            ):
+                raise SyntheticProviderError()
+
+        with self.assertRaises(SyntheticProviderError):
+
+            process_invoice(
+                invoice.id,
+                extraction_service=(
+                    FailingMetadataExtractionService()
+                ),
+            )
+
+        run = InvoiceExtractionRun.objects.get(
+            invoice=invoice,
+        )
+
+        self.assertEqual(
+            run.status,
+            InvoiceExtractionRun.Status.FAILED,
+        )
+
+        self.assertEqual(
+            run.raw_response,
+            raw_response,
+        )
+
+        self.assertIsNone(run.validated_data)
+        self.assertIsNone(run.postprocessed_data)
+
+        self.assertIn(
+            "SyntheticProviderError",
+            run.error_summary,
+        )
+
+        self.assertIsNotNone(run.started_at)
+        self.assertIsNotNone(run.completed_at)
+
+    def test_successful_extraction_remains_succeeded_if_evidence_verification_fails(self):
+
+        from invoices.models import InvoiceExtractionRun
+        from invoices.services.extraction import (
+            InvoiceExtractionOutcome,
+        )
+
+        document = self.create_document(
+            self.generate_pdf()
+        )
+
+        invoice = Invoice.objects.create(
+            organization=self.organization,
+            source_document=document,
+        )
+
+        payload = self.valid_extraction_payload()
+
+        raw_response = '{"invoice_number": "DEMO-002"}'
+
+        class MetadataFakeExtractionService:
+
+            def extract_with_metadata(
+                inner_self,
+                *,
+                document_text,
+            ):
+                return InvoiceExtractionOutcome(
+                    extraction=InvoiceExtractionResult.model_validate(
+                        payload
+                    ),
+                    provider="groq",
+                    model="openai/gpt-oss-20b",
+                    prompt_version="invoice_prompt_v1",
+                    schema_version="invoice_schema_v1",
+                    raw_response=raw_response,
+                )
+
+        with patch(
+            "invoices.services.processing.verify_extraction_evidence",
+            side_effect=RuntimeError(
+                "Synthetic evidence verification failure."
+            ),
+        ):
+            with self.assertRaises(RuntimeError):
+                process_invoice(
+                    invoice.id,
+                    extraction_service=MetadataFakeExtractionService(),
+                )
+
+        run = InvoiceExtractionRun.objects.get(
+            invoice=invoice,
+        )
+
+        self.assertEqual(
+            run.status,
+            InvoiceExtractionRun.Status.SUCCEEDED,
+        )
+
+        self.assertEqual(
+            run.raw_response,
+            raw_response,
+        )
+
+        self.assertIsNotNone(run.validated_data)
+        self.assertIsNotNone(run.postprocessed_data)
+        self.assertIsNotNone(run.completed_at)
+
 
 class InvoiceQueueAPITests(TestCase):
 
@@ -2756,7 +3153,6 @@ class InvoiceQueueAPITests(TestCase):
             event.status,
             OutboxEvent.Status.PENDING,
         )
-
 
 
 class InvoiceListAPITests(TestCase):
@@ -3104,7 +3500,6 @@ class InvoiceListAPITests(TestCase):
         )
 
         self.assertIsNone(result["vendor"])
-
 
 
 class InvoiceOutboxTests(TestCase):
@@ -4669,6 +5064,7 @@ class InvoiceValidationIssueManagementAPITests(TestCase):
         self.assertIsNotNone(self.issue.resolved_at)
 
         self.assertIn(str(self.issue.id), resolved_ids)
+
 
 class InvoiceReviewSubmissionAPITests(TestCase):
 
