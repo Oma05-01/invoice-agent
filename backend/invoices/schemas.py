@@ -85,9 +85,11 @@ class ExtractedTax(BaseModel):
 
     rate_percent: Decimal | None = None
 
+    taxable_base: Decimal | None = None
     amount: Decimal | None = None
     @field_validator(
         "rate_percent",
+        "taxable_base",
         "amount",
         mode="before",
     )
@@ -95,6 +97,34 @@ class ExtractedTax(BaseModel):
     def normalize_decimal_fields(cls, value):
         return _normalize_decimal_string(value)
 
+class ExtractedChargeComponent(BaseModel):
+    """
+    An individually identified non-tax charge on an invoice.
+
+    The original description and treatment are preserved.
+    Missing amounts remain None.
+    """
+
+    model_config = ConfigDict(
+        extra="forbid",
+        str_strip_whitespace=True,
+    )
+
+    description: str = Field(min_length=1)
+
+    treatment: Literal[
+        "added",
+        "deducted",
+        "included",
+        "unknown",
+    ] = "unknown"
+
+    amount: Decimal | None = None
+
+    @field_validator("amount", mode="before")
+    @classmethod
+    def normalize_decimal_fields(cls, value):
+        return _normalize_decimal_string(value)
 
 class ExtractedLineItem(BaseModel):
 
@@ -168,6 +198,10 @@ class InvoiceExtractionResult(BaseModel):
     taxes: list[ExtractedTax] | None = None
 
     other_charges: Decimal | None = None
+
+    other_charge_components: (
+        list[ExtractedChargeComponent] | None
+    ) = None
 
     total_amount: Decimal | None = None
 

@@ -23,6 +23,22 @@ class Invoice(TimeStampedUUIDModel):
         FAILED = "failed", "Failed"
         QUEUED = "queued", "Queued"
 
+    class PaymentTermsBasis(models.TextChoices):
+        INVOICE_DATE = "invoice_date", "Invoice date"
+        RECEIPT_DATE = "receipt_date", "Receipt date"
+        MONTH_END = "month_end", "Month end"
+        OTHER = "other", "Other"
+        UNKNOWN = "unknown", "Unknown"
+
+    class PaymentTermsSource(models.TextChoices):
+        DOCUMENT = "document", "Invoice document"
+        MANUAL = "manual", "Manual"
+
+    class DueDateSource(models.TextChoices):
+        DOCUMENT = "document", "Invoice document"
+        CALCULATED = "calculated", "Calculated"
+        MANUAL = "manual", "Manual correction"
+
     organization = models.ForeignKey(
         Organization,
         on_delete=models.PROTECT,
@@ -50,6 +66,11 @@ class Invoice(TimeStampedUUIDModel):
         blank=True,
     )
 
+    purchase_order_number = models.CharField(
+        max_length=100,
+        blank=True,
+    )
+
     invoice_date = models.DateField(
         null=True,
         blank=True,
@@ -58,6 +79,33 @@ class Invoice(TimeStampedUUIDModel):
     due_date = models.DateField(
         null=True,
         blank=True,
+    )
+
+    payment_terms = models.TextField(blank=True)
+
+    payment_terms_days = models.PositiveSmallIntegerField(
+        null=True,
+        blank=True,
+    )
+
+    payment_terms_basis = models.CharField(
+        max_length=20,
+        choices=PaymentTermsBasis.choices,
+        default=PaymentTermsBasis.UNKNOWN,
+    )
+
+    payment_terms_source = models.CharField(
+        max_length=20,
+        choices=PaymentTermsSource.choices,
+        blank=True,
+        default="",
+    )
+
+    due_date_source = models.CharField(
+        max_length=20,
+        choices=DueDateSource.choices,
+        blank=True,
+        default="",
     )
 
     currency = models.CharField(
@@ -184,6 +232,139 @@ class Invoice(TimeStampedUUIDModel):
     def __str__(self):
         return self.invoice_number or f"Invoice {self.pk}"
 
+
+class InvoiceTaxComponent(TimeStampedUUIDModel):
+
+    class Treatment(models.TextChoices):
+        ADDED = "added", "Added"
+        DEDUCTED = "deducted", "Deducted"
+        INCLUDED = "included", "Included"
+        WITHHELD = "withheld", "Withheld"
+        UNKNOWN = "unknown", "Unknown"
+
+    class RecoverabilityStatus(models.TextChoices):
+        NOT_ASSESSED = "not_assessed", "Not assessed"
+        FULLY_RECOVERABLE = (
+            "fully_recoverable",
+            "Fully recoverable",
+        )
+        PARTIALLY_RECOVERABLE = (
+            "partially_recoverable",
+            "Partially recoverable",
+        )
+        NON_RECOVERABLE = (
+            "non_recoverable",
+            "Non-recoverable",
+        )
+
+    invoice = models.ForeignKey(
+        Invoice,
+        on_delete=models.CASCADE,
+        related_name="tax_components",
+    )
+
+    position = models.PositiveIntegerField(default=1)
+
+    name = models.CharField(max_length=100)
+
+    tax_type = models.CharField(max_length=50)
+
+    treatment = models.CharField(
+        max_length=20,
+        choices=Treatment.choices,
+        default=Treatment.UNKNOWN,
+    )
+
+    rate_percent = models.DecimalField(
+        max_digits=7,
+        decimal_places=4,
+        null=True,
+        blank=True,
+    )
+
+    taxable_base = models.DecimalField(
+        max_digits=18,
+        decimal_places=2,
+        null=True,
+        blank=True,
+    )
+
+    amount = models.DecimalField(
+        max_digits=18,
+        decimal_places=2,
+        null=True,
+        blank=True,
+    )
+
+    recoverability_status = models.CharField(
+        max_length=30,
+        choices=RecoverabilityStatus.choices,
+        default=RecoverabilityStatus.NOT_ASSESSED,
+    )
+
+    recoverable_amount = models.DecimalField(
+        max_digits=18,
+        decimal_places=2,
+        null=True,
+        blank=True,
+    )
+
+    class Meta:
+        ordering = ["position"]
+
+        constraints = [
+            models.UniqueConstraint(
+                fields=["invoice", "position"],
+                name="unique_invoice_tax_position",
+            ),
+        ]
+
+    def __str__(self):
+        return f"{self.name} - {self.invoice}"
+
+class InvoiceChargeComponent(TimeStampedUUIDModel):
+
+    class Treatment(models.TextChoices):
+        ADDED = "added", "Added"
+        DEDUCTED = "deducted", "Deducted"
+        INCLUDED = "included", "Included"
+        UNKNOWN = "unknown", "Unknown"
+
+    invoice = models.ForeignKey(
+        Invoice,
+        on_delete=models.CASCADE,
+        related_name="charge_components",
+    )
+
+    position = models.PositiveIntegerField(default=1)
+
+    description = models.TextField()
+
+    treatment = models.CharField(
+        max_length=20,
+        choices=Treatment.choices,
+        default=Treatment.UNKNOWN,
+    )
+
+    amount = models.DecimalField(
+        max_digits=18,
+        decimal_places=2,
+        null=True,
+        blank=True,
+    )
+
+    class Meta:
+        ordering = ["position"]
+
+        constraints = [
+            models.UniqueConstraint(
+                fields=["invoice", "position"],
+                name="unique_invoice_charge_position",
+            ),
+        ]
+
+    def __str__(self):
+        return f"{self.description} - {self.invoice}"
 
 class InvoiceLineItem(TimeStampedUUIDModel):
 

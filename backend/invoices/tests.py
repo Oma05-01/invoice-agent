@@ -48,7 +48,8 @@ from django.test import TestCase, override_settings
 from organizations.models import Organization, OrganizationMembership
 from vendors.models import Vendor
 from documents.models import Document
-from invoices.models import Invoice, InvoiceLineItem, InvoiceValidationIssue, OutboxEvent
+from invoices.models import Invoice, InvoiceLineItem, InvoiceValidationIssue, OutboxEvent, InvoiceTaxComponent, InvoiceChargeComponent
+
 
 from documents.extraction import OCRRequiredError
 from invoices.services.processing import (
@@ -56,6 +57,7 @@ from invoices.services.processing import (
     InvoiceProcessingStateError,
     _match_supplier,
 )
+
 from invoices.services.evidence import verify_extraction_evidence
 from invoices.services.review import synchronize_validation_issues
 
@@ -677,7 +679,58 @@ class InvoiceExtractionSchemaTests(SimpleTestCase):
                     "unauthorised_field": "unexpected",
                 }
             )
+    
+    def test_taxable_base_and_charge_components_are_normalized(self):
+        payload = self.valid_payload()
 
+        payload["taxes"][0]["taxable_base"] = "100,000.00"
+
+        payload["other_charges"] = "5,000.00"
+
+        payload["other_charge_components"] = [
+            {
+                "description": "Delivery charge",
+                "treatment": "added",
+                "amount": "5,000.00",
+            }
+        ]
+
+        result = InvoiceExtractionResult.model_validate(payload)
+
+        self.assertEqual(
+            result.taxes[0].taxable_base,
+            Decimal("100000.00"),
+        )
+
+        self.assertEqual(
+            result.other_charge_components[0].description,
+            "Delivery charge",
+        )
+
+        self.assertEqual(
+            result.other_charge_components[0].amount,
+            Decimal("5000.00"),
+        )
+
+    def test_missing_taxable_base_and_charge_components_remain_none(self):
+        result = InvoiceExtractionResult.model_validate({
+            "supplier_legal_name": "ABC Engineering Ltd",
+        })
+
+        self.assertIsNone(result.other_charge_components)
+        self.assertIsNone(result.taxes)
+
+    def test_malformed_charge_component_amount_is_rejected(self):
+        with self.assertRaises(ValidationError):
+            InvoiceExtractionResult.model_validate({
+                "other_charge_components": [
+                    {
+                        "description": "Delivery",
+                        "treatment": "added",
+                        "amount": "5,00,00.00",
+                    }
+                ],
+            })
 
 class FakeInvoiceExtractionProvider:
 
@@ -1239,13 +1292,13 @@ class InvoiceEvidenceVerificationIntegrationTests(TestCase):
         super().tearDown()
 
     @staticmethod
-    def generate_pdf(scanned=False):
-        pdf = pymupdf.open()  # PyMuPDF mapping
+    def generate_pdf(scanned=False, additional_text=""):
+
+        pdf = pymupdf.open()
         page = pdf.new_page()
 
         if not scanned:
-            page.insert_text(
-                (72, 72),
+            document_text = (
                 "SUPPLIER INVOICE\n"
                 "Invoice Number: DEMO-002\n"
                 "Supplier: ABC Engineering Ltd\n"
@@ -1256,12 +1309,21 @@ class InvoiceEvidenceVerificationIntegrationTests(TestCase):
                 "Description: Engineering services\n"
                 "Quantity: 1\n"
                 "Unit Price: NGN 100000.00\n"
-                "Line Total: NGN 100000.00",
+                "Line Total: NGN 100000.00"
             )
+
+            if additional_text.strip():
+                document_text += "\n" + additional_text.strip()
+
+            page.insert_text(
+                (72, 72),
+                document_text,
+            )
+
         content = pdf.tobytes()
         pdf.close()
-        return content
 
+        return content
     def create_document(self, content):
         document = Document(
             organization=self.organization,
@@ -1399,14 +1461,13 @@ class InvoiceProcessingTests(TestCase):
         super().tearDown()
 
     @staticmethod
-    def generate_pdf(scanned=False):
+    def generate_pdf(scanned=False, additional_text=""):
 
         pdf = pymupdf.open()
         page = pdf.new_page()
 
         if not scanned:
-            page.insert_text(
-                (72, 72),
+            document_text = (
                 "SUPPLIER INVOICE\n"
                 "Invoice Number: DEMO-002\n"
                 "Supplier: ABC Engineering Ltd\n"
@@ -1417,14 +1478,21 @@ class InvoiceProcessingTests(TestCase):
                 "Description: Engineering services\n"
                 "Quantity: 1\n"
                 "Unit Price: NGN 100000.00\n"
-                "Line Total: NGN 100000.00",
+                "Line Total: NGN 100000.00"
+            )
+
+            if additional_text.strip():
+                document_text += "\n" + additional_text.strip()
+
+            page.insert_text(
+                (72, 72),
+                document_text,
             )
 
         content = pdf.tobytes()
         pdf.close()
 
         return content
-
     def create_document(self, content):
 
         document = Document(
@@ -1842,6 +1910,243 @@ class InvoiceProcessingTests(TestCase):
             ).count(),
             1,
         )
+
+        self.assertEqual(
+            InvoiceValidationIssue.objects.filter(
+                invoice=invoice
+            ).count(),
+            0,
+        )
+
+    def test_phase_one_extraction_fields_and_components_are_persisted(self):
+
+        additional_text = (
+            "Due Date: 06 December 2026\n"
+            "Payment Terms: Net 30\n"
+            "PO Number: PO-2026-001\n"
+            "Taxable Base: NGN 100000.00\n"
+            "Delivery Charge: NGN 5000.00"
+        )
+
+        document = self.create_document(
+            self.generate_pdf(
+                additional_text=additional_text
+            )
+        )
+
+        invoice = Invoice.objects.create(
+            organization=self.organization,
+            source_document=document,
+        )
+
+        payload = self.valid_extraction_payload()
+
+        payload.update({
+            "due_date": "2026-12-06",
+            "payment_terms": "Net 30",
+            "purchase_order_number": "PO-2026-001",
+            "other_charges": "5000.00",
+            "total_amount": "112500.00",
+            "other_charge_components": [
+                {
+                    "description": "Delivery charge",
+                    "treatment": "added",
+                    "amount": "5000.00",
+                }
+            ],
+        })
+
+        payload["taxes"][0]["taxable_base"] = "100000.00"
+
+        evidence = payload["field_evidence"]
+
+        evidence.update({
+            "due_date": [
+                {
+                    "page": 1,
+                    "quote": "Due Date: 06 December 2026",
+                }
+            ],
+            "payment_terms": [
+                {
+                    "page": 1,
+                    "quote": "Payment Terms: Net 30",
+                }
+            ],
+            "purchase_order_number": [
+                {
+                    "page": 1,
+                    "quote": "PO Number: PO-2026-001",
+                }
+            ],
+            "taxes": [
+                {
+                    "page": 1,
+                    "quote": "VAT: NGN 7500.00",
+                },
+                {
+                    "page": 1,
+                    "quote": "Taxable Base: NGN 100000.00",
+                },
+            ],
+            "other_charge_components": [
+                {
+                    "page": 1,
+                    "quote": "Delivery Charge: NGN 5000.00",
+                }
+            ],
+        })
+
+        service = FakeExtractionService(payload)
+
+        invoice = process_invoice(
+            invoice.id,
+            extraction_service=service,
+        )
+
+        invoice.refresh_from_db()
+
+        # ---------------------------------------------
+        # Invoice header persistence
+        # ---------------------------------------------
+
+        self.assertEqual(
+            invoice.payment_terms,
+            "Net 30",
+        )
+
+        self.assertEqual(
+            invoice.payment_terms_source,
+            Invoice.PaymentTermsSource.DOCUMENT,
+        )
+
+        self.assertEqual(
+            invoice.purchase_order_number,
+            "PO-2026-001",
+        )
+
+        self.assertEqual(
+            invoice.due_date.isoformat(),
+            "2026-12-06",
+        )
+
+        self.assertEqual(
+            invoice.due_date_source,
+            Invoice.DueDateSource.DOCUMENT,
+        )
+
+        # Normalization is intentionally not implemented yet.
+        self.assertIsNone(invoice.payment_terms_days)
+
+        self.assertEqual(
+            invoice.payment_terms_basis,
+            Invoice.PaymentTermsBasis.UNKNOWN,
+        )
+
+        # ---------------------------------------------
+        # Aggregate financial fields remain correct
+        # ---------------------------------------------
+
+        self.assertEqual(
+            invoice.tax_amount,
+            Decimal("7500.00"),
+        )
+
+        self.assertEqual(
+            invoice.other_charges,
+            Decimal("5000.00"),
+        )
+
+        self.assertEqual(
+            invoice.total_amount,
+            Decimal("112500.00"),
+        )
+
+        # ---------------------------------------------
+        # Individual tax component persistence
+        # ---------------------------------------------
+
+        tax = InvoiceTaxComponent.objects.get(
+            invoice=invoice,
+            position=1,
+        )
+
+        self.assertEqual(tax.name, "VAT")
+        self.assertEqual(tax.tax_type, "VAT")
+
+        self.assertEqual(
+            tax.rate_percent,
+            Decimal("7.5"),
+        )
+
+        self.assertEqual(
+            tax.taxable_base,
+            Decimal("100000.00"),
+        )
+
+        self.assertEqual(
+            tax.amount,
+            Decimal("7500.00"),
+        )
+
+        self.assertEqual(
+            tax.recoverability_status,
+            InvoiceTaxComponent.RecoverabilityStatus.NOT_ASSESSED,
+        )
+
+        self.assertIsNone(tax.recoverable_amount)
+
+        # ---------------------------------------------
+        # Individual charge component persistence
+        # ---------------------------------------------
+
+        charge = InvoiceChargeComponent.objects.get(
+            invoice=invoice,
+            position=1,
+        )
+
+        self.assertEqual(
+            charge.description,
+            "Delivery charge",
+        )
+
+        self.assertEqual(
+            charge.treatment,
+            InvoiceChargeComponent.Treatment.ADDED,
+        )
+
+        self.assertEqual(
+            charge.amount,
+            Decimal("5000.00"),
+        )
+
+        # ---------------------------------------------
+        # Original extraction snapshot
+        # ---------------------------------------------
+
+        self.assertEqual(
+            invoice.extracted_data["payment_terms"],
+            "Net 30",
+        )
+
+        self.assertEqual(
+            invoice.extracted_data["purchase_order_number"],
+            "PO-2026-001",
+        )
+
+        self.assertEqual(
+            invoice.extracted_data["taxes"][0]["taxable_base"],
+            "100000.00",
+        )
+
+        self.assertEqual(
+            len(invoice.extracted_data["other_charge_components"]),
+            1,
+        )
+
+        # ---------------------------------------------
+        # No unexpected validation issues
+        # ---------------------------------------------
 
         self.assertEqual(
             InvoiceValidationIssue.objects.filter(
@@ -4607,7 +4912,11 @@ class InvoiceReviewSubmissionAPITests(TestCase):
             return_value=BytesIO(b"mock-pdf"),
         ), patch(
             "invoices.services.review.extract_pdf_text",
-            return_value=Mock(page_texts={1: page_text}),
+            return_value=Mock(
+                page_texts={1: page_text},
+                page_words={},
+                page_sizes={},
+            ),
         ):
             response = self.submit()
 
@@ -4689,3 +4998,4 @@ class InvoiceReviewSubmissionAPITests(TestCase):
         self.assertFalse(
             ApprovalRequest.objects.filter(invoice=self.invoice).exists()
         )
+

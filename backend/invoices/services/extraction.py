@@ -76,6 +76,33 @@ The document is the source of truth.
     or code, such as "(NGN)" or "NGN". Do not combine a column
     heading such as "UNIT PRICE" with a currency marker unless
     that combined phrase appears contiguously in the source.
+27. Extract individual other-charge components when the
+    invoice separately identifies them.
+
+28. Preserve the original description of each charge.
+
+29. Distinguish added, deducted, included and unknown
+    charge treatments.
+
+30. Do not invent charge components or derive a breakdown
+    from an aggregate other_charges amount.
+
+31. Extract taxable_base for each tax component only when
+    the taxable base is explicitly supported by the document.
+
+32. Never calculate taxable_base by dividing the tax amount
+    by its tax rate.
+
+33. Preserve payment terms verbatim in payment_terms.
+
+34. Do not assume that Net 30 means 30 days from the
+    invoice date.
+
+35. Do not calculate due dates or invent payment-term
+    calculation bases. Those are handled by deterministic
+    application logic.
+
+36. Preserve the difference between an unknown value and zero.
 
 Do not assume that a supplier's name, tax number, invoice
 number or payment information is correct merely because

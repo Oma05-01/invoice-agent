@@ -19,6 +19,8 @@ from vendors.models import Vendor
 from invoices.models import (
     Invoice,
     InvoiceLineItem,
+    InvoiceTaxComponent,
+    InvoiceChargeComponent,
     InvoiceValidationIssue,
 )
 
@@ -567,6 +569,33 @@ def _persist_extraction(
             else None
         )
 
+        invoice.due_date_source = (
+            Invoice.DueDateSource.DOCUMENT
+            if extraction.due_date
+            else ""
+        )
+        
+        invoice.payment_terms = (
+            extraction.payment_terms or ""
+        )
+
+        invoice.payment_terms_source = (
+            Invoice.PaymentTermsSource.DOCUMENT
+            if extraction.payment_terms
+            else ""
+        )
+
+        # Payment-term normalization will be handled
+        # by a separate deterministic service.
+        invoice.payment_terms_days = None
+        invoice.payment_terms_basis = (
+            Invoice.PaymentTermsBasis.UNKNOWN
+        )
+
+        invoice.purchase_order_number = (
+            extraction.purchase_order_number or ""
+        )
+
         invoice.currency = extraction.currency
 
         invoice.subtotal = extraction.subtotal
@@ -589,6 +618,55 @@ def _persist_extraction(
         invoice.status = Invoice.Status.NEEDS_REVIEW
 
         invoice.save()
+
+        # Replace component records from any previous
+        # pre-review extraction attempt.
+        invoice.tax_components.all().delete()
+        invoice.charge_components.all().delete()
+
+        # Persist individual tax components.
+        tax_components = [
+            InvoiceTaxComponent(
+                invoice=invoice,
+                position=position,
+                name=tax.name,
+                tax_type=tax.tax_type,
+                treatment=tax.treatment,
+                rate_percent=tax.rate_percent,
+                taxable_base=tax.taxable_base,
+                amount=tax.amount,
+                # Recoverability remains NOT_ASSESSED.
+            )
+            for position, tax in enumerate(
+                extraction.taxes or [],
+                start=1,
+            )
+        ]
+
+        if tax_components:
+            InvoiceTaxComponent.objects.bulk_create(
+                tax_components
+            )
+
+        # Persist individually identified other charges.
+        charge_components = [
+            InvoiceChargeComponent(
+                invoice=invoice,
+                position=position,
+                description=charge.description,
+                treatment=charge.treatment,
+                amount=charge.amount,
+            )
+            for position, charge in enumerate(
+                extraction.other_charge_components or [],
+                start=1,
+            )
+        ]
+
+        if charge_components:
+            InvoiceChargeComponent.objects.bulk_create(
+                charge_components
+            )
 
         # Create line items.
 
