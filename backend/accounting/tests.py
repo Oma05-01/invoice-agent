@@ -19,14 +19,14 @@ from accounting.services import (
     AccountingConfigurationError,
     AccountingStateError,
     create_draft_journal_for_approved_invoice,
+    create_vendor_payment,
     initialize_chart_of_accounts,
     AccountingPermissionError,
-    AccountingStateError,
     update_draft_journal_line,
     post_journal_entry,
     reverse_journal_entry,
     record_journal_audit,
-    create_adjustment_journal
+    create_adjustment_journal,
 )
 
 from approvals.models import ApprovalRequest, ApprovalDecision
@@ -2858,3 +2858,187 @@ class FinancialStatementsAPITests(TestCase):
             )
 
             self.assertEqual(response.status_code, 404)
+
+
+class VendorPaymentCreationServiceTests(TestCase):
+
+    def setUp(self):
+        User = get_user_model()
+
+        self.operator = User.objects.create_user(
+            username="payment_operator",
+            password="test-password-123",
+        )
+
+        self.outsider = User.objects.create_user(
+            username="payment_outsider",
+            password="test-password-123",
+        )
+
+        self.organization = Organization.objects.create(
+            name="Vendor Payment Test Company",
+            slug="vendor-payment-test-company",
+            default_currency="NGN",
+        )
+
+        OrganizationMembership.objects.create(
+            organization=self.organization,
+            user=self.operator,
+            role=OrganizationMembership.Role.FINANCE_OPERATOR,
+        )
+
+        self.accounts = initialize_chart_of_accounts(
+            organization=self.organization,
+        )
+
+        self.vendor = Vendor.objects.create(
+            organization=self.organization,
+            vendor_code="VP-CREATE-001",
+            legal_name="Vendor Payment Test Supplies",
+        )
+
+    def create_payment(self, **overrides):
+        payload = {
+            "vendor_id": self.vendor.pk,
+            "payment_account_id": self.accounts["1000"].pk,
+            "amount": "125000.00",
+            "currency": "NGN",
+            "payment_date": date(2026, 11, 13),
+            "reference": "VP-CREATE-001",
+        }
+
+        payload.update(overrides)
+
+        return create_vendor_payment(
+            organization_id=self.organization.pk,
+            actor=self.operator,
+            **payload,
+        )
+
+    def assert_no_payment_records(self):
+        self.assertFalse(
+            VendorPayment.objects.filter(
+                organization=self.organization,
+            ).exists()
+        )
+
+        self.assertFalse(
+            JournalEntry.objects.filter(
+                organization=self.organization,
+            ).exists()
+        )
+
+    def test_finance_operator_can_create_draft_vendor_payment(self):
+        payment = self.create_payment()
+
+        journal = payment.journal_entry
+
+        self.assertEqual(
+            payment.status,
+            VendorPayment.Status.DRAFT,
+        )
+
+        self.assertEqual(
+            journal.status,
+            JournalEntry.Status.DRAFT,
+        )
+
+        self.assertEqual(payment.vendor, self.vendor)
+        self.assertEqual(payment.amount, Decimal("125000.00"))
+        self.assertEqual(payment.currency, "NGN")
+        self.assertEqual(payment.reference, "VP-CREATE-001")
+
+        self.assertIsNone(journal.source_invoice_id)
+        self.assertIsNone(journal.approval_decision_id)
+        self.assertIsNone(journal.reversal_of_id)
+
+        lines = list(
+            journal.lines.select_related("account").order_by(
+                "line_number"
+            )
+        )
+
+        self.assertEqual(len(lines), 2)
+
+        self.assertEqual(lines[0].account.code, "2000")
+        self.assertEqual(lines[0].debit, Decimal("125000.00"))
+        self.assertEqual(lines[0].credit, Decimal("0.00"))
+
+        self.assertEqual(lines[1].account.code, "1000")
+        self.assertEqual(lines[1].debit, Decimal("0.00"))
+        self.assertEqual(lines[1].credit, Decimal("125000.00"))
+
+        self.assertEqual(
+            sum(line.debit for line in lines),
+            sum(line.credit for line in lines),
+        )
+
+        event = JournalAuditEvent.objects.get(
+            journal_entry=journal,
+            operation="vendor_payment_draft_created",
+        )
+
+        self.assertEqual(
+            event.metadata["vendor_payment_id"],
+            str(payment.pk),
+        )
+
+        self.assertEqual(
+            event.metadata["vendor_name"],
+            self.vendor.legal_name,
+        )
+
+    def test_user_without_finance_membership_cannot_create_payment(self):
+        with self.assertRaises(AccountingPermissionError):
+            create_vendor_payment(
+                organization_id=self.organization.pk,
+                vendor_id=self.vendor.pk,
+                payment_account_id=self.accounts["1000"].pk,
+                amount="125000.00",
+                currency="NGN",
+                actor=self.outsider,
+            )
+
+        self.assert_no_payment_records()
+
+    def test_expense_or_liability_account_cannot_be_payment_account(self):
+        with self.assertRaisesMessage(
+            AccountingStateError,
+            "The payment account must be an asset account.",
+        ):
+            self.create_payment(
+                payment_account_id=self.accounts["2000"].pk,
+            )
+
+        self.assert_no_payment_records()
+
+    def test_inactive_vendor_cannot_receive_payment(self):
+        self.vendor.is_active = False
+        self.vendor.save(update_fields=["is_active"])
+
+        with self.assertRaisesMessage(
+            AccountingStateError,
+            "Payments cannot be created for an inactive vendor.",
+        ):
+            self.create_payment()
+
+        self.assert_no_payment_records()
+
+    def test_inactive_accounts_payable_control_account_is_rejected(self):
+        payable_account = self.accounts["2000"]
+        payable_account.is_active = False
+        payable_account.save(update_fields=["is_active"])
+
+        with self.assertRaises(AccountingConfigurationError):
+            self.create_payment()
+
+        self.assert_no_payment_records()
+
+    def test_payment_amount_cannot_have_more_than_two_decimal_places(self):
+        with self.assertRaisesMessage(
+            AccountingStateError,
+            "The payment amount must have no more than two decimal places.",
+        ):
+            self.create_payment(amount="125000.125")
+
+        self.assert_no_payment_records()

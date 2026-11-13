@@ -23,7 +23,8 @@ from auditlog.services import (
     record_invoice_event,
     record_journal_event,
 )
-from organizations.models import OrganizationMembership
+from organizations.models import OrganizationMembership, Organization
+from vendors.models import Vendor
 
 class AccountingError(Exception):
     """Base exception for accounting operations."""
@@ -1182,3 +1183,287 @@ def create_adjustment_journal(
 
     return entry
 
+
+@transaction.atomic
+def create_vendor_payment(
+    *,
+    organization_id,
+    vendor_id,
+    payment_account_id,
+    amount,
+    currency,
+    actor,
+    payment_date=None,
+    reference="",
+    description="",
+):
+    """
+    Create a draft vendor payment and its balanced draft journal.
+
+    Both records and the audit event are committed atomically.
+    """
+
+    # 1. Authorize the actor.
+    require_accounting_role(
+        organization_id=organization_id,
+        actor=actor,
+        allowed_roles=DRAFT_EDIT_ROLES,
+    )
+
+    # 2. Lock and validate the organization.
+    organization = (
+        Organization.objects
+        .select_for_update()
+        .filter(pk=organization_id)
+        .first()
+    )
+
+    if organization is None:
+        raise AccountingStateError(
+            "The specified organization does not exist."
+        )
+
+    if not organization.is_active:
+        raise AccountingStateError(
+            "Vendor payments cannot be created for an inactive organization."
+        )
+
+    # 3. Validate and normalize the amount.
+    if isinstance(amount, (float, bool)):
+        raise AccountingStateError(
+            "Payment amounts must be supplied as decimal values or strings."
+        )
+
+    try:
+        payment_amount = Decimal(str(amount))
+    except (InvalidOperation, TypeError, ValueError):
+        raise AccountingStateError(
+            "A valid payment amount is required."
+        )
+
+    if not payment_amount.is_finite() or payment_amount <= 0:
+        raise AccountingStateError(
+            "The payment amount must be a positive finite value."
+        )
+
+    try:
+        normalized_amount = payment_amount.quantize(
+            Decimal("0.01")
+        )
+    except InvalidOperation:
+        raise AccountingStateError(
+            "The payment amount must have no more than two decimal places."
+        )
+
+    if normalized_amount != payment_amount:
+        raise AccountingStateError(
+            "The payment amount must have no more than two decimal places."
+        )
+
+    payment_amount = normalized_amount
+
+    # 4. Validate currency, date, reference and description.
+    if not isinstance(currency, str):
+        raise AccountingStateError(
+            "A valid three-letter payment currency is required."
+        )
+
+    currency = currency.strip().upper()
+
+    if len(currency) != 3 or not currency.isalpha():
+        raise AccountingStateError(
+            "A valid three-letter payment currency is required."
+        )
+
+    if payment_date is None:
+        payment_date = timezone.localdate()
+    elif not isinstance(payment_date, date):
+        raise AccountingStateError(
+            "The payment date must be a date value."
+        )
+
+    if not isinstance(reference, str):
+        raise AccountingStateError(
+            "The payment reference must be text."
+        )
+
+    reference = reference.strip()
+
+    if len(reference) > 100:
+        raise AccountingStateError(
+            "The payment reference cannot exceed 100 characters."
+        )
+
+    if not isinstance(description, str):
+        raise AccountingStateError(
+            "The payment description must be text."
+        )
+
+    description = description.strip()
+
+    # 5. Lock and validate the vendor.
+    vendor = (
+        Vendor.objects
+        .select_for_update(of=("self",))
+        .filter(
+            pk=vendor_id,
+            organization=organization,
+        )
+        .first()
+    )
+
+    if vendor is None:
+        raise AccountingStateError(
+            "The specified vendor does not belong to this organization."
+        )
+
+    if not vendor.is_active:
+        raise AccountingStateError(
+            "Payments cannot be created for an inactive vendor."
+        )
+
+    # 6. Resolve the organization's Accounts Payable control account.
+    payable_account = (
+        Account.objects
+        .select_for_update(of=("self",))
+        .filter(
+            organization=organization,
+            code="2000",
+        )
+        .first()
+    )
+
+    if payable_account is None:
+        raise AccountingConfigurationError(
+            "The organization's Accounts Payable account (2000) is missing."
+        )
+
+    if (
+        payable_account.account_type != Account.AccountType.LIABILITY
+        or not payable_account.is_control_account
+        or not payable_account.is_active
+    ):
+        raise AccountingConfigurationError(
+            "Account 2000 must be an active liability control account."
+        )
+
+    # 7. Lock and validate the selected payment account.
+    payment_account = (
+        Account.objects
+        .select_for_update(of=("self",))
+        .filter(
+            pk=payment_account_id,
+            organization=organization,
+        )
+        .first()
+    )
+
+    if payment_account is None:
+        raise AccountingStateError(
+            "The payment account does not belong to this organization."
+        )
+
+    if payment_account.account_type != Account.AccountType.ASSET:
+        raise AccountingStateError(
+            "The payment account must be an asset account."
+        )
+
+    if not payment_account.is_active:
+        raise AccountingStateError(
+            "The payment account must be active."
+        )
+
+    # 8. Create the standalone draft journal.
+    journal_description = description or (
+        f"Vendor payment to {vendor.display_name or vendor.legal_name}"
+    )
+
+    journal = JournalEntry(
+        organization=organization,
+        entry_date=payment_date,
+        currency=currency,
+        reference=reference,
+        description=journal_description,
+        status=JournalEntry.Status.DRAFT,
+        created_by=actor,
+    )
+
+    journal.full_clean()
+    journal.save(force_insert=True)
+
+    # 9. Debit Accounts Payable.
+    payable_line = JournalLine(
+        entry=journal,
+        line_number=1,
+        account=payable_account,
+        description=(
+            f"Accounts payable settlement - "
+            f"{vendor.display_name or vendor.legal_name}"
+        ),
+        debit=payment_amount,
+        credit=Decimal("0.00"),
+    )
+
+    payable_line.full_clean()
+    payable_line.save(force_insert=True)
+
+    # 10. Credit the selected asset account.
+    payment_line = JournalLine(
+        entry=journal,
+        line_number=2,
+        account=payment_account,
+        description=f"Vendor payment from {payment_account.name}",
+        debit=Decimal("0.00"),
+        credit=payment_amount,
+    )
+
+    payment_line.full_clean()
+    payment_line.save(force_insert=True)
+
+    # 11. Create the linked draft payment.
+    payment = VendorPayment(
+        organization=organization,
+        vendor=vendor,
+        payment_date=payment_date,
+        reference=reference,
+        amount=payment_amount,
+        currency=currency,
+        payment_account=payment_account,
+        journal_entry=journal,
+        status=VendorPayment.Status.DRAFT,
+        created_by=actor,
+    )
+
+    payment.full_clean()
+    payment.save(force_insert=True)
+
+    # 12. Record the payment-specific audit event.
+    record_journal_audit(
+        entry=journal,
+        actor=actor,
+        operation="vendor_payment_draft_created",
+        changes={
+            "payment_status": {
+                "before": None,
+                "after": payment.status,
+            },
+            "journal_status": {
+                "before": None,
+                "after": journal.status,
+            },
+        },
+        metadata={
+            "vendor_payment_id": str(payment.pk),
+            "vendor_id": str(vendor.pk),
+            "vendor_name": vendor.display_name or vendor.legal_name,
+            "reference": reference,
+            "payment_date": payment_date.isoformat(),
+            "amount": str(payment_amount),
+            "currency": currency,
+            "payment_account_id": str(payment_account.pk),
+            "payment_account_code": payment_account.code,
+            "accounts_payable_account_code": payable_account.code,
+        },
+    )
+
+    return payment
