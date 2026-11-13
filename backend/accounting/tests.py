@@ -32,6 +32,7 @@ from accounting.services import (
     remove_vendor_payment_allocation,
     post_vendor_payment,
     update_draft_journal_entry_date,
+    reverse_vendor_payment,
 )
 
 from approvals.models import ApprovalRequest, ApprovalDecision
@@ -3659,4 +3660,208 @@ class VendorPaymentAllocationServiceTests(TestCase):
         self.assertEqual(
             self.payment.journal_entry.entry_date,
             original_date,
+        )
+
+
+
+    def test_finance_admin_can_reverse_posted_vendor_payment(self):
+        self.allocate(amount="100000.00")
+
+        posted_payment = post_vendor_payment(
+            organization_id=self.organization.pk,
+            payment_id=self.payment.pk,
+            actor=self.admin,
+        )
+
+        original_journal = posted_payment.journal_entry
+
+        payment, reversal = reverse_vendor_payment(
+            organization_id=self.organization.pk,
+            payment_id=posted_payment.pk,
+            actor=self.admin,
+            reversal_reason="Supplier payment was made in error.",
+        )
+
+        payment.refresh_from_db()
+        original_journal.refresh_from_db()
+        reversal.refresh_from_db()
+
+        self.assertEqual(
+            payment.status,
+            VendorPayment.Status.REVERSED,
+        )
+        self.assertEqual(
+            original_journal.status,
+            JournalEntry.Status.REVERSED,
+        )
+        self.assertEqual(
+            reversal.status,
+            JournalEntry.Status.POSTED,
+        )
+        self.assertEqual(
+            payment.reversal_reason,
+            "Supplier payment was made in error.",
+        )
+
+        self.assertEqual(reversal.reversal_of, original_journal)
+
+        # Historical allocation records are retained.
+        self.assertTrue(
+            PaymentAllocation.objects.filter(
+                payment=payment,
+                invoice=self.invoice,
+            ).exists()
+        )
+
+        # The original payment's allocation must no longer reserve
+        # the invoice balance after reversal.
+        replacement_payment = self.create_payment(
+            amount="100000.00",
+            reference="ALLOC-PAY-AFTER-REVERSAL",
+        )
+
+        replacement_allocation = self.allocate(
+            payment=replacement_payment,
+            amount="100000.00",
+        )
+
+        self.assertEqual(
+            replacement_allocation.amount,
+            Decimal("100000.00"),
+        )
+
+        self.assertTrue(
+            JournalAuditEvent.objects.filter(
+                journal_entry=original_journal,
+                operation="vendor_payment_reversed",
+            ).exists()
+        )
+
+        self.assertTrue(
+            JournalAuditEvent.objects.filter(
+                journal_entry=original_journal,
+                operation="journal_reversed",
+            ).exists()
+        )
+
+        self.assertTrue(
+            JournalAuditEvent.objects.filter(
+                journal_entry=reversal,
+                operation="journal_reversal_created",
+            ).exists()
+        )
+
+    def test_finance_operator_cannot_reverse_posted_payment(self):
+        self.allocate(amount="100000.00")
+
+        post_vendor_payment(
+            organization_id=self.organization.pk,
+            payment_id=self.payment.pk,
+            actor=self.admin,
+        )
+
+        with self.assertRaises(AccountingPermissionError):
+            reverse_vendor_payment(
+                organization_id=self.organization.pk,
+                payment_id=self.payment.pk,
+                actor=self.operator,
+                reversal_reason="Unauthorized reversal attempt.",
+            )
+
+        self.payment.refresh_from_db()
+        self.payment.journal_entry.refresh_from_db()
+
+        self.assertEqual(
+            self.payment.status,
+            VendorPayment.Status.POSTED,
+        )
+        self.assertEqual(
+            self.payment.journal_entry.status,
+            JournalEntry.Status.POSTED,
+        )
+
+        self.assertFalse(
+            JournalEntry.objects.filter(
+                reversal_of=self.payment.journal_entry,
+            ).exists()
+        )
+
+    def test_draft_vendor_payment_cannot_be_reversed(self):
+        with self.assertRaisesMessage(
+            AccountingStateError,
+            "Only posted vendor payments can be reversed.",
+        ):
+            reverse_vendor_payment(
+                organization_id=self.organization.pk,
+                payment_id=self.payment.pk,
+                actor=self.admin,
+                reversal_reason="Attempted draft reversal.",
+            )
+
+        self.payment.refresh_from_db()
+
+        self.assertEqual(
+            self.payment.status,
+            VendorPayment.Status.DRAFT,
+        )
+
+    def test_vendor_payment_reversal_requires_a_reason(self):
+        self.allocate(amount="100000.00")
+
+        post_vendor_payment(
+            organization_id=self.organization.pk,
+            payment_id=self.payment.pk,
+            actor=self.admin,
+        )
+
+        with self.assertRaisesMessage(
+            AccountingStateError,
+            "A reason is required to reverse a vendor payment.",
+        ):
+            reverse_vendor_payment(
+                organization_id=self.organization.pk,
+                payment_id=self.payment.pk,
+                actor=self.admin,
+                reversal_reason="   ",
+            )
+
+        self.payment.refresh_from_db()
+
+        self.assertEqual(
+            self.payment.status,
+            VendorPayment.Status.POSTED,
+        )
+
+    def test_vendor_payment_cannot_be_reversed_twice(self):
+        self.allocate(amount="100000.00")
+
+        post_vendor_payment(
+            organization_id=self.organization.pk,
+            payment_id=self.payment.pk,
+            actor=self.admin,
+        )
+
+        reverse_vendor_payment(
+            organization_id=self.organization.pk,
+            payment_id=self.payment.pk,
+            actor=self.admin,
+            reversal_reason="First valid reversal.",
+        )
+
+        with self.assertRaisesMessage(
+            AccountingStateError,
+            "Only posted vendor payments can be reversed.",
+        ):
+            reverse_vendor_payment(
+                organization_id=self.organization.pk,
+                payment_id=self.payment.pk,
+                actor=self.admin,
+                reversal_reason="Second reversal attempt.",
+            )
+
+        self.assertEqual(
+            JournalEntry.objects.filter(
+                reversal_of=self.payment.journal_entry,
+            ).count(),
+            1,
         )

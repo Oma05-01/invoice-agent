@@ -838,6 +838,8 @@ def _reverse_locked_journal_entry(
             "Only posted journals can be reversed."
         )
 
+    active_allocations = False
+
     if original.source_invoice_id:
         active_allocations = (
             PaymentAllocation.objects
@@ -1041,6 +1043,12 @@ def create_adjustment_journal(
         organization_id=organization_id,
         journal_entry_id=original_journal_id,
     )
+
+    if VendorPayment.objects.filter(journal_entry=original).exists():
+        raise AccountingStateError(
+            "Vendor payment journals cannot be adjusted "
+            "through generic journal operations."
+        )
 
     if original.status not in (
         JournalEntry.Status.POSTED,
@@ -2307,3 +2315,179 @@ def post_vendor_payment(
     )
 
     return payment
+
+
+@transaction.atomic
+def reverse_vendor_payment(
+    *,
+    organization_id,
+    payment_id,
+    actor,
+    reversal_reason,
+):
+    """
+    Reverse a posted vendor payment and release its invoice allocations.
+
+    The original payment, its journal, the reversal journal, and
+    their audit events are updated atomically.
+
+    Returns:
+        (payment, reversal_journal)
+    """
+
+    # 1. Authorize the actor.
+    require_accounting_role(
+        organization_id=organization_id,
+        actor=actor,
+        allowed_roles=REVERSAL_ROLES,
+    )
+
+    if (
+        not isinstance(reversal_reason, str)
+        or not reversal_reason.strip()
+    ):
+        raise AccountingStateError(
+            "A reason is required to reverse a vendor payment."
+        )
+
+    reason = reversal_reason.strip()
+
+    # 2. Lock the payment.
+    payment = (
+        VendorPayment.objects
+        .select_for_update(of=("self",))
+        .filter(
+            pk=payment_id,
+            organization_id=organization_id,
+        )
+        .first()
+    )
+
+    if payment is None:
+        raise VendorPayment.DoesNotExist
+
+    if payment.status != VendorPayment.Status.POSTED:
+        raise AccountingStateError(
+            "Only posted vendor payments can be reversed."
+        )
+
+    if not payment.journal_entry_id:
+        raise AccountingStateError(
+            "The vendor payment has no accounting journal."
+        )
+
+    # 3. Lock and validate the original payment journal.
+    original = get_locked_journal(
+        organization_id=organization_id,
+        journal_entry_id=payment.journal_entry_id,
+    )
+
+    if original.status != JournalEntry.Status.POSTED:
+        raise AccountingStateError(
+            "The payment journal must be Posted before reversal."
+        )
+
+    if (
+        original.organization_id != payment.organization_id
+        or original.currency != payment.currency
+    ):
+        raise AccountingStateError(
+            "The payment and journal contain inconsistent details."
+        )
+
+    if (
+        original.source_invoice_id
+        or original.approval_decision_id
+        or original.reversal_of_id
+        or JournalAdjustment.objects.filter(
+            Q(original_journal=original)
+            | Q(adjustment_journal=original)
+        ).exists()
+    ):
+        raise AccountingStateError(
+            "A vendor payment must reference an unadjusted, "
+            "standalone original journal."
+        )
+
+    # 4. Lock and validate historical allocations.
+    #
+    # Keep the allocation rows. Changing payment status to Reversed
+    # releases them from the active-allocation calculation.
+    allocations = list(
+        PaymentAllocation.objects
+        .select_for_update(of=("self",))
+        .filter(payment=payment)
+        .order_by("invoice_id", "pk")
+    )
+
+    if not allocations:
+        raise AccountingStateError(
+            "The posted vendor payment has no invoice allocations."
+        )
+
+    total_allocated = sum(
+        (allocation.amount for allocation in allocations),
+        Decimal("0.00"),
+    )
+
+    if total_allocated != payment.amount:
+        raise AccountingStateError(
+            "The posted payment allocations do not equal "
+            "the payment amount."
+        )
+
+    # 5. Create the accounting reversal and mark the original
+    # journal Reversed. This also records the two journal events.
+    reversal = _reverse_locked_journal_entry(
+        original=original,
+        actor=actor,
+        reversal_reason=reason,
+    )
+
+    # 6. Update the payment status.
+    previous_status = payment.status
+
+    payment.status = VendorPayment.Status.REVERSED
+    payment.reversal_reason = reason
+
+    # VendorPayment.clean() verifies that the original journal
+    # is now also Reversed.
+    payment.full_clean()
+
+    payment.save(
+        update_fields=[
+            "status",
+            "reversal_reason",
+            "updated_at",
+        ]
+    )
+
+    # 7. Record the payment-specific reversal event.
+    record_journal_audit(
+        entry=original,
+        actor=actor,
+        operation="vendor_payment_reversed",
+        changes={
+            "payment_status": {
+                "before": previous_status,
+                "after": payment.status,
+            },
+            "journal_status": {
+                "before": JournalEntry.Status.POSTED,
+                "after": original.status,
+            },
+        },
+        metadata={
+            "vendor_payment_id": str(payment.pk),
+            "vendor_id": str(payment.vendor_id),
+            "amount": str(payment.amount),
+            "currency": payment.currency,
+            "allocation_count": len(allocations),
+            "total_allocated": str(total_allocated),
+            "reversal_journal_id": str(reversal.pk),
+            "reversal_reason": reason,
+            "reversed_by": actor.get_username(),
+        },
+    )
+
+    return payment, reversal
