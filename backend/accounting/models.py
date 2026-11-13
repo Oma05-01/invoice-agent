@@ -411,3 +411,303 @@ class JournalAdjustment(TimeStampedUUIDModel):
             f"Adjustment of {self.original_journal.reference} "
             f"by {self.adjustment_journal.reference}"
         )
+
+
+class VendorPayment(TimeStampedUUIDModel):
+
+    class Status(models.TextChoices):
+        DRAFT = "draft", "Draft"
+        POSTED = "posted", "Posted"
+        REVERSED = "reversed", "Reversed"
+
+    organization = models.ForeignKey(
+        Organization,
+        on_delete=models.PROTECT,
+        related_name="vendor_payments",
+    )
+
+    vendor = models.ForeignKey(
+        "vendors.Vendor",
+        on_delete=models.PROTECT,
+        related_name="payments",
+    )
+
+    payment_date = models.DateField(
+        default=timezone.localdate,
+    )
+
+    reference = models.CharField(
+        max_length=100,
+        blank=True,
+    )
+
+    amount = models.DecimalField(
+        max_digits=18,
+        decimal_places=2,
+    )
+
+    currency = models.CharField(max_length=3)
+
+    payment_account = models.ForeignKey(
+        Account,
+        on_delete=models.PROTECT,
+        related_name="vendor_payments",
+    )
+
+    journal_entry = models.OneToOneField(
+        JournalEntry,
+        on_delete=models.PROTECT,
+        null=True,
+        blank=True,
+        related_name="vendor_payment",
+    )
+
+    status = models.CharField(
+        max_length=20,
+        choices=Status.choices,
+        default=Status.DRAFT,
+    )
+
+    created_by = models.ForeignKey(
+        settings.AUTH_USER_MODEL,
+        on_delete=models.SET_NULL,
+        null=True,
+        blank=True,
+        related_name="created_vendor_payments",
+    )
+
+    posted_by = models.ForeignKey(
+        settings.AUTH_USER_MODEL,
+        on_delete=models.PROTECT,
+        null=True,
+        blank=True,
+        related_name="posted_vendor_payments",
+    )
+
+    posted_at = models.DateTimeField(
+        null=True,
+        blank=True,
+    )
+
+    reversal_reason = models.TextField(blank=True)
+
+    class Meta:
+        ordering = ["-payment_date", "-created_at"]
+
+        constraints = [
+            models.CheckConstraint(
+                condition=Q(amount__gt=0),
+                name="vendor_payment_amount_positive",
+            ),
+        ]
+
+        indexes = [
+            models.Index(
+                fields=["organization", "status", "payment_date"],
+                name="vpay_org_status_date_idx",
+            ),
+            models.Index(
+                fields=["vendor", "payment_date"],
+                name="vpay_vendor_date_idx",
+            ),
+        ]
+
+    def clean(self):
+        super().clean()
+
+        errors = {}
+
+        if (
+            self.vendor_id
+            and self.organization_id
+            and self.vendor.organization_id != self.organization_id
+        ):
+            errors["vendor"] = (
+                "The vendor must belong to the payment organization."
+            )
+
+        if self.payment_account_id:
+            if (
+                self.payment_account.organization_id
+                != self.organization_id
+            ):
+                errors["payment_account"] = (
+                    "The payment account must belong "
+                    "to the payment organization."
+                )
+
+            if (
+                self.payment_account.account_type
+                != Account.AccountType.ASSET
+            ):
+                errors["payment_account"] = (
+                    "The payment account must be an asset account."
+                )
+
+            if not self.payment_account.is_active:
+                errors["payment_account"] = (
+                    "The payment account must be active."
+                )
+
+        if self.currency and (
+            len(self.currency) != 3
+            or not self.currency.isalpha()
+        ):
+            errors["currency"] = (
+                "A valid three-letter currency is required."
+            )
+
+        if self.journal_entry_id:
+            journal = self.journal_entry
+
+            if journal.organization_id != self.organization_id:
+                errors["journal_entry"] = (
+                    "The payment journal must belong "
+                    "to the payment organization."
+                )
+
+            if journal.currency != self.currency:
+                errors["journal_entry"] = (
+                    "The payment and journal currencies must match."
+                )
+
+            if (
+                journal.source_invoice_id
+                or journal.approval_decision_id
+                or journal.reversal_of_id
+                or JournalAdjustment.objects.filter(
+                    Q(original_journal=journal)
+                    | Q(adjustment_journal=journal)
+                ).exists()
+            ):
+                errors["journal_entry"] = (
+                    "A payment must reference a standalone "
+                    "journal, not an invoice, adjustment "
+                    "or reversal journal."
+                )
+
+            expected_journal_status = {
+                self.Status.DRAFT: JournalEntry.Status.DRAFT,
+                self.Status.POSTED: JournalEntry.Status.POSTED,
+                self.Status.REVERSED: JournalEntry.Status.REVERSED,
+            }.get(self.status)
+
+            if journal.status != expected_journal_status:
+                errors["journal_entry"] = (
+                    "The payment and journal statuses must match."
+                )
+
+        elif self.status != self.Status.DRAFT:
+            errors["journal_entry"] = (
+                "Posted or reversed payments must have a journal."
+            )
+
+        if errors:
+            raise ValidationError(errors)
+
+    def __str__(self):
+        return self.reference or f"Payment {self.pk}"
+
+
+
+class PaymentAllocation(TimeStampedUUIDModel):
+
+    payment = models.ForeignKey(
+        VendorPayment,
+        on_delete=models.PROTECT,
+        related_name="allocations",
+    )
+
+    invoice = models.ForeignKey(
+        "invoices.Invoice",
+        on_delete=models.PROTECT,
+        related_name="payment_allocations",
+    )
+
+    amount = models.DecimalField(
+        max_digits=18,
+        decimal_places=2,
+    )
+
+    class Meta:
+        ordering = ["created_at"]
+
+        constraints = [
+            models.UniqueConstraint(
+                fields=["payment", "invoice"],
+                name="unique_payment_invoice_allocation",
+            ),
+            models.CheckConstraint(
+                condition=Q(amount__gt=0),
+                name="payment_allocation_amount_positive",
+            ),
+        ]
+
+        indexes = [
+            models.Index(
+                fields=["invoice", "created_at"],
+                name="palloc_invoice_created_idx",
+            ),
+        ]
+
+    def clean(self):
+        super().clean()
+
+        errors = {}
+
+        if self.payment_id and self.invoice_id:
+            payment = self.payment
+            invoice = self.invoice
+
+            if payment.organization_id != invoice.organization_id:
+                errors["invoice"] = (
+                    "The payment and invoice must belong "
+                    "to the same organization."
+                )
+
+            if payment.vendor_id != invoice.vendor_id:
+                errors["invoice"] = (
+                    "The payment and invoice must belong "
+                    "to the same vendor."
+                )
+
+            if invoice.status != invoice.Status.APPROVED:
+                errors["invoice"] = (
+                    "Only approved invoices can receive "
+                    "payment allocations."
+                )
+
+            try:
+                invoice_journal = invoice.journal_entry
+            except JournalEntry.DoesNotExist:
+                invoice_journal = None
+
+            if (
+                invoice_journal is None
+                or invoice_journal.status != JournalEntry.Status.POSTED
+            ):
+                errors["invoice"] = (
+                    "The invoice must have a posted "
+                    "accounting journal."
+                )
+
+            elif invoice_journal.currency != payment.currency:
+                errors["invoice"] = (
+                    "The payment and invoice journal "
+                    "currencies must match."
+                )
+
+            if payment.status != VendorPayment.Status.DRAFT:
+                errors["payment"] = (
+                    "Allocations can only be changed "
+                    "while the payment is in Draft."
+                )
+
+        if errors:
+            raise ValidationError(errors)
+
+    def __str__(self):
+        return (
+            f"{self.payment} - {self.invoice}: "
+            f"{self.amount}"
+        )
