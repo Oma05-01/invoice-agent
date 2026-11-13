@@ -6,6 +6,7 @@ from decimal import Decimal, InvalidOperation
 from django.core.exceptions import ValidationError
 from django.db import transaction
 from django.utils import timezone
+from accounting.ap_balances import get_invoice_ap_obligation
 
 from accounting.models import (
     Account,
@@ -17,7 +18,7 @@ from accounting.models import (
 )
 from approvals.models import ApprovalDecision
 from invoices.models import Invoice
-from django.db.models import Max, Q, Sum
+from django.db.models import Max, Q
 
 from auditlog.models import InvoiceAuditEvent
 from auditlog.services import (
@@ -1551,10 +1552,11 @@ def _normalize_positive_allocation_amount(value):
 
 def _get_posted_invoice_ap_obligation(*, invoice, journal):
     """
-    Calculate the invoice's AP obligation from its posted journal.
+    Return the invoice's current net AP obligation.
 
-    Invoice.amount_due is deliberately not used as the accounting
-    source of truth.
+    The supplied invoice journal must still be Posted.
+    The shared calculation includes any posted adjustments
+    and their reversals.
     """
 
     if (
@@ -1566,29 +1568,14 @@ def _get_posted_invoice_ap_obligation(*, invoice, journal):
             "The invoice must have its own posted accounting journal."
         )
 
-    totals = (
-        JournalLine.objects
-        .filter(
-            entry=journal,
-            account__organization_id=invoice.organization_id,
-            account__code="2000",
-            account__account_type=Account.AccountType.LIABILITY,
-            account__is_control_account=True,
-        )
-        .aggregate(
-            total_debit=Sum("debit"),
-            total_credit=Sum("credit"),
-        )
+    obligation = get_invoice_ap_obligation(
+        invoice=invoice,
+        as_of_date=timezone.localdate(),
     )
-
-    debit = totals["total_debit"] or Decimal("0.00")
-    credit = totals["total_credit"] or Decimal("0.00")
-
-    obligation = credit - debit
 
     if obligation <= Decimal("0.00"):
         raise AccountingConfigurationError(
-            "The invoice journal does not contain a valid "
+            "The invoice does not have a positive outstanding "
             "Accounts Payable obligation on account 2000."
         )
 
