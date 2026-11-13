@@ -4,7 +4,11 @@ from decimal import Decimal
 from django.db.models import Sum
 
 from accounting.models import Account, JournalEntry, JournalLine
-
+from accounting.ap_balances import (
+    get_invoice_ap_obligation,
+    get_invoice_posted_payment_allocations,
+)
+from invoices.models import Invoice
 
 ZERO = Decimal("0.00")
 
@@ -699,4 +703,263 @@ def build_balance_sheet(
             "Cumulative unclosed earnings are included in equity "
             "because year-end closing entries are not yet implemented."
         ),
+    }
+
+AP_AGEING_BUCKET_LABELS = {
+    "current": "Current / Not Yet Due",
+    "1_30_days": "1–30 Days Overdue",
+    "31_60_days": "31–60 Days Overdue",
+    "61_90_days": "61–90 Days Overdue",
+    "over_90_days": "Over 90 Days Overdue",
+    "missing_due_date": "Missing Due Date",
+}
+
+
+def _get_ap_ageing_bucket(*, due_date, as_of_date):
+    """
+    Classify an outstanding invoice balance by its due date.
+
+    A due date equal to the reporting date is current.
+    Missing due dates are never inferred from payment terms.
+    """
+
+    if due_date is None:
+        return "missing_due_date", None
+
+    days_overdue = (as_of_date - due_date).days
+
+    if days_overdue <= 0:
+        return "current", 0
+
+    if days_overdue <= 30:
+        return "1_30_days", days_overdue
+
+    if days_overdue <= 60:
+        return "31_60_days", days_overdue
+
+    if days_overdue <= 90:
+        return "61_90_days", days_overdue
+
+    return "over_90_days", days_overdue
+
+
+def _empty_ap_ageing_totals():
+    return {
+        bucket: ZERO
+        for bucket in AP_AGEING_BUCKET_LABELS
+    }
+
+
+def _serialize_ap_ageing_totals(totals):
+    return {
+        bucket: money(totals[bucket])
+        for bucket in AP_AGEING_BUCKET_LABELS
+    }
+
+
+def build_ap_ageing_report(
+    *,
+    organization,
+    as_of_date,
+    currency=None,
+):
+    """
+    Build an Accounts Payable ageing report.
+
+    Outstanding invoice balances are calculated from:
+    - Posted invoice journals.
+    - Posted adjustments and their reversals.
+    - Posted vendor payment allocations.
+    - Payment reversals effective by the reporting date.
+
+    Draft payments do not reduce outstanding AP.
+
+    Balances are grouped by currency and vendor. Invoices without
+    an assigned vendor are grouped under Unassigned Vendor.
+    """
+
+    invoices = (
+        Invoice.objects
+        .filter(
+            organization=organization,
+            journal_entry__isnull=False,
+        )
+        .select_related(
+            "vendor",
+            "journal_entry",
+        )
+        .order_by(
+            "journal_entry__currency",
+            "vendor__legal_name",
+            "invoice_date",
+            "invoice_number",
+            "id",
+        )
+    )
+
+    if currency:
+        invoices = invoices.filter(
+            journal_entry__currency=currency,
+        )
+
+    currency_reports = {}
+
+    for invoice in invoices:
+        journal = invoice.journal_entry
+        invoice_currency = journal.currency
+
+        if not invoice_currency:
+            continue
+
+        ap_obligation = get_invoice_ap_obligation(
+            invoice=invoice,
+            as_of_date=as_of_date,
+        )
+
+        if ap_obligation <= ZERO:
+            continue
+
+        posted_payments = (
+            get_invoice_posted_payment_allocations(
+                invoice=invoice,
+                as_of_date=as_of_date,
+            )
+        )
+
+        outstanding = ap_obligation - posted_payments
+
+        # A subsequent adjustment can reduce the obligation below
+        # amounts previously paid. Do not report negative AP.
+        if outstanding <= ZERO:
+            continue
+
+        bucket, days_overdue = _get_ap_ageing_bucket(
+            due_date=invoice.due_date,
+            as_of_date=as_of_date,
+        )
+
+        currency_report = currency_reports.setdefault(
+            invoice_currency,
+            {
+                "currency": invoice_currency,
+                "bucket_totals": _empty_ap_ageing_totals(),
+                "total_outstanding": ZERO,
+                "invoice_count": 0,
+                "vendors": {},
+            },
+        )
+
+        vendor_key = (
+            str(invoice.vendor_id)
+            if invoice.vendor_id
+            else "unassigned"
+        )
+
+        if invoice.vendor:
+            vendor_name = (
+                invoice.vendor.display_name
+                or invoice.vendor.legal_name
+            )
+            vendor_id = str(invoice.vendor_id)
+        else:
+            vendor_name = "Unassigned Vendor"
+            vendor_id = None
+
+        vendor_report = currency_report["vendors"].setdefault(
+            vendor_key,
+            {
+                "vendor_id": vendor_id,
+                "vendor_name": vendor_name,
+                "bucket_totals": _empty_ap_ageing_totals(),
+                "total_outstanding": ZERO,
+                "invoice_count": 0,
+                "invoices": [],
+            },
+        )
+
+        invoice_report = {
+            "invoice_id": str(invoice.id),
+            "invoice_number": invoice.invoice_number,
+            "invoice_date": (
+                invoice.invoice_date.isoformat()
+                if invoice.invoice_date
+                else None
+            ),
+            "due_date": (
+                invoice.due_date.isoformat()
+                if invoice.due_date
+                else None
+            ),
+            "ageing_bucket": bucket,
+            "days_overdue": days_overdue,
+            "ap_obligation": money(ap_obligation),
+            "posted_payments": money(posted_payments),
+            "outstanding_amount": money(outstanding),
+        }
+
+        currency_report["bucket_totals"][bucket] += outstanding
+        currency_report["total_outstanding"] += outstanding
+        currency_report["invoice_count"] += 1
+
+        vendor_report["bucket_totals"][bucket] += outstanding
+        vendor_report["total_outstanding"] += outstanding
+        vendor_report["invoice_count"] += 1
+        vendor_report["invoices"].append(invoice_report)
+
+    # Retain an empty report for the requested/default currency
+    # when there are no outstanding invoices.
+    if not currency_reports:
+        empty_currency = currency or organization.default_currency
+
+        currency_reports[empty_currency] = {
+            "currency": empty_currency,
+            "bucket_totals": _empty_ap_ageing_totals(),
+            "total_outstanding": ZERO,
+            "invoice_count": 0,
+            "vendors": {},
+        }
+
+    serialized_currencies = []
+
+    for code in sorted(currency_reports):
+        report = currency_reports[code]
+
+        vendors = []
+
+        for vendor in report["vendors"].values():
+            vendors.append({
+                "vendor_id": vendor["vendor_id"],
+                "vendor_name": vendor["vendor_name"],
+                "bucket_totals": _serialize_ap_ageing_totals(
+                    vendor["bucket_totals"],
+                ),
+                "total_outstanding": money(
+                    vendor["total_outstanding"],
+                ),
+                "invoice_count": vendor["invoice_count"],
+                "invoices": vendor["invoices"],
+            })
+
+        vendors.sort(
+            key=lambda item: item["vendor_name"].casefold(),
+        )
+
+        serialized_currencies.append({
+            "currency": code,
+            "bucket_totals": _serialize_ap_ageing_totals(
+                report["bucket_totals"],
+            ),
+            "total_outstanding": money(
+                report["total_outstanding"],
+            ),
+            "invoice_count": report["invoice_count"],
+            "vendors": vendors,
+        })
+
+    return {
+        "organization_id": str(organization.id),
+        "as_of_date": as_of_date.isoformat(),
+        "currency_filter": currency,
+        "bucket_labels": AP_AGEING_BUCKET_LABELS,
+        "currencies": serialized_currencies,
     }

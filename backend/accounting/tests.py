@@ -14,7 +14,7 @@ from accounting.models import (
     PaymentAllocation,
 )
 from vendors.models import Vendor
-
+from accounting.reporting import build_ap_ageing_report
 from accounting.services import (
     DEFAULT_CHART_OF_ACCOUNTS,
     AccountingConfigurationError,
@@ -3864,4 +3864,405 @@ class VendorPaymentAllocationServiceTests(TestCase):
                 reversal_of=self.payment.journal_entry,
             ).count(),
             1,
+        )
+
+class APAgeingReportTests(TestCase):
+
+    def setUp(self):
+        User = get_user_model()
+
+        self.operator = User.objects.create_user(
+            username="ap_ageing_operator",
+            password="test-password-123",
+        )
+
+        self.admin = User.objects.create_user(
+            username="ap_ageing_admin",
+            password="test-password-123",
+        )
+
+        self.organization = Organization.objects.create(
+            name="AP Ageing Test Company",
+            slug="ap-ageing-test-company",
+            default_currency="NGN",
+        )
+
+        OrganizationMembership.objects.create(
+            organization=self.organization,
+            user=self.operator,
+            role=OrganizationMembership.Role.FINANCE_OPERATOR,
+        )
+
+        OrganizationMembership.objects.create(
+            organization=self.organization,
+            user=self.admin,
+            role=OrganizationMembership.Role.FINANCE_ADMIN,
+        )
+
+        self.accounts = initialize_chart_of_accounts(
+            organization=self.organization,
+        )
+
+        self.vendor = Vendor.objects.create(
+            organization=self.organization,
+            vendor_code="AGE-001",
+            legal_name="AP Ageing Test Vendor",
+        )
+
+        self.today = timezone.localdate()
+
+    def create_posted_invoice(
+        self,
+        *,
+        invoice_number,
+        amount,
+        due_date,
+        unassigned_vendor=False,
+        invoice_date=None,
+    ):
+        amount = Decimal(str(amount))
+        invoice_date = (
+            invoice_date
+            or self.today - timedelta(days=120)
+        )
+
+        invoice = Invoice.objects.create(
+            organization=self.organization,
+            vendor=(
+                None if unassigned_vendor else self.vendor
+            ),
+            invoice_number=invoice_number,
+            invoice_date=invoice_date,
+            due_date=due_date,
+            currency="NGN",
+            subtotal=amount,
+            total_amount=amount,
+            status=Invoice.Status.APPROVED,
+        )
+
+        journal = JournalEntry(
+            organization=self.organization,
+            source_invoice=invoice,
+            entry_date=invoice_date,
+            currency="NGN",
+            reference=f"AGE-{invoice_number}",
+            description="AP ageing test invoice.",
+            status=JournalEntry.Status.DRAFT,
+            created_by=self.admin,
+        )
+
+        journal.full_clean()
+        journal.save(force_insert=True)
+
+        lines = [
+            JournalLine(
+                entry=journal,
+                line_number=1,
+                account=self.accounts["5000"],
+                description="Supplier expense.",
+                debit=amount,
+                credit=Decimal("0.00"),
+            ),
+            JournalLine(
+                entry=journal,
+                line_number=2,
+                account=self.accounts["2000"],
+                description="Accounts payable.",
+                debit=Decimal("0.00"),
+                credit=amount,
+            ),
+        ]
+
+        for line in lines:
+            line.full_clean()
+            line.save(force_insert=True)
+
+        post_journal_entry(
+            organization_id=self.organization.pk,
+            journal_entry_id=journal.pk,
+            actor=self.admin,
+        )
+
+        return invoice, journal
+
+    def create_posted_payment(
+        self,
+        *,
+        invoice,
+        amount,
+        reference,
+        payment_date=None,
+    ):
+        amount = Decimal(str(amount))
+
+        payment = create_vendor_payment(
+            organization_id=self.organization.pk,
+            vendor_id=invoice.vendor_id,
+            payment_account_id=self.accounts["1000"].pk,
+            amount=amount,
+            currency="NGN",
+            payment_date=payment_date or self.today,
+            reference=reference,
+            actor=self.operator,
+        )
+
+        set_vendor_payment_allocation(
+            organization_id=self.organization.pk,
+            payment_id=payment.pk,
+            invoice_id=invoice.pk,
+            amount=amount,
+            actor=self.operator,
+        )
+
+        post_vendor_payment(
+            organization_id=self.organization.pk,
+            payment_id=payment.pk,
+            actor=self.admin,
+        )
+
+        return payment
+
+    def get_report(self, *, as_of_date=None):
+        return build_ap_ageing_report(
+            organization=self.organization,
+            as_of_date=as_of_date or self.today,
+        )
+
+    def get_ngn_report(self, *, as_of_date=None):
+        report = self.get_report(as_of_date=as_of_date)
+
+        return next(
+            item
+            for item in report["currencies"]
+            if item["currency"] == "NGN"
+        )
+
+    def test_reports_all_ageing_buckets_and_missing_due_date(self):
+        due_dates = [
+            self.today + timedelta(days=10),
+            self.today,
+            self.today - timedelta(days=1),
+            self.today - timedelta(days=30),
+            self.today - timedelta(days=31),
+            self.today - timedelta(days=60),
+            self.today - timedelta(days=61),
+            self.today - timedelta(days=90),
+            self.today - timedelta(days=91),
+            None,
+        ]
+
+        for index, due_date in enumerate(due_dates, start=1):
+            self.create_posted_invoice(
+                invoice_number=f"AGE-BUCKET-{index:03}",
+                amount="100.00",
+                due_date=due_date,
+            )
+
+        report = self.get_ngn_report()
+
+        self.assertEqual(report["invoice_count"], 10)
+        self.assertEqual(
+            report["total_outstanding"],
+            "1000.00",
+        )
+
+        expected_totals = {
+            "current": "200.00",
+            "1_30_days": "200.00",
+            "31_60_days": "200.00",
+            "61_90_days": "200.00",
+            "over_90_days": "100.00",
+            "missing_due_date": "100.00",
+        }
+
+        for bucket, expected in expected_totals.items():
+            with self.subTest(bucket=bucket):
+                self.assertEqual(
+                    report["bucket_totals"][bucket],
+                    expected,
+                )
+
+    def test_unassigned_vendor_is_included_in_report(self):
+        self.create_posted_invoice(
+            invoice_number="AGE-UNASSIGNED-001",
+            amount="25000.00",
+            due_date=self.today - timedelta(days=10),
+            unassigned_vendor=True,
+        )
+
+        report = self.get_ngn_report()
+
+        self.assertEqual(len(report["vendors"]), 1)
+
+        vendor_report = report["vendors"][0]
+
+        self.assertIsNone(vendor_report["vendor_id"])
+        self.assertEqual(
+            vendor_report["vendor_name"],
+            "Unassigned Vendor",
+        )
+        self.assertEqual(
+            vendor_report["total_outstanding"],
+            "25000.00",
+        )
+
+    def test_draft_payment_does_not_reduce_ap_ageing(self):
+        invoice, journal = self.create_posted_invoice(
+            invoice_number="AGE-DRAFT-PAY-001",
+            amount="1000.00",
+            due_date=self.today - timedelta(days=10),
+        )
+
+        payment = create_vendor_payment(
+            organization_id=self.organization.pk,
+            vendor_id=self.vendor.pk,
+            payment_account_id=self.accounts["1000"].pk,
+            amount="400.00",
+            currency="NGN",
+            reference="AGE-DRAFT-PAY-001",
+            actor=self.operator,
+        )
+
+        set_vendor_payment_allocation(
+            organization_id=self.organization.pk,
+            payment_id=payment.pk,
+            invoice_id=invoice.pk,
+            amount="400.00",
+            actor=self.operator,
+        )
+
+        report = self.get_ngn_report()
+
+        self.assertEqual(
+            report["total_outstanding"],
+            "1000.00",
+        )
+
+    def test_posted_partial_payment_reduces_ap_ageing(self):
+        invoice, journal = self.create_posted_invoice(
+            invoice_number="AGE-PARTIAL-PAY-001",
+            amount="1000.00",
+            due_date=self.today - timedelta(days=10),
+        )
+
+        self.create_posted_payment(
+            invoice=invoice,
+            amount="400.00",
+            reference="AGE-PARTIAL-PAY-001",
+        )
+
+        report = self.get_ngn_report()
+
+        self.assertEqual(
+            report["total_outstanding"],
+            "600.00",
+        )
+        self.assertEqual(
+            report["bucket_totals"]["1_30_days"],
+            "600.00",
+        )
+
+        vendor_report = report["vendors"][0]
+
+        self.assertEqual(
+            vendor_report["invoices"][0]["ap_obligation"],
+            "1000.00",
+        )
+        self.assertEqual(
+            vendor_report["invoices"][0]["posted_payments"],
+            "400.00",
+        )
+        self.assertEqual(
+            vendor_report["invoices"][0]["outstanding_amount"],
+            "600.00",
+        )
+
+    def test_reversed_payment_restores_outstanding_ap(self):
+        invoice, journal = self.create_posted_invoice(
+            invoice_number="AGE-REVERSED-PAY-001",
+            amount="1000.00",
+            due_date=self.today - timedelta(days=10),
+        )
+
+        payment = self.create_posted_payment(
+            invoice=invoice,
+            amount="1000.00",
+            reference="AGE-REVERSED-PAY-001",
+        )
+
+        reverse_vendor_payment(
+            organization_id=self.organization.pk,
+            payment_id=payment.pk,
+            actor=self.admin,
+            reversal_reason="Testing AP ageing after payment reversal.",
+        )
+
+        report = self.get_ngn_report()
+
+        self.assertEqual(
+            report["total_outstanding"],
+            "1000.00",
+        )
+
+    def test_historical_ageing_respects_payment_reversal_date(self):
+        historical_date = self.today - timedelta(days=1)
+        past_posted_at = timezone.now() - timedelta(days=2)
+
+        invoice, invoice_journal = self.create_posted_invoice(
+            invoice_number="AGE-HISTORICAL-001",
+            amount="1000.00",
+            due_date=historical_date - timedelta(days=10),
+            invoice_date=historical_date - timedelta(days=20),
+        )
+
+        payment = self.create_posted_payment(
+            invoice=invoice,
+            amount="1000.00",
+            reference="AGE-HISTORICAL-001",
+            payment_date=historical_date,
+        )
+
+        # Set the posting timestamps to before the historical
+        # reporting date so that the payment had settled AP then.
+        JournalEntry.objects.filter(
+            pk=invoice_journal.pk,
+        ).update(
+            posted_at=past_posted_at,
+        )
+
+        JournalEntry.objects.filter(
+            pk=payment.journal_entry_id,
+        ).update(
+            posted_at=past_posted_at,
+        )
+
+        VendorPayment.objects.filter(
+            pk=payment.pk,
+        ).update(
+            posted_at=past_posted_at,
+        )
+
+        reverse_vendor_payment(
+            organization_id=self.organization.pk,
+            payment_id=payment.pk,
+            actor=self.admin,
+            reversal_reason="Testing historical AP ageing.",
+        )
+
+        historical_report = self.get_ngn_report(
+            as_of_date=historical_date,
+        )
+
+        current_report = self.get_ngn_report()
+
+        # Before reversal, the payment was an effective settlement.
+        self.assertEqual(
+            historical_report["total_outstanding"],
+            "0.00",
+        )
+
+        # After reversal, the invoice is outstanding again.
+        self.assertEqual(
+            current_report["total_outstanding"],
+            "1000.00",
         )
