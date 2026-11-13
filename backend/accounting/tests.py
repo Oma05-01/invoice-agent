@@ -9,8 +9,10 @@ from accounting.models import (
     Account,
     JournalAdjustment,
     JournalEntry,
+    VendorPayment,
     JournalLine,
 )
+from vendors.models import Vendor
 
 from accounting.services import (
     DEFAULT_CHART_OF_ACCOUNTS,
@@ -397,6 +399,72 @@ class AccountingJournalLifecycleTests(TestCase):
             journal_entry_id=entry.id,
             actor=self.admin,
         )
+
+    def create_payment_journal(self, reference):
+        entry = JournalEntry(
+            organization=self.organization,
+            entry_date=date(2026, 11, 13),
+            currency="NGN",
+            reference=reference,
+            description="Vendor payment test journal.",
+            status=JournalEntry.Status.DRAFT,
+            created_by=self.admin,
+        )
+        entry.full_clean()
+        entry.save(force_insert=True)
+
+        lines = [
+            JournalLine(
+                entry=entry,
+                line_number=1,
+                account=self.accounts["2000"],
+                description="Accounts payable settlement.",
+                debit=Decimal("10000.00"),
+                credit=Decimal("0.00"),
+            ),
+            JournalLine(
+                entry=entry,
+                line_number=2,
+                account=self.accounts["1000"],
+                description="Cash payment.",
+                debit=Decimal("0.00"),
+                credit=Decimal("10000.00"),
+            ),
+        ]
+
+        for line in lines:
+            line.full_clean()
+            line.save(force_insert=True)
+
+        return entry
+
+    def create_vendor_payment(self, entry, status):
+        vendor = Vendor.objects.create(
+            organization=self.organization,
+            legal_name="Payment Test Vendor",
+            vendor_code="PAYMENT-TEST-001",
+        )
+
+        payment = VendorPayment(
+            organization=self.organization,
+            vendor=vendor,
+            reference="VP-TEST-001",
+            amount=Decimal("10000.00"),
+            currency="NGN",
+            payment_account=self.accounts["1000"],
+            journal_entry=entry,
+            status=status,
+            created_by=self.admin,
+        )
+
+        if status == VendorPayment.Status.POSTED:
+            payment.posted_by = self.admin
+            payment.posted_at = timezone.now()
+
+        payment.full_clean()
+        payment.save(force_insert=True)
+
+        return payment
 
     def test_finance_operator_can_classify_draft_line(self):
         entry = self.create_draft()
@@ -978,6 +1046,66 @@ class AccountingJournalLifecycleTests(TestCase):
             JournalAdjustment.objects.count(),
             0,
         )
+
+    def test_generic_post_rejects_vendor_payment_journal(self):
+        entry = self.create_payment_journal("VP-POST-TEST-001")
+
+        payment = self.create_vendor_payment(
+            entry,
+            VendorPayment.Status.DRAFT,
+        )
+
+        with self.assertRaisesMessage(
+            AccountingStateError,
+            "Vendor payment journals must be posted "
+            "through the vendor payment workflow.",
+        ):
+            post_journal_entry(
+                organization_id=self.organization.id,
+                journal_entry_id=entry.id,
+                actor=self.admin,
+            )
+
+        entry.refresh_from_db()
+        payment.refresh_from_db()
+
+        self.assertEqual(entry.status, JournalEntry.Status.DRAFT)
+        self.assertEqual(payment.status, VendorPayment.Status.DRAFT)
+
+    def test_generic_reversal_rejects_vendor_payment_journal(self):
+        entry = self.create_payment_journal("VP-REV-TEST-001")
+
+        # Post the journal before linking the payment.
+        self.post_entry(entry)
+        entry.refresh_from_db()
+
+        payment = self.create_vendor_payment(
+            entry,
+            VendorPayment.Status.POSTED,
+        )
+
+        with self.assertRaisesMessage(
+            AccountingStateError,
+            "Vendor payment journals must be reversed "
+            "through the vendor payment workflow.",
+        ):
+            reverse_journal_entry(
+                organization_id=self.organization.id,
+                journal_entry_id=entry.id,
+                actor=self.admin,
+                reversal_reason="Testing payment journal protection.",
+            )
+
+        entry.refresh_from_db()
+        payment.refresh_from_db()
+
+        self.assertEqual(entry.status, JournalEntry.Status.POSTED)
+        self.assertEqual(payment.status, VendorPayment.Status.POSTED)
+
+        self.assertFalse(
+            JournalEntry.objects.filter(reversal_of=entry).exists()
+        )
+
 
 class AccountingAPITests(TestCase):
 

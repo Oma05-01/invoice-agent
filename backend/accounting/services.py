@@ -12,6 +12,7 @@ from accounting.models import (
     JournalAdjustment,
     JournalEntry,
     JournalLine,
+    VendorPayment,
 )
 from approvals.models import ApprovalDecision
 from invoices.models import Invoice
@@ -700,24 +701,14 @@ def update_draft_journal_entry_date(
     return entry
 
 
-@transaction.atomic
-def post_journal_entry(
-    *,
-    organization_id,
-    journal_entry_id,
-    actor,
-):
-    require_accounting_role(
-        organization_id=organization_id,
-        actor=actor,
-        allowed_roles=POSTING_ROLES,
-    )
 
-    entry = get_locked_journal(
-        organization_id=organization_id,
-        journal_entry_id=journal_entry_id,
-    )
+def _post_locked_journal_entry(*, entry, actor):
+    """
+    Post an already-locked draft journal.
 
+    The caller must provide an atomic transaction and must
+    lock the journal before calling this helper.
+    """
     if entry.status != JournalEntry.Status.DRAFT:
         raise AccountingStateError(
             "Only draft journals can be posted."
@@ -784,30 +775,49 @@ def post_journal_entry(
 
     return entry
 
+
 @transaction.atomic
-def reverse_journal_entry(
+def post_journal_entry(
     *,
     organization_id,
     journal_entry_id,
     actor,
-    reversal_reason,
 ):
     require_accounting_role(
         organization_id=organization_id,
         actor=actor,
-        allowed_roles=REVERSAL_ROLES,
+        allowed_roles=POSTING_ROLES,
     )
 
-    if not reversal_reason.strip():
-        raise AccountingStateError(
-            "A reason is required to reverse a journal."
-        )
-
-    original = get_locked_journal(
+    entry = get_locked_journal(
         organization_id=organization_id,
         journal_entry_id=journal_entry_id,
     )
 
+    if VendorPayment.objects.filter(journal_entry=entry).exists():
+        raise AccountingStateError(
+            "Vendor payment journals must be posted "
+            "through the vendor payment workflow."
+        )
+
+    return _post_locked_journal_entry(
+        entry=entry,
+        actor=actor,
+    )
+
+
+def _reverse_locked_journal_entry(
+    *,
+    original,
+    actor,
+    reversal_reason,
+):
+    """
+    Reverse an already-locked posted journal.
+
+    The caller must provide an atomic transaction and must
+    lock the original journal before calling this helper.
+    """
     if original.status != JournalEntry.Status.POSTED:
         raise AccountingStateError(
             "Only posted journals can be reversed."
@@ -846,10 +856,6 @@ def reverse_journal_entry(
 
     reversal.full_clean()
     reversal.save(force_insert=True)
-
-    # Reverse every original posting:
-    # original debit becomes reversal credit,
-    # original credit becomes reversal debit.
 
     for index, original_line in enumerate(original_lines, start=1):
         reversal_line = JournalLine(
@@ -905,6 +911,44 @@ def reverse_journal_entry(
     )
 
     return reversal
+
+
+@transaction.atomic
+def reverse_journal_entry(
+    *,
+    organization_id,
+    journal_entry_id,
+    actor,
+    reversal_reason,
+):
+    require_accounting_role(
+        organization_id=organization_id,
+        actor=actor,
+        allowed_roles=REVERSAL_ROLES,
+    )
+
+    if not isinstance(reversal_reason, str) or not reversal_reason.strip():
+        raise AccountingStateError(
+            "A reason is required to reverse a journal."
+        )
+
+    original = get_locked_journal(
+        organization_id=organization_id,
+        journal_entry_id=journal_entry_id,
+    )
+
+    if VendorPayment.objects.filter(journal_entry=original).exists():
+        raise AccountingStateError(
+            "Vendor payment journals must be reversed "
+            "through the vendor payment workflow."
+        )
+
+    return _reverse_locked_journal_entry(
+        original=original,
+        actor=actor,
+        reversal_reason=reversal_reason,
+    )
+
 
 @transaction.atomic
 def create_adjustment_journal(
