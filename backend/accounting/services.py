@@ -533,6 +533,12 @@ def update_draft_journal_line(
         journal_entry_id=journal_entry_id,
     )
 
+    if VendorPayment.objects.filter(journal_entry=entry).exists():
+        raise AccountingStateError(
+            "Vendor payment journals cannot be edited "
+            "through generic journal operations."
+        )
+
     if entry.status != JournalEntry.Status.DRAFT:
         raise AccountingStateError(
             "Only draft journal lines can be edited."
@@ -674,6 +680,14 @@ def update_draft_journal_entry_date(
         journal_entry_id=journal_entry_id,
     )
 
+    # Vendor payment journals must only be modified
+    # through dedicated vendor payment operations.
+    if VendorPayment.objects.filter(journal_entry=entry).exists():
+        raise AccountingStateError(
+            "Vendor payment journals cannot be edited "
+            "through generic journal operations."
+        )
+
     if entry.status != JournalEntry.Status.DRAFT:
         raise AccountingStateError(
             "Only draft journal dates can be changed."
@@ -701,7 +715,6 @@ def update_draft_journal_entry_date(
     )
 
     return entry
-
 
 
 def _post_locked_journal_entry(*, entry, actor):
@@ -1939,3 +1952,358 @@ def remove_vendor_payment_allocation(
             "currency": payment.currency,
         },
     )
+
+
+@transaction.atomic
+def post_vendor_payment(
+    *,
+    organization_id,
+    payment_id,
+    actor,
+):
+    """
+    Post a fully allocated vendor payment and its journal atomically.
+
+    Only owners and finance administrators may post payments.
+    """
+
+    # 1. Authorize the actor.
+    require_accounting_role(
+        organization_id=organization_id,
+        actor=actor,
+        allowed_roles=POSTING_ROLES,
+    )
+
+    # 2. Lock the payment.
+    payment = (
+        VendorPayment.objects
+        .select_for_update(of=("self",))
+        .filter(
+            pk=payment_id,
+            organization_id=organization_id,
+        )
+        .first()
+    )
+
+    if payment is None:
+        raise VendorPayment.DoesNotExist
+
+    if payment.status != VendorPayment.Status.DRAFT:
+        raise AccountingStateError(
+            "Only draft vendor payments can be posted."
+        )
+
+    if not payment.journal_entry_id:
+        raise AccountingStateError(
+            "The vendor payment must have an accounting journal."
+        )
+
+    # 3. Lock the payment journal.
+    journal = get_locked_journal(
+        organization_id=organization_id,
+        journal_entry_id=payment.journal_entry_id,
+    )
+
+    if journal.status != JournalEntry.Status.DRAFT:
+        raise AccountingStateError(
+            "The payment journal must remain in Draft before posting."
+        )
+
+    if (
+        journal.source_invoice_id
+        or journal.approval_decision_id
+        or journal.reversal_of_id
+        or JournalAdjustment.objects.filter(
+            Q(original_journal=journal)
+            | Q(adjustment_journal=journal)
+        ).exists()
+    ):
+        raise AccountingStateError(
+            "A vendor payment must use a standalone journal."
+        )
+
+    if (
+        journal.organization_id != payment.organization_id
+        or journal.currency != payment.currency
+        or journal.entry_date != payment.payment_date
+        or journal.reference != payment.reference
+    ):
+        raise AccountingStateError(
+            "The payment and its journal contain inconsistent details."
+        )
+
+    # 4. Validate the organization's AP control account.
+    payable_account = (
+        Account.objects
+        .select_for_update(of=("self",))
+        .filter(
+            organization_id=organization_id,
+            code="2000",
+        )
+        .first()
+    )
+
+    if payable_account is None:
+        raise AccountingConfigurationError(
+            "The organization's Accounts Payable account (2000) is missing."
+        )
+
+    if (
+        payable_account.account_type != Account.AccountType.LIABILITY
+        or not payable_account.is_control_account
+        or not payable_account.is_active
+    ):
+        raise AccountingConfigurationError(
+            "Account 2000 must be an active liability control account."
+        )
+
+    # 5. Validate the selected asset account.
+    payment_account = (
+        Account.objects
+        .select_for_update(of=("self",))
+        .filter(
+            pk=payment.payment_account_id,
+            organization_id=organization_id,
+        )
+        .first()
+    )
+
+    if (
+        payment_account is None
+        or payment_account.account_type != Account.AccountType.ASSET
+        or not payment_account.is_active
+    ):
+        raise AccountingStateError(
+            "The payment account must be an active asset account."
+        )
+
+    # 6. Lock and validate the payment journal lines.
+    journal_lines = list(
+        JournalLine.objects
+        .select_for_update(of=("self",))
+        .select_related("account")
+        .filter(entry=journal)
+        .order_by("line_number")
+    )
+
+    if len(journal_lines) != 2:
+        raise AccountingStateError(
+            "A vendor payment journal must contain exactly two lines."
+        )
+
+    payable_lines = [
+        line for line in journal_lines
+        if line.account_id == payable_account.pk
+    ]
+
+    payment_lines = [
+        line for line in journal_lines
+        if line.account_id == payment_account.pk
+    ]
+
+    if len(payable_lines) != 1 or len(payment_lines) != 1:
+        raise AccountingStateError(
+            "The payment journal must debit Accounts Payable "
+            "and credit the selected payment account."
+        )
+
+    payable_line = payable_lines[0]
+    payment_line = payment_lines[0]
+
+    zero = Decimal("0.00")
+
+    if (
+        payable_line.debit != payment.amount
+        or payable_line.credit != zero
+        or payment_line.debit != zero
+        or payment_line.credit != payment.amount
+    ):
+        raise AccountingStateError(
+            "The payment journal lines must match the payment amount."
+        )
+
+    # 7. Identify the invoices allocated to this payment.
+    #
+    # The payment row is locked, so allocations belonging to this
+    # payment cannot be changed by the allocation services.
+    invoice_ids = list(
+        PaymentAllocation.objects
+        .filter(payment=payment)
+        .order_by("invoice_id")
+        .values_list("invoice_id", flat=True)
+    )
+
+    if not invoice_ids:
+        raise AccountingStateError(
+            "A vendor payment must have at least one invoice allocation."
+        )
+
+    # 8. Lock all affected invoices in a consistent order.
+    invoices = list(
+        Invoice.objects
+        .select_for_update(of=("self",))
+        .filter(
+            pk__in=invoice_ids,
+            organization_id=organization_id,
+        )
+        .order_by("pk")
+    )
+
+    if len(invoices) != len(invoice_ids):
+        raise AccountingStateError(
+            "One or more allocated invoices do not belong "
+            "to this organization."
+        )
+
+    invoice_map = {
+        invoice.pk: invoice
+        for invoice in invoices
+    }
+
+    # 9. Lock the corresponding invoice journals in the same order.
+    invoice_journals = list(
+        JournalEntry.objects
+        .select_for_update(of=("self",))
+        .filter(
+            organization_id=organization_id,
+            source_invoice_id__in=invoice_ids,
+        )
+        .order_by("source_invoice_id")
+    )
+
+    invoice_journal_map = {
+        entry.source_invoice_id: entry
+        for entry in invoice_journals
+    }
+
+    # 10. Lock and load this payment's allocations.
+    allocations = list(
+        PaymentAllocation.objects
+        .select_for_update(of=("self",))
+        .filter(payment=payment)
+        .order_by("invoice_id", "pk")
+    )
+
+    if not allocations:
+        raise AccountingStateError(
+            "A vendor payment must have at least one invoice allocation."
+        )
+
+    total_allocated = sum(
+        (allocation.amount for allocation in allocations),
+        zero,
+    )
+
+    if total_allocated != payment.amount:
+        raise AccountingStateError(
+            "The total invoice allocations must equal the payment amount."
+        )
+
+    # 11. Revalidate every invoice and its outstanding AP balance.
+    for allocation in allocations:
+        invoice = invoice_map.get(allocation.invoice_id)
+
+        if invoice is None:
+            raise AccountingStateError(
+                "An allocated invoice could not be found."
+            )
+
+        if invoice.vendor_id != payment.vendor_id:
+            raise AccountingStateError(
+                "The invoice and payment must belong to the same vendor."
+            )
+
+        if invoice.status != Invoice.Status.APPROVED:
+            raise AccountingStateError(
+                "Only approved invoices can receive payment allocations."
+            )
+
+        invoice_journal = invoice_journal_map.get(invoice.pk)
+
+        if (
+            invoice_journal is None
+            or invoice_journal.status != JournalEntry.Status.POSTED
+        ):
+            raise AccountingStateError(
+                "Every allocated invoice must have a posted "
+                "accounting journal."
+            )
+
+        if invoice_journal.currency != payment.currency:
+            raise AccountingStateError(
+                "The payment and invoice journal currencies must match."
+            )
+
+        obligation = _get_posted_invoice_ap_obligation(
+            invoice=invoice,
+            journal=invoice_journal,
+        )
+
+        # This query includes active Draft and Posted payments.
+        # It excludes allocations belonging to reversed payments.
+        active_allocations = list(
+            _get_active_invoice_allocations(invoice=invoice)
+        )
+
+        reserved_amount = sum(
+            (item.amount for item in active_allocations),
+            zero,
+        )
+
+        if reserved_amount > obligation:
+            raise AccountingStateError(
+                "The active payment allocations exceed the "
+                "invoice's remaining accounts payable balance."
+            )
+
+    # 12. Post the journal using the existing accounting helper.
+    _post_locked_journal_entry(
+        entry=journal,
+        actor=actor,
+    )
+
+    # 13. Update the payment status in the same transaction.
+    previous_status = payment.status
+
+    payment.status = VendorPayment.Status.POSTED
+    payment.posted_by = actor
+    payment.posted_at = journal.posted_at
+
+    payment.full_clean()
+
+    payment.save(
+        update_fields=[
+            "status",
+            "posted_by",
+            "posted_at",
+            "updated_at",
+        ]
+    )
+
+    # 14. Record the payment-specific audit event.
+    record_journal_audit(
+        entry=journal,
+        actor=actor,
+        operation="vendor_payment_posted",
+        changes={
+            "payment_status": {
+                "before": previous_status,
+                "after": payment.status,
+            }
+        },
+        metadata={
+            "vendor_payment_id": str(payment.pk),
+            "vendor_id": str(payment.vendor_id),
+            "vendor_name": (
+                payment.vendor.display_name
+                or payment.vendor.legal_name
+            ),
+            "amount": str(payment.amount),
+            "currency": payment.currency,
+            "allocation_count": len(allocations),
+            "total_allocated": str(total_allocated),
+            "posted_by": actor.get_username(),
+        },
+    )
+
+    return payment

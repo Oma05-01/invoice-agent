@@ -30,6 +30,8 @@ from accounting.services import (
     create_adjustment_journal,
     set_vendor_payment_allocation,
     remove_vendor_payment_allocation,
+    post_vendor_payment,
+    update_draft_journal_entry_date,
 )
 
 from approvals.models import ApprovalRequest, ApprovalDecision
@@ -3437,4 +3439,224 @@ class VendorPaymentAllocationServiceTests(TestCase):
             JournalEntry.objects.filter(
                 reversal_of=self.invoice_journal,
             ).exists()
+        )
+
+
+
+    def test_finance_admin_can_post_fully_allocated_payment(self):
+        self.allocate(amount="100000.00")
+
+        payment = post_vendor_payment(
+            organization_id=self.organization.pk,
+            payment_id=self.payment.pk,
+            actor=self.admin,
+        )
+
+        payment.refresh_from_db()
+        payment.journal_entry.refresh_from_db()
+
+        self.assertEqual(
+            payment.status,
+            VendorPayment.Status.POSTED,
+        )
+        self.assertEqual(
+            payment.journal_entry.status,
+            JournalEntry.Status.POSTED,
+        )
+        self.assertEqual(payment.posted_by, self.admin)
+        self.assertIsNotNone(payment.posted_at)
+
+        self.assertTrue(
+            JournalAuditEvent.objects.filter(
+                journal_entry=payment.journal_entry,
+                operation="vendor_payment_posted",
+            ).exists()
+        )
+
+        self.assertTrue(
+            JournalAuditEvent.objects.filter(
+                journal_entry=payment.journal_entry,
+                operation="journal_posted",
+            ).exists()
+        )
+
+    def test_finance_operator_cannot_post_vendor_payment(self):
+        self.allocate(amount="100000.00")
+
+        with self.assertRaises(AccountingPermissionError):
+            post_vendor_payment(
+                organization_id=self.organization.pk,
+                payment_id=self.payment.pk,
+                actor=self.operator,
+            )
+
+        self.payment.refresh_from_db()
+        self.payment.journal_entry.refresh_from_db()
+
+        self.assertEqual(
+            self.payment.status,
+            VendorPayment.Status.DRAFT,
+        )
+        self.assertEqual(
+            self.payment.journal_entry.status,
+            JournalEntry.Status.DRAFT,
+        )
+
+    def test_payment_cannot_be_posted_without_allocations(self):
+        with self.assertRaisesMessage(
+            AccountingStateError,
+            "A vendor payment must have at least one invoice allocation.",
+        ):
+            post_vendor_payment(
+                organization_id=self.organization.pk,
+                payment_id=self.payment.pk,
+                actor=self.admin,
+            )
+
+        self.payment.refresh_from_db()
+
+        self.assertEqual(
+            self.payment.status,
+            VendorPayment.Status.DRAFT,
+        )
+
+    def test_payment_must_be_fully_allocated_before_posting(self):
+        self.allocate(amount="50000.00")
+
+        with self.assertRaisesMessage(
+            AccountingStateError,
+            "The total invoice allocations must equal the payment amount.",
+        ):
+            post_vendor_payment(
+                organization_id=self.organization.pk,
+                payment_id=self.payment.pk,
+                actor=self.admin,
+            )
+
+        self.payment.refresh_from_db()
+        self.payment.journal_entry.refresh_from_db()
+
+        self.assertEqual(
+            self.payment.status,
+            VendorPayment.Status.DRAFT,
+        )
+        self.assertEqual(
+            self.payment.journal_entry.status,
+            JournalEntry.Status.DRAFT,
+        )
+
+    def test_posting_revalidates_invoice_reserved_balance(self):
+        self.allocate(amount="100000.00")
+
+        competing_payment = self.create_payment(
+            amount="100000.00",
+            reference="ALLOC-COMPETING-001",
+        )
+
+        # Simulate an inconsistent allocation inserted outside
+        # the allocation service. Posting must still detect it.
+        PaymentAllocation.objects.create(
+            payment=competing_payment,
+            invoice=self.invoice,
+            amount=Decimal("1.00"),
+        )
+
+        with self.assertRaisesMessage(
+            AccountingStateError,
+            "The active payment allocations exceed the "
+            "invoice's remaining accounts payable balance.",
+        ):
+            post_vendor_payment(
+                organization_id=self.organization.pk,
+                payment_id=self.payment.pk,
+                actor=self.admin,
+            )
+
+        self.payment.refresh_from_db()
+        self.payment.journal_entry.refresh_from_db()
+
+        self.assertEqual(
+            self.payment.status,
+            VendorPayment.Status.DRAFT,
+        )
+        self.assertEqual(
+            self.payment.journal_entry.status,
+            JournalEntry.Status.DRAFT,
+        )
+
+    def test_posting_rejects_modified_payment_journal(self):
+        JournalLine.objects.filter(
+            entry=self.payment.journal_entry,
+            line_number=1,
+        ).update(
+            debit=Decimal("99999.00"),
+        )
+
+        self.allocate(amount="100000.00")
+
+        with self.assertRaisesMessage(
+            AccountingStateError,
+            "The payment journal lines must match the payment amount.",
+        ):
+            post_vendor_payment(
+                organization_id=self.organization.pk,
+                payment_id=self.payment.pk,
+                actor=self.admin,
+            )
+
+        self.payment.refresh_from_db()
+        self.payment.journal_entry.refresh_from_db()
+
+        self.assertEqual(
+            self.payment.status,
+            VendorPayment.Status.DRAFT,
+        )
+        self.assertEqual(
+            self.payment.journal_entry.status,
+            JournalEntry.Status.DRAFT,
+        )
+
+    def test_generic_line_edit_rejects_payment_journal(self):
+        line = self.payment.journal_entry.lines.get(line_number=1)
+
+        with self.assertRaisesMessage(
+            AccountingStateError,
+            "Vendor payment journals cannot be edited "
+            "through generic journal operations.",
+        ):
+            update_draft_journal_line(
+                organization_id=self.organization.pk,
+                journal_entry_id=self.payment.journal_entry_id,
+                journal_line_id=line.pk,
+                actor=self.operator,
+                corrections={
+                    "debit": Decimal("90000.00"),
+                },
+                correction_reason="Testing payment journal protection.",
+            )
+
+        line.refresh_from_db()
+        self.assertEqual(line.debit, Decimal("100000.00"))
+
+    def test_generic_date_edit_rejects_payment_journal(self):
+        original_date = self.payment.journal_entry.entry_date
+
+        with self.assertRaisesMessage(
+            AccountingStateError,
+            "Vendor payment journals cannot be edited "
+            "through generic journal operations.",
+        ):
+            update_draft_journal_entry_date(
+                organization_id=self.organization.pk,
+                journal_entry_id=self.payment.journal_entry_id,
+                actor=self.operator,
+                entry_date=date(2026, 11, 14),
+                correction_reason="Testing payment date protection.",
+            )
+
+        self.payment.journal_entry.refresh_from_db()
+
+        self.assertEqual(
+            self.payment.journal_entry.entry_date,
+            original_date,
         )
