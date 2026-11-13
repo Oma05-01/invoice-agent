@@ -11,6 +11,7 @@ from accounting.models import (
     JournalEntry,
     VendorPayment,
     JournalLine,
+    PaymentAllocation,
 )
 from vendors.models import Vendor
 
@@ -27,6 +28,8 @@ from accounting.services import (
     reverse_journal_entry,
     record_journal_audit,
     create_adjustment_journal,
+    set_vendor_payment_allocation,
+    remove_vendor_payment_allocation,
 )
 
 from approvals.models import ApprovalRequest, ApprovalDecision
@@ -3042,3 +3045,396 @@ class VendorPaymentCreationServiceTests(TestCase):
             self.create_payment(amount="125000.125")
 
         self.assert_no_payment_records()
+
+
+class VendorPaymentAllocationServiceTests(TestCase):
+
+    def setUp(self):
+        User = get_user_model()
+
+        self.operator = User.objects.create_user(
+            username="allocation_operator",
+            password="test-password-123",
+        )
+
+        self.admin = User.objects.create_user(
+            username="allocation_admin",
+            password="test-password-123",
+        )
+
+        self.outsider = User.objects.create_user(
+            username="allocation_outsider",
+            password="test-password-123",
+        )
+
+        self.organization = Organization.objects.create(
+            name="Payment Allocation Test Company",
+            slug="payment-allocation-test-company",
+            default_currency="NGN",
+        )
+
+        OrganizationMembership.objects.create(
+            organization=self.organization,
+            user=self.operator,
+            role=OrganizationMembership.Role.FINANCE_OPERATOR,
+        )
+
+        OrganizationMembership.objects.create(
+            organization=self.organization,
+            user=self.admin,
+            role=OrganizationMembership.Role.FINANCE_ADMIN,
+        )
+
+        self.accounts = initialize_chart_of_accounts(
+            organization=self.organization,
+        )
+
+        self.vendor = Vendor.objects.create(
+            organization=self.organization,
+            vendor_code="ALLOC-001",
+            legal_name="Allocation Test Vendor",
+        )
+
+        self.invoice, self.invoice_journal = (
+            self.create_invoice_with_journal(
+                invoice_number="ALLOC-INV-001",
+                amount=Decimal("100000.00"),
+            )
+        )
+
+        self.payment = self.create_payment(
+            amount="100000.00",
+            reference="ALLOC-PAY-001",
+        )
+
+    def create_invoice_with_journal(
+        self,
+        *,
+        invoice_number,
+        amount,
+        currency="NGN",
+        vendor=None,
+        post=True,
+    ):
+        vendor = vendor or self.vendor
+
+        invoice = Invoice.objects.create(
+            organization=self.organization,
+            vendor=vendor,
+            invoice_number=invoice_number,
+            invoice_date=date(2026, 11, 10),
+            due_date=date(2026, 12, 10),
+            currency=currency,
+            subtotal=amount,
+            total_amount=amount,
+            status=Invoice.Status.APPROVED,
+        )
+
+        journal = JournalEntry(
+            organization=self.organization,
+            source_invoice=invoice,
+            entry_date=date(2026, 11, 10),
+            currency=currency,
+            reference=f"INV-{invoice_number}",
+            description="Allocation test invoice journal.",
+            status=JournalEntry.Status.DRAFT,
+            created_by=self.admin,
+        )
+
+        journal.full_clean()
+        journal.save(force_insert=True)
+
+        lines = [
+            JournalLine(
+                entry=journal,
+                line_number=1,
+                account=self.accounts["5000"],
+                description="Supplier expense.",
+                debit=amount,
+                credit=Decimal("0.00"),
+            ),
+            JournalLine(
+                entry=journal,
+                line_number=2,
+                account=self.accounts["2000"],
+                description="Accounts payable.",
+                debit=Decimal("0.00"),
+                credit=amount,
+            ),
+        ]
+
+        for line in lines:
+            line.full_clean()
+            line.save(force_insert=True)
+
+        if post:
+            post_journal_entry(
+                organization_id=self.organization.pk,
+                journal_entry_id=journal.pk,
+                actor=self.admin,
+            )
+
+        return invoice, journal
+
+    def create_payment(self, *, amount, reference):
+        return create_vendor_payment(
+            organization_id=self.organization.pk,
+            vendor_id=self.vendor.pk,
+            payment_account_id=self.accounts["1000"].pk,
+            amount=amount,
+            currency="NGN",
+            reference=reference,
+            actor=self.operator,
+        )
+
+    def allocate(self, *, payment=None, invoice=None, amount):
+        return set_vendor_payment_allocation(
+            organization_id=self.organization.pk,
+            payment_id=(payment or self.payment).pk,
+            invoice_id=(invoice or self.invoice).pk,
+            amount=amount,
+            actor=self.operator,
+        )
+
+    def test_can_create_partial_invoice_allocation(self):
+        allocation = self.allocate(amount="40000.00")
+
+        self.assertEqual(
+            allocation.amount,
+            Decimal("40000.00"),
+        )
+
+        self.assertEqual(allocation.payment, self.payment)
+        self.assertEqual(allocation.invoice, self.invoice)
+
+        event = JournalAuditEvent.objects.get(
+            journal_entry=self.payment.journal_entry,
+            operation="vendor_payment_allocation_created",
+        )
+
+        self.assertEqual(
+            event.metadata["payment_allocation_id"],
+            str(allocation.pk),
+        )
+
+    def test_existing_allocation_can_be_updated(self):
+        allocation = self.allocate(amount="40000.00")
+
+        updated = self.allocate(amount="60000.00")
+
+        self.assertEqual(updated.pk, allocation.pk)
+        self.assertEqual(updated.amount, Decimal("60000.00"))
+
+        self.assertEqual(
+            PaymentAllocation.objects.filter(
+                payment=self.payment,
+                invoice=self.invoice,
+            ).count(),
+            1,
+        )
+
+        event = JournalAuditEvent.objects.get(
+            journal_entry=self.payment.journal_entry,
+            operation="vendor_payment_allocation_updated",
+        )
+
+        self.assertEqual(
+            event.changes["allocation_amount"]["before"],
+            "40000.00",
+        )
+
+        self.assertEqual(
+            event.changes["allocation_amount"]["after"],
+            "60000.00",
+        )
+
+    def test_allocation_can_be_removed_from_draft_payment(self):
+        self.allocate(amount="40000.00")
+
+        remove_vendor_payment_allocation(
+            organization_id=self.organization.pk,
+            payment_id=self.payment.pk,
+            invoice_id=self.invoice.pk,
+            actor=self.operator,
+        )
+
+        self.assertFalse(
+            PaymentAllocation.objects.filter(
+                payment=self.payment,
+                invoice=self.invoice,
+            ).exists()
+        )
+
+        self.assertTrue(
+            JournalAuditEvent.objects.filter(
+                journal_entry=self.payment.journal_entry,
+                operation="vendor_payment_allocation_removed",
+            ).exists()
+        )
+
+    def test_payment_allocations_cannot_exceed_payment_amount(self):
+        with self.assertRaisesMessage(
+            AccountingStateError,
+            "The payment's total allocations cannot exceed its amount.",
+        ):
+            self.allocate(amount="100000.01")
+
+        self.assertFalse(
+            PaymentAllocation.objects.filter(
+                payment=self.payment,
+            ).exists()
+        )
+
+    def test_draft_allocations_reserve_invoice_balance(self):
+        self.allocate(amount="80000.00")
+
+        second_payment = self.create_payment(
+            amount="50000.00",
+            reference="ALLOC-PAY-002",
+        )
+
+        with self.assertRaisesMessage(
+            AccountingStateError,
+            "The allocation exceeds the invoice's remaining "
+            "accounts payable balance.",
+        ):
+            self.allocate(
+                payment=second_payment,
+                amount="20000.01",
+            )
+
+        self.assertFalse(
+            PaymentAllocation.objects.filter(
+                payment=second_payment,
+            ).exists()
+        )
+
+    def test_invoice_allocation_cannot_exceed_posted_ap_obligation(self):
+        larger_payment = self.create_payment(
+            amount="150000.00",
+            reference="ALLOC-PAY-LARGE-001",
+        )
+
+        with self.assertRaisesMessage(
+            AccountingStateError,
+            "The allocation exceeds the invoice's remaining "
+            "accounts payable balance.",
+        ):
+            self.allocate(
+                payment=larger_payment,
+                amount="100000.01",
+            )
+
+        self.assertFalse(
+            PaymentAllocation.objects.filter(
+                payment=larger_payment,
+            ).exists()
+        )
+
+    def test_payment_and_invoice_must_have_same_vendor(self):
+        other_vendor = Vendor.objects.create(
+            organization=self.organization,
+            vendor_code="ALLOC-002",
+            legal_name="Different Allocation Vendor",
+        )
+
+        other_invoice, _ = self.create_invoice_with_journal(
+            invoice_number="ALLOC-INV-002",
+            amount=Decimal("50000.00"),
+            vendor=other_vendor,
+        )
+
+        with self.assertRaisesMessage(
+            AccountingStateError,
+            "The invoice and payment must belong to the same vendor.",
+        ):
+            self.allocate(
+                invoice=other_invoice,
+                amount="10000.00",
+            )
+
+    def test_payment_and_invoice_journal_currencies_must_match(self):
+        usd_invoice, _ = self.create_invoice_with_journal(
+            invoice_number="ALLOC-USD-001",
+            amount=Decimal("50000.00"),
+            currency="USD",
+        )
+
+        with self.assertRaisesMessage(
+            AccountingStateError,
+            "The payment and invoice journal currencies must match.",
+        ):
+            self.allocate(
+                invoice=usd_invoice,
+                amount="10000.00",
+            )
+
+    def test_invoice_must_have_posted_journal(self):
+        unposted_invoice, _ = self.create_invoice_with_journal(
+            invoice_number="ALLOC-UNPOSTED-001",
+            amount=Decimal("50000.00"),
+            post=False,
+        )
+
+        with self.assertRaisesMessage(
+            AccountingStateError,
+            "The invoice must have a posted accounting journal.",
+        ):
+            self.allocate(
+                invoice=unposted_invoice,
+                amount="10000.00",
+            )
+
+    def test_unapproved_invoice_cannot_receive_allocation(self):
+        self.invoice.status = Invoice.Status.REJECTED
+        self.invoice.save(update_fields=["status"])
+
+        with self.assertRaisesMessage(
+            AccountingStateError,
+            "Only approved invoices can receive payment allocations.",
+        ):
+            self.allocate(amount="10000.00")
+
+    def test_user_without_finance_membership_cannot_allocate(self):
+        with self.assertRaises(AccountingPermissionError):
+            set_vendor_payment_allocation(
+                organization_id=self.organization.pk,
+                payment_id=self.payment.pk,
+                invoice_id=self.invoice.pk,
+                amount="10000.00",
+                actor=self.outsider,
+            )
+
+        self.assertFalse(
+            PaymentAllocation.objects.filter(
+                payment=self.payment,
+            ).exists()
+        )
+
+    def test_invoice_journal_cannot_be_reversed_with_active_allocations(self):
+        self.allocate(amount="30000.00")
+
+        with self.assertRaisesMessage(
+            AccountingStateError,
+            "An invoice journal with active payment allocations "
+            "cannot be reversed.",
+        ):
+            reverse_journal_entry(
+                organization_id=self.organization.pk,
+                journal_entry_id=self.invoice_journal.pk,
+                actor=self.admin,
+                reversal_reason="Testing active allocation protection.",
+            )
+
+        self.invoice_journal.refresh_from_db()
+
+        self.assertEqual(
+            self.invoice_journal.status,
+            JournalEntry.Status.POSTED,
+        )
+
+        self.assertFalse(
+            JournalEntry.objects.filter(
+                reversal_of=self.invoice_journal,
+            ).exists()
+        )

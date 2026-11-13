@@ -12,11 +12,12 @@ from accounting.models import (
     JournalAdjustment,
     JournalEntry,
     JournalLine,
+    PaymentAllocation,
     VendorPayment,
 )
 from approvals.models import ApprovalDecision
 from invoices.models import Invoice
-from django.db.models import Max
+from django.db.models import Max, Q, Sum
 
 from auditlog.models import InvoiceAuditEvent
 from auditlog.services import (
@@ -824,6 +825,31 @@ def _reverse_locked_journal_entry(
             "Only posted journals can be reversed."
         )
 
+    if original.source_invoice_id:
+        active_allocations = (
+            PaymentAllocation.objects
+            .filter(invoice_id=original.source_invoice_id)
+            .filter(
+                Q(
+                    payment__status=VendorPayment.Status.DRAFT,
+                    payment__journal_entry__status=JournalEntry.Status.DRAFT,
+                )
+                |
+                Q(
+                    payment__status=VendorPayment.Status.POSTED,
+                    payment__journal_entry__status=JournalEntry.Status.POSTED,
+                )
+            )
+            .exists()
+        )
+
+    if active_allocations:
+        raise AccountingStateError(
+            "An invoice journal with active payment allocations "
+            "cannot be reversed. Remove draft allocations or "
+            "reverse related vendor payments first."
+        )
+
     if JournalEntry.objects.filter(reversal_of=original).exists():
         raise AccountingStateError(
             "This journal has already been reversed."
@@ -1467,3 +1493,449 @@ def create_vendor_payment(
     )
 
     return payment
+
+
+def _normalize_positive_allocation_amount(value):
+    if isinstance(value, (float, bool)):
+        raise AccountingStateError(
+            "Allocation amounts must be supplied as decimal values or strings."
+        )
+
+    try:
+        amount = Decimal(str(value))
+    except (InvalidOperation, TypeError, ValueError):
+        raise AccountingStateError(
+            "A valid allocation amount is required."
+        )
+
+    if not amount.is_finite() or amount <= Decimal("0.00"):
+        raise AccountingStateError(
+            "The allocation amount must be positive and finite."
+        )
+
+    try:
+        normalized = amount.quantize(Decimal("0.01"))
+    except InvalidOperation:
+        raise AccountingStateError(
+            "The allocation amount must have no more than two decimal places."
+        )
+
+    if normalized != amount:
+        raise AccountingStateError(
+            "The allocation amount must have no more than two decimal places."
+        )
+
+    return normalized
+
+
+def _get_posted_invoice_ap_obligation(*, invoice, journal):
+    """
+    Calculate the invoice's AP obligation from its posted journal.
+
+    Invoice.amount_due is deliberately not used as the accounting
+    source of truth.
+    """
+
+    if (
+        journal.organization_id != invoice.organization_id
+        or journal.source_invoice_id != invoice.pk
+        or journal.status != JournalEntry.Status.POSTED
+    ):
+        raise AccountingStateError(
+            "The invoice must have its own posted accounting journal."
+        )
+
+    totals = (
+        JournalLine.objects
+        .filter(
+            entry=journal,
+            account__organization_id=invoice.organization_id,
+            account__code="2000",
+            account__account_type=Account.AccountType.LIABILITY,
+            account__is_control_account=True,
+        )
+        .aggregate(
+            total_debit=Sum("debit"),
+            total_credit=Sum("credit"),
+        )
+    )
+
+    debit = totals["total_debit"] or Decimal("0.00")
+    credit = totals["total_credit"] or Decimal("0.00")
+
+    obligation = credit - debit
+
+    if obligation <= Decimal("0.00"):
+        raise AccountingConfigurationError(
+            "The invoice journal does not contain a valid "
+            "Accounts Payable obligation on account 2000."
+        )
+
+    return obligation
+
+
+def _get_active_invoice_allocations(*, invoice, exclude_id=None):
+    """
+    Return allocations that currently reserve invoice value.
+
+    Draft payments reserve balances but do not reduce AP ageing.
+    Posted payments reduce AP ageing and continue to reserve balances.
+    Reversed payments release their allocations.
+    """
+
+    queryset = (
+        PaymentAllocation.objects
+        .select_for_update(of=("self",))
+        .filter(invoice=invoice)
+        .filter(
+            Q(
+                payment__status=VendorPayment.Status.DRAFT,
+                payment__journal_entry__status=JournalEntry.Status.DRAFT,
+            )
+            |
+            Q(
+                payment__status=VendorPayment.Status.POSTED,
+                payment__journal_entry__status=JournalEntry.Status.POSTED,
+            )
+        )
+    )
+
+    if exclude_id is not None:
+        queryset = queryset.exclude(pk=exclude_id)
+
+    return queryset.order_by("pk")
+
+
+@transaction.atomic
+def set_vendor_payment_allocation(
+    *,
+    organization_id,
+    payment_id,
+    invoice_id,
+    amount,
+    actor,
+):
+    """
+    Create or update one allocation on a draft vendor payment.
+
+    Locks the payment and invoice so competing payment allocations
+    cannot independently reserve the same outstanding AP balance.
+    """
+
+    require_accounting_role(
+        organization_id=organization_id,
+        actor=actor,
+        allowed_roles=DRAFT_EDIT_ROLES,
+    )
+
+    allocation_amount = _normalize_positive_allocation_amount(amount)
+
+    # 1. Lock the payment.
+    payment = (
+        VendorPayment.objects
+        .select_for_update(of=("self",))
+        .filter(
+            pk=payment_id,
+            organization_id=organization_id,
+        )
+        .first()
+    )
+
+    if payment is None:
+        raise VendorPayment.DoesNotExist
+
+    if payment.status != VendorPayment.Status.DRAFT:
+        raise AccountingStateError(
+            "Allocations can only be changed while the payment is in Draft."
+        )
+
+    if not payment.journal_entry_id:
+        raise AccountingStateError(
+            "The draft payment must have an accounting journal."
+        )
+
+    payment_journal = get_locked_journal(
+        organization_id=organization_id,
+        journal_entry_id=payment.journal_entry_id,
+    )
+
+    if payment_journal.status != JournalEntry.Status.DRAFT:
+        raise AccountingStateError(
+            "The payment journal must remain in Draft."
+        )
+
+    # 2. Lock the invoice.
+    invoice = (
+        Invoice.objects
+        .select_for_update(of=("self",))
+        .filter(
+            pk=invoice_id,
+            organization_id=organization_id,
+        )
+        .first()
+    )
+
+    if invoice is None:
+        raise Invoice.DoesNotExist
+
+    if invoice.vendor_id is None or invoice.vendor_id != payment.vendor_id:
+        raise AccountingStateError(
+            "The invoice and payment must belong to the same vendor."
+        )
+
+    if invoice.status != Invoice.Status.APPROVED:
+        raise AccountingStateError(
+            "Only approved invoices can receive payment allocations."
+        )
+
+    # 3. Lock and validate the invoice journal.
+    invoice_journal = (
+        JournalEntry.objects
+        .select_for_update(of=("self",))
+        .filter(
+            organization_id=organization_id,
+            source_invoice=invoice,
+        )
+        .first()
+    )
+
+    if (
+        invoice_journal is None
+        or invoice_journal.status != JournalEntry.Status.POSTED
+    ):
+        raise AccountingStateError(
+            "The invoice must have a posted accounting journal."
+        )
+
+    if invoice_journal.currency != payment.currency:
+        raise AccountingStateError(
+            "The payment and invoice journal currencies must match."
+        )
+
+    ap_obligation = _get_posted_invoice_ap_obligation(
+        invoice=invoice,
+        journal=invoice_journal,
+    )
+
+    # 4. Lock the existing allocation, if this is an update.
+    existing = (
+        PaymentAllocation.objects
+        .select_for_update(of=("self",))
+        .filter(
+            payment=payment,
+            invoice=invoice,
+        )
+        .first()
+    )
+
+    if existing is not None and existing.amount == allocation_amount:
+        return existing
+
+    # 5. Enforce the payment's total allocation limit.
+    payment_allocations = list(
+        PaymentAllocation.objects
+        .select_for_update(of=("self",))
+        .filter(payment=payment)
+        .exclude(pk=existing.pk if existing else None)
+        .order_by("pk")
+    )
+
+    other_payment_allocations = sum(
+        (item.amount for item in payment_allocations),
+        Decimal("0.00"),
+    )
+
+    if other_payment_allocations + allocation_amount > payment.amount:
+        raise AccountingStateError(
+            "The payment's total allocations cannot exceed its amount."
+        )
+
+    # 6. Enforce the invoice's reserved AP balance.
+    #
+    # This includes active Draft and Posted payments.
+    # The current allocation is excluded during an update.
+    invoice_allocations = list(
+        _get_active_invoice_allocations(
+            invoice=invoice,
+            exclude_id=existing.pk if existing else None,
+        )
+    )
+
+    other_invoice_allocations = sum(
+        (item.amount for item in invoice_allocations),
+        Decimal("0.00"),
+    )
+
+    if other_invoice_allocations + allocation_amount > ap_obligation:
+        raise AccountingStateError(
+            "The allocation exceeds the invoice's remaining "
+            "accounts payable balance."
+        )
+
+    # 7. Create or update the allocation.
+    previous_amount = (
+        existing.amount if existing is not None else None
+    )
+
+    if existing is None:
+        allocation = PaymentAllocation(
+            payment=payment,
+            invoice=invoice,
+            amount=allocation_amount,
+        )
+        operation = "vendor_payment_allocation_created"
+
+    else:
+        allocation = existing
+        allocation.amount = allocation_amount
+        operation = "vendor_payment_allocation_updated"
+
+    allocation.full_clean()
+
+    if existing is None:
+        allocation.save(force_insert=True)
+    else:
+        allocation.save(
+            update_fields=["amount", "updated_at"]
+        )
+
+    # 8. Audit the allocation change.
+    record_journal_audit(
+        entry=payment_journal,
+        actor=actor,
+        operation=operation,
+        changes={
+            "allocation_amount": {
+                "before": (
+                    str(previous_amount)
+                    if previous_amount is not None
+                    else None
+                ),
+                "after": str(allocation_amount),
+            }
+        },
+        metadata={
+            "vendor_payment_id": str(payment.pk),
+            "payment_allocation_id": str(allocation.pk),
+            "invoice_id": str(invoice.pk),
+            "invoice_number": invoice.invoice_number,
+            "invoice_due_date": (
+                invoice.due_date.isoformat()
+                if invoice.due_date
+                else None
+            ),
+            "amount": str(allocation_amount),
+            "currency": payment.currency,
+        },
+    )
+
+    return allocation
+
+
+@transaction.atomic
+def remove_vendor_payment_allocation(
+    *,
+    organization_id,
+    payment_id,
+    invoice_id,
+    actor,
+):
+    """
+    Remove an allocation from a draft payment.
+
+    Removing a draft allocation releases its reserved invoice balance.
+    """
+
+    require_accounting_role(
+        organization_id=organization_id,
+        actor=actor,
+        allowed_roles=DRAFT_EDIT_ROLES,
+    )
+
+    # 1. Lock the payment.
+    payment = (
+        VendorPayment.objects
+        .select_for_update(of=("self",))
+        .filter(
+            pk=payment_id,
+            organization_id=organization_id,
+        )
+        .first()
+    )
+
+    if payment is None:
+        raise VendorPayment.DoesNotExist
+
+    if payment.status != VendorPayment.Status.DRAFT:
+        raise AccountingStateError(
+            "Only draft payment allocations can be removed."
+        )
+
+    if not payment.journal_entry_id:
+        raise AccountingStateError(
+            "The draft payment must have an accounting journal."
+        )
+
+    payment_journal = get_locked_journal(
+        organization_id=organization_id,
+        journal_entry_id=payment.journal_entry_id,
+    )
+
+    if payment_journal.status != JournalEntry.Status.DRAFT:
+        raise AccountingStateError(
+            "The payment journal must remain in Draft."
+        )
+
+    # 2. Lock the invoice to serialize allocation changes.
+    invoice = (
+        Invoice.objects
+        .select_for_update(of=("self",))
+        .filter(
+            pk=invoice_id,
+            organization_id=organization_id,
+        )
+        .first()
+    )
+
+    if invoice is None:
+        raise Invoice.DoesNotExist
+
+    # 3. Lock and retrieve the allocation.
+    allocation = (
+        PaymentAllocation.objects
+        .select_for_update(of=("self",))
+        .filter(
+            payment=payment,
+            invoice=invoice,
+        )
+        .first()
+    )
+
+    if allocation is None:
+        raise PaymentAllocation.DoesNotExist
+
+    previous_amount = allocation.amount
+    allocation_id = allocation.pk
+
+    allocation.delete()
+
+    # 4. Audit the removal.
+    record_journal_audit(
+        entry=payment_journal,
+        actor=actor,
+        operation="vendor_payment_allocation_removed",
+        changes={
+            "allocation_amount": {
+                "before": str(previous_amount),
+                "after": None,
+            }
+        },
+        metadata={
+            "vendor_payment_id": str(payment.pk),
+            "payment_allocation_id": str(allocation_id),
+            "invoice_id": str(invoice.pk),
+            "invoice_number": invoice.invoice_number,
+            "amount": str(previous_amount),
+            "currency": payment.currency,
+        },
+    )
