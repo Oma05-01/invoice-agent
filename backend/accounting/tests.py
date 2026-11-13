@@ -3887,6 +3887,25 @@ class APAgeingReportTests(TestCase):
             default_currency="NGN",
         )
 
+        self.viewer = User.objects.create_user(
+            username="ap_ageing_viewer",
+            password="test-password-123",
+        )
+
+        self.outsider = User.objects.create_user(
+            username="ap_ageing_outsider",
+            password="test-password-123",
+        )
+
+        OrganizationMembership.objects.create(
+            organization=self.organization,
+            user=self.viewer,
+            role=OrganizationMembership.Role.READ_ONLY,
+        )
+
+        self.client = APIClient()
+        self.client.force_authenticate(user=self.viewer)
+
         OrganizationMembership.objects.create(
             organization=self.organization,
             user=self.operator,
@@ -4266,3 +4285,134 @@ class APAgeingReportTests(TestCase):
             current_report["total_outstanding"],
             "1000.00",
         )
+
+    def test_read_only_member_can_view_ap_ageing_report(self):
+        self.create_posted_invoice(
+            invoice_number="AGE-API-001",
+            amount="1500.00",
+            due_date=self.today - timedelta(days=10),
+        )
+
+        url = reverse(
+            "accounting-ap-ageing",
+            kwargs={
+                "organization_id": self.organization.pk,
+            },
+        )
+
+        response = self.client.get(url)
+
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual(
+            response.data["organization_id"],
+            str(self.organization.pk),
+        )
+        self.assertEqual(
+            response.data["currencies"][0]["total_outstanding"],
+            "1500.00",
+        )
+
+
+    def test_ap_ageing_api_accepts_date_and_currency_filters(self):
+        self.create_posted_invoice(
+            invoice_number="AGE-API-FILTER-001",
+            amount="2500.00",
+            due_date=self.today - timedelta(days=20),
+        )
+
+        url = reverse(
+            "accounting-ap-ageing",
+            kwargs={
+                "organization_id": self.organization.pk,
+            },
+        )
+
+        response = self.client.get(
+            url,
+            {
+                "as_of_date": self.today.isoformat(),
+                "currency": "ngn",
+            },
+        )
+
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual(
+            response.data["as_of_date"],
+            self.today.isoformat(),
+        )
+        self.assertEqual(
+            response.data["currency_filter"],
+            "NGN",
+        )
+        self.assertEqual(
+            response.data["currencies"][0]["currency"],
+            "NGN",
+        )
+
+
+    def test_ap_ageing_api_rejects_invalid_currency(self):
+        url = reverse(
+            "accounting-ap-ageing",
+            kwargs={
+                "organization_id": self.organization.pk,
+            },
+        )
+
+        response = self.client.get(
+            url,
+            {"currency": "N1N"},
+        )
+
+        self.assertEqual(response.status_code, 400)
+
+
+    def test_ap_ageing_api_rejects_invalid_as_of_date(self):
+        url = reverse(
+            "accounting-ap-ageing",
+            kwargs={
+                "organization_id": self.organization.pk,
+            },
+        )
+
+        response = self.client.get(
+            url,
+            {"as_of_date": "not-a-date"},
+        )
+
+        self.assertEqual(response.status_code, 400)
+
+
+    def test_non_member_cannot_view_ap_ageing_report(self):
+        url = reverse(
+            "accounting-ap-ageing",
+            kwargs={
+                "organization_id": self.organization.pk,
+            },
+        )
+
+        self.client.force_authenticate(user=self.outsider)
+
+        response = self.client.get(url)
+
+        self.assertEqual(response.status_code, 404)
+
+
+    def test_user_cannot_access_another_organizations_ap_ageing_report(
+        self,
+    ):
+        another_organization = Organization.objects.create(
+            name="Another AP Ageing Company",
+            slug="another-ap-ageing-company",
+            default_currency="NGN",
+        )
+
+        url = reverse(
+            "accounting-ap-ageing",
+            kwargs={
+                "organization_id": another_organization.pk,
+            },
+        )
+
+        response = self.client.get(url)
+
+        self.assertEqual(response.status_code, 404)

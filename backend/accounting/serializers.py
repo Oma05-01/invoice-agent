@@ -251,6 +251,26 @@ class BalanceSheetQuerySerializer(serializers.Serializer):
 
         return value
 
+
+class APAgeingQuerySerializer(serializers.Serializer):
+    as_of_date = serializers.DateField(required=False)
+
+    currency = serializers.CharField(
+        required=False,
+        max_length=3,
+    )
+
+    def validate_currency(self, value):
+        value = value.strip().upper()
+
+        if len(value) != 3 or not value.isalpha():
+            raise serializers.ValidationError(
+                "Currency must be a three-letter code, such as NGN or USD."
+            )
+
+        return value
+    
+
 class JournalAdjustmentLineInputSerializer(serializers.Serializer):
     account_id = serializers.UUIDField()
 

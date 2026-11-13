@@ -14,6 +14,7 @@ from accounting.views import (
     BalanceSheetAPIView,
     JournalAdjustmentCreateAPIView,
     JournalEntryDateUpdateAPIView,
+    APAgeingReportAPIView,
 )
 
 
@@ -82,6 +83,11 @@ urlpatterns = [
         "organizations/<uuid:organization_id>/accounting/journals/<uuid:journal_entry_id>/adjustments/",
         JournalAdjustmentCreateAPIView.as_view(),
         name="accounting-journal-adjustment-create",
+    ),
+        path(
+        "organizations/<uuid:organization_id>/accounting/reports/ap-ageing/",
+        APAgeingReportAPIView.as_view(),
+        name="accounting-ap-ageing",
     ),
 
 ]

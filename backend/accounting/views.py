@@ -21,7 +21,8 @@ from accounting.serializers import (
     IncomeStatementQuerySerializer,
     BalanceSheetQuerySerializer,
     JournalAdjustmentCreateSerializer,
-    JournalEntryDateUpdateSerializer
+    JournalEntryDateUpdateSerializer,
+    APAgeingQuerySerializer,
 )
 from accounting.services import (
     AccountingConfigurationError,
@@ -41,6 +42,7 @@ from accounting.reporting import (
     build_trial_balance,
     build_income_statement,
     build_balance_sheet,
+    build_ap_ageing_report
 )
 
 from django.utils import timezone
@@ -613,6 +615,38 @@ class BalanceSheetAPIView(OrganizationAccountingAPIView):
         )
 
         return Response(report)
+
+
+class APAgeingReportAPIView(OrganizationAccountingAPIView):
+    """
+    Return outstanding accounts payable grouped by ageing bucket
+    and vendor, with each currency reported separately.
+    """
+
+    def get(self, request, organization_id):
+        membership = self.get_membership(
+            request,
+            organization_id,
+        )
+
+        serializer = APAgeingQuerySerializer(
+            data=request.query_params,
+        )
+        serializer.is_valid(raise_exception=True)
+
+        filters = serializer.validated_data
+
+        report = build_ap_ageing_report(
+            organization=membership.organization,
+            as_of_date=(
+                filters.get("as_of_date")
+                or timezone.localdate()
+            ),
+            currency=filters.get("currency"),
+        )
+
+        return Response(report)
+    
 
 class JournalEntryDateUpdateAPIView(
     OrganizationAccountingAPIView
