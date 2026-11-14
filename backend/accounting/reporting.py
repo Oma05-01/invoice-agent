@@ -956,10 +956,41 @@ def build_ap_ageing_report(
             "vendors": vendors,
         })
 
+    # List currencies with reportable AP activity, even if
+    # their outstanding AP balance is currently zero.
+    currency_values = (
+        JournalLine.objects
+        .filter(
+            entry__organization=organization,
+            entry__status__in=REPORTABLE_STATUSES,
+            entry__entry_date__lte=as_of_date,
+            entry__posted_at__isnull=False,
+            entry__posted_at__date__lte=as_of_date,
+            account__organization=organization,
+            account__code="2000",
+            account__account_type=Account.AccountType.LIABILITY,
+            account__is_control_account=True,
+        )
+        .values_list("entry__currency", flat=True)
+        .distinct()
+    )
+
+    available_currencies = {
+        code for code in currency_values if code
+    }
+
+    if organization.default_currency:
+        available_currencies.add(
+            organization.default_currency
+        )
+
+    available_currencies = sorted(available_currencies)
+
     return {
         "organization_id": str(organization.id),
         "as_of_date": as_of_date.isoformat(),
         "currency_filter": currency,
         "bucket_labels": AP_AGEING_BUCKET_LABELS,
         "currencies": serialized_currencies,
+        "available_currencies": available_currencies,
     }

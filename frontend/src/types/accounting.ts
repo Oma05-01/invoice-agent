@@ -297,5 +297,6 @@ export interface APAgeingReportResponse {
   currency_filter: string | null;
   bucket_labels: Record<APAgeingBucket, string>;
   currencies: APAgeingCurrencyReport[];
+  available_currencies: string[];
 }
 

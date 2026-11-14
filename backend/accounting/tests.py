@@ -69,7 +69,7 @@ class AccountingServiceTests(TestCase):
             organization=self.organization,
             invoice_number="ACC-001",
             invoice_date=date(2026, 11, 6),
-            currency="NGN",
+            currency=currency,
             subtotal=Decimal("300000.00"),
             tax_amount=Decimal("22500.00"),
             total_amount=Decimal("322500.00"),
@@ -3938,6 +3938,7 @@ class APAgeingReportTests(TestCase):
         due_date,
         unassigned_vendor=False,
         invoice_date=None,
+        currency="NGN",
     ):
         amount = Decimal(str(amount))
         invoice_date = (
@@ -3963,7 +3964,7 @@ class APAgeingReportTests(TestCase):
             organization=self.organization,
             source_invoice=invoice,
             entry_date=invoice_date,
-            currency="NGN",
+            currency=currency,
             reference=f"AGE-{invoice_number}",
             description="AP ageing test invoice.",
             status=JournalEntry.Status.DRAFT,
@@ -4416,3 +4417,39 @@ class APAgeingReportTests(TestCase):
         response = self.client.get(url)
 
         self.assertEqual(response.status_code, 404)
+
+    def test_available_currencies_include_reversed_ap_activity(self):
+        invoice, journal = self.create_posted_invoice(
+            invoice_number="AGE-USD-REVERSED-001",
+            amount="500.00",
+            currency="USD",
+            due_date=self.today - timedelta(days=10),
+        )
+
+        reverse_journal_entry(
+            organization_id=self.organization.pk,
+            journal_entry_id=journal.pk,
+            actor=self.admin,
+            reversal_reason="Testing available currencies with zero AP.",
+        )
+
+        report = self.get_report()
+
+        self.assertIn("NGN", report["available_currencies"])
+        self.assertIn("USD", report["available_currencies"])
+
+        usd_report = build_ap_ageing_report(
+            organization=self.organization,
+            as_of_date=self.today,
+            currency="USD",
+        )
+
+        self.assertEqual(
+            usd_report["currencies"][0]["total_outstanding"],
+            "0.00",
+        )
+
+        self.assertEqual(
+            usd_report["available_currencies"],
+            report["available_currencies"],
+        )

@@ -1318,11 +1318,7 @@ function APAgeingReport({
       setReport(result);
 
       // Populate currency choices from the unfiltered report.
-      setAvailableCurrencies((current) =>
-        current.length > 0
-          ? current
-          : result.currencies.map((item) => item.currency),
-      );
+      setAvailableCurrencies(result.available_currencies);
     } catch (err) {
       setError(
         err instanceof Error
