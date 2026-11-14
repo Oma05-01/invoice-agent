@@ -14,6 +14,7 @@ import type {
   JournalAdjustmentRequest,
   JournalAdjustmentResponse,
   JournalEntryDateUpdateRequest,
+  APAgeingReportResponse,
 } from "@/types/accounting";
 
 async function getErrorMessage(
@@ -345,5 +346,46 @@ export async function fetchBalanceSheet(
   }
 
   return response.json() as Promise<BalanceSheetResponse>;
+}
+
+
+export interface APAgeingReportFilters {
+  asOfDate?: string;
+  currency?: string;
+}
+
+export async function fetchAPAgeingReport(
+  organizationId: string,
+  filters: APAgeingReportFilters = {},
+): Promise<APAgeingReportResponse> {
+  const params = new URLSearchParams();
+
+  if (filters.asOfDate) {
+    params.set("as_of_date", filters.asOfDate);
+  }
+
+  if (filters.currency) {
+    params.set("currency", filters.currency);
+  }
+
+  const query = params.toString();
+
+  const response = await fetch(
+    `/api/organizations/${encodeURIComponent(organizationId)}/accounting/reports/ap-ageing/${query ? `?${query}` : ""}`,
+    {
+      method: "GET",
+      credentials: "same-origin",
+      headers: {
+        Accept: "application/json",
+      },
+      cache: "no-store",
+    },
+  );
+
+  if (!response.ok) {
+    throw new Error(await getErrorMessage(response));
+  }
+
+  return response.json() as Promise<APAgeingReportResponse>;
 }
 

@@ -248,3 +248,54 @@ export interface JournalEntryDateUpdateRequest {
   correction_reason: string;
 }
 
+
+export type APAgeingBucket =
+  | "current"
+  | "1_30_days"
+  | "31_60_days"
+  | "61_90_days"
+  | "over_90_days"
+  | "missing_due_date";
+
+export type APAgeingBucketTotals = Record<
+  APAgeingBucket,
+  string
+>;
+
+export interface APAgeingInvoice {
+  invoice_id: string;
+  invoice_number: string;
+  invoice_date: string | null;
+  due_date: string | null;
+  ageing_bucket: APAgeingBucket;
+  days_overdue: number | null;
+  ap_obligation: string;
+  posted_payments: string;
+  outstanding_amount: string;
+}
+
+export interface APAgeingVendor {
+  vendor_id: string | null;
+  vendor_name: string;
+  bucket_totals: APAgeingBucketTotals;
+  total_outstanding: string;
+  invoice_count: number;
+  invoices: APAgeingInvoice[];
+}
+
+export interface APAgeingCurrencyReport {
+  currency: string;
+  bucket_totals: APAgeingBucketTotals;
+  total_outstanding: string;
+  invoice_count: number;
+  vendors: APAgeingVendor[];
+}
+
+export interface APAgeingReportResponse {
+  organization_id: string;
+  as_of_date: string;
+  currency_filter: string | null;
+  bucket_labels: Record<APAgeingBucket, string>;
+  currencies: APAgeingCurrencyReport[];
+}
+
