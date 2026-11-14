@@ -20,6 +20,7 @@ import {
   fetchTrialBalance,
   fetchIncomeStatement,
   fetchBalanceSheet,
+  fetchAPAgeingReport,
 } from "@/lib/accounting";
 
 import type {
@@ -30,6 +31,8 @@ import type {
   TrialBalanceResponse,
   IncomeStatementResponse,
   BalanceSheetResponse,
+  APAgeingReportResponse,
+  APAgeingBucket,
 } from "@/types/accounting";
 
 
@@ -38,8 +41,21 @@ type Props = {
   accounts: AccountingAccount[];
 };
 
-type ReportTab = "ledger" | "trial-balance" | "income-statement" | "balance-sheet";
+type ReportTab =
+  | "ledger"
+  | "trial-balance"
+  | "income-statement"
+  | "balance-sheet"
+  | "ap-ageing";
 
+const apAgeingBucketOrder: APAgeingBucket[] = [
+  "current",
+  "1_30_days",
+  "31_60_days",
+  "61_90_days",
+  "over_90_days",
+  "missing_due_date",
+];
 
 const journalStatusStyles: Record<JournalStatus, string> = {
   draft: "bg-amber-50 text-amber-700",
@@ -1267,6 +1283,363 @@ function BalanceSheetReport({
 }
 
 
+function APAgeingReport({
+  organizationId,
+}: {
+  organizationId: string;
+}) {
+  const [asOfDate, setAsOfDate] = useState(getLocalDateValue);
+  const [currency, setCurrency] = useState("");
+  const [availableCurrencies, setAvailableCurrencies] = useState<string[]>([]);
+  const [report, setReport] = useState<APAgeingReportResponse | null>(null);
+  const [loading, setLoading] = useState(false);
+  const [error, setError] = useState("");
+
+  async function handleGenerateReport(
+    event: FormEvent<HTMLFormElement>,
+  ) {
+    event.preventDefault();
+
+    if (!asOfDate) {
+      setError("Select an as-of date.");
+      return;
+    }
+
+    setLoading(true);
+    setError("");
+    setReport(null);
+
+    try {
+      const result = await fetchAPAgeingReport(organizationId, {
+        asOfDate,
+        currency: currency || undefined,
+      });
+
+      setReport(result);
+
+      // Populate currency choices from the unfiltered report.
+      setAvailableCurrencies((current) =>
+        current.length > 0
+          ? current
+          : result.currencies.map((item) => item.currency),
+      );
+    } catch (err) {
+      setError(
+        err instanceof Error
+          ? err.message
+          : "Unable to generate the AP ageing report.",
+      );
+    } finally {
+      setLoading(false);
+    }
+  }
+
+  return (
+    <div className="w-full min-w-0">
+      <div className="border-b border-slate-100 p-5">
+        <h2 className="text-sm font-bold text-slate-900">
+          Accounts Payable Ageing
+        </h2>
+        <p className="mt-1 text-xs text-slate-400">
+          Review outstanding supplier balances by how long they have been
+          due.
+        </p>
+      </div>
+
+      <form
+        onSubmit={handleGenerateReport}
+        className="flex flex-col gap-4 border-b border-slate-100 bg-slate-50/60 p-5 sm:flex-row sm:items-end"
+      >
+        <div className="w-full min-w-0 sm:max-w-xs">
+          <label
+            htmlFor="ap-ageing-date"
+            className="mb-1.5 block text-xs font-semibold text-slate-600"
+          >
+            Report as of
+          </label>
+          <input
+            id="ap-ageing-date"
+            type="date"
+            value={asOfDate}
+            onChange={(event) => setAsOfDate(event.target.value)}
+            required
+            className="h-10 w-full rounded-lg border border-slate-200 bg-white px-3 text-sm outline-none focus:border-blue-500"
+          />
+        </div>
+
+        <div className="w-full min-w-0 sm:max-w-xs">
+          <label
+            htmlFor="ap-ageing-currency"
+            className="mb-1.5 block text-xs font-semibold text-slate-600"
+          >
+            Currency
+          </label>
+          <select
+            id="ap-ageing-currency"
+            value={currency}
+            onChange={(event) => setCurrency(event.target.value)}
+            className="h-10 w-full rounded-lg border border-slate-200 bg-white px-3 text-sm outline-none focus:border-blue-500"
+          >
+            <option value="">All currencies</option>
+            {availableCurrencies.map((code) => (
+              <option key={code} value={code}>
+                {code}
+              </option>
+            ))}
+          </select>
+        </div>
+
+        <button
+          type="submit"
+          disabled={loading}
+          className="inline-flex h-10 w-full items-center justify-center gap-2 whitespace-nowrap rounded-lg bg-blue-700 px-5 text-sm font-semibold text-white transition hover:bg-blue-800 disabled:cursor-not-allowed disabled:opacity-50 sm:w-auto sm:min-w-[190px]"
+        >
+          {loading ? (
+            <LoaderCircle size={16} className="animate-spin" />
+          ) : (
+            <Search size={16} />
+          )}
+          {loading ? "Generating report..." : "Generate AP ageing"}
+        </button>
+      </form>
+
+      {error && (
+        <div
+          role="alert"
+          className="m-5 rounded-lg border border-rose-200 bg-rose-50 p-4 text-sm text-rose-700"
+        >
+          {error}
+        </div>
+      )}
+
+      {!report && !loading && !error && (
+        <ReportEmptyState
+          title="No AP ageing report generated"
+          description="Choose a reporting date and optionally a currency to review outstanding supplier balances."
+        />
+      )}
+
+      {report && (
+        <div className="w-full min-w-0 space-y-6 p-4 sm:p-5">
+          <div>
+            <h3 className="text-lg font-bold text-slate-900">
+              Accounts Payable Ageing
+            </h3>
+            <p className="mt-1 text-xs text-slate-500">
+              Outstanding balances as of {formatReportDate(report.as_of_date)}
+            </p>
+          </div>
+
+          {report.currencies.map((item) => (
+            <section
+              key={item.currency}
+              className="space-y-5 rounded-xl border border-slate-200 bg-slate-50/40 p-3 sm:p-4"
+            >
+              <div className="flex flex-wrap items-center justify-between gap-2">
+                <div>
+                  <h4 className="text-sm font-bold text-slate-900">
+                    {item.currency} ageing summary
+                  </h4>
+                  <p className="mt-1 text-xs text-slate-500">
+                    {item.invoice_count} outstanding invoice(s)
+                  </p>
+                </div>
+
+                <div className="text-right">
+                  <p className="text-xs text-slate-500">
+                    Total outstanding
+                  </p>
+                  <p className="mt-1 text-lg font-bold text-slate-900">
+                    {formatReportAmount(
+                      item.total_outstanding,
+                      item.currency,
+                    )}
+                  </p>
+                </div>
+              </div>
+
+              <div className="grid grid-cols-1 gap-3 sm:grid-cols-2 lg:grid-cols-3 xl:grid-cols-6">
+                {apAgeingBucketOrder.map((bucket) => (
+                  <div
+                    key={bucket}
+                    className="min-w-0 rounded-lg border border-slate-200 bg-white p-3"
+                  >
+                    <p className="text-xs font-medium leading-5 text-slate-500">
+                      {report.bucket_labels[bucket]}
+                    </p>
+                    <p className="mt-2 break-words text-sm font-bold text-slate-900">
+                      {formatReportAmount(
+                        item.bucket_totals[bucket],
+                        item.currency,
+                      )}
+                    </p>
+                  </div>
+                ))}
+              </div>
+
+              <div className="space-y-3">
+                <div className="flex flex-wrap items-center justify-between gap-2">
+                  <h5 className="text-sm font-bold text-slate-800">
+                    Vendor breakdown
+                  </h5>
+                  <span className="text-xs text-slate-500">
+                    {item.vendors.length} vendor group(s)
+                  </span>
+                </div>
+
+                {item.vendors.length === 0 ? (
+                  <div className="rounded-lg border border-dashed border-slate-200 bg-white p-8 text-center">
+                    <p className="text-sm font-medium text-slate-700">
+                      No outstanding supplier balances
+                    </p>
+                    <p className="mt-1 text-xs text-slate-400">
+                      There are no outstanding invoices for this currency
+                      and reporting date.
+                    </p>
+                  </div>
+                ) : (
+                  <div className="space-y-2">
+                    {item.vendors.map((vendor) => (
+                      <details
+                        key={vendor.vendor_id ?? "unassigned"}
+                        className="group overflow-hidden rounded-lg border border-slate-200 bg-white"
+                      >
+                        <summary className="flex cursor-pointer list-none flex-wrap items-center justify-between gap-3 p-4 hover:bg-slate-50 [&::-webkit-details-marker]:hidden">
+                          <div className="min-w-0">
+                            <p className="truncate text-sm font-semibold text-slate-800">
+                              {vendor.vendor_name}
+                            </p>
+                            <p className="mt-1 text-xs text-slate-400">
+                              {vendor.invoice_count} outstanding invoice(s)
+                            </p>
+                          </div>
+
+                          <div className="ml-auto flex items-center gap-3">
+                            <span className="text-sm font-bold text-slate-900">
+                              {formatReportAmount(
+                                vendor.total_outstanding,
+                                item.currency,
+                              )}
+                            </span>
+                            <span
+                              aria-hidden="true"
+                              className="text-slate-400 transition-transform group-open:rotate-180"
+                            >
+                              ▼
+                            </span>
+                          </div>
+                        </summary>
+
+                        <div className="border-t border-slate-100">
+                          <div className="grid grid-cols-2 gap-2 border-b border-slate-100 bg-slate-50/70 p-3 sm:grid-cols-3 lg:grid-cols-6">
+                            {apAgeingBucketOrder.map((bucket) => (
+                              <div key={bucket}>
+                                <p className="text-[10px] leading-4 text-slate-500">
+                                  {report.bucket_labels[bucket]}
+                                </p>
+                                <p className="mt-1 text-xs font-semibold text-slate-800">
+                                  {formatReportAmount(
+                                    vendor.bucket_totals[bucket],
+                                    item.currency,
+                                  )}
+                                </p>
+                              </div>
+                            ))}
+                          </div>
+
+                          <div className="overflow-x-auto">
+                            <table className="w-full min-w-[950px] text-left text-xs">
+                              <thead className="bg-white text-slate-500">
+                                <tr>
+                                  <th className="px-4 py-3 font-semibold">
+                                    Invoice
+                                  </th>
+                                  <th className="px-4 py-3 font-semibold">
+                                    Invoice date
+                                  </th>
+                                  <th className="px-4 py-3 font-semibold">
+                                    Due date
+                                  </th>
+                                  <th className="px-4 py-3 font-semibold">
+                                    Ageing category
+                                  </th>
+                                  <th className="px-4 py-3 text-right font-semibold">
+                                    AP obligation
+                                  </th>
+                                  <th className="px-4 py-3 text-right font-semibold">
+                                    Posted payments
+                                  </th>
+                                  <th className="px-4 py-3 text-right font-semibold">
+                                    Outstanding
+                                  </th>
+                                </tr>
+                              </thead>
+
+                              <tbody className="divide-y divide-slate-100">
+                                {vendor.invoices.map((invoice) => (
+                                  <tr
+                                    key={invoice.invoice_id}
+                                    className="hover:bg-slate-50/70"
+                                  >
+                                    <td className="px-4 py-3 font-semibold text-slate-800">
+                                      {invoice.invoice_number || "Unnamed invoice"}
+                                    </td>
+                                    <td className="px-4 py-3 text-slate-600">
+                                      {formatReportDate(invoice.invoice_date)}
+                                    </td>
+                                    <td className="px-4 py-3 text-slate-600">
+                                      {formatReportDate(invoice.due_date)}
+                                    </td>
+                                    <td className="px-4 py-3 text-slate-600">
+                                      <span className="whitespace-nowrap rounded-full bg-slate-100 px-2.5 py-1 text-[11px] font-medium text-slate-700">
+                                        {report.bucket_labels[invoice.ageing_bucket]}
+                                      </span>
+                                      {invoice.days_overdue !== null &&
+                                        invoice.days_overdue > 0 && (
+                                          <p className="mt-1 text-[10px] text-slate-400">
+                                            {invoice.days_overdue} day(s) overdue
+                                          </p>
+                                        )}
+                                    </td>
+                                    <td className="px-4 py-3 text-right text-slate-600">
+                                      {formatReportAmount(
+                                        invoice.ap_obligation,
+                                        item.currency,
+                                      )}
+                                    </td>
+                                    <td className="px-4 py-3 text-right text-slate-600">
+                                      {formatReportAmount(
+                                        invoice.posted_payments,
+                                        item.currency,
+                                      )}
+                                    </td>
+                                    <td className="px-4 py-3 text-right font-bold text-slate-900">
+                                      {formatReportAmount(
+                                        invoice.outstanding_amount,
+                                        item.currency,
+                                      )}
+                                    </td>
+                                  </tr>
+                                ))}
+                              </tbody>
+                            </table>
+                          </div>
+                        </div>
+                      </details>
+                    ))}
+                  </div>
+                )}
+              </div>
+            </section>
+          ))}
+        </div>
+      )}
+    </div>
+  );
+}
+
+
+
 export function AccountingReports({
   organizationId,
   accounts,
@@ -1327,6 +1700,19 @@ export function AccountingReports({
           <Landmark size={15} />
           Balance Sheet
         </button>
+
+        <button
+          type="button"
+          onClick={() => setActiveReport("ap-ageing")}
+          className={`inline-flex items-center gap-2 border-b-2 py-4 text-xs font-semibold transition ${
+            activeReport === "ap-ageing"
+              ? "border-blue-700 text-blue-700"
+              : "border-transparent text-slate-400 hover:text-slate-700"
+          }`}
+        >
+          <FileBarChart size={15} />
+          AP Ageing
+        </button>
       </div>
 
       {activeReport === "ledger" && (
@@ -1340,6 +1726,9 @@ export function AccountingReports({
       )}
       {activeReport === "balance-sheet" && (
         <BalanceSheetReport organizationId={organizationId} />
+      )}
+      {activeReport === "ap-ageing" && (
+        <APAgeingReport organizationId={organizationId} />
       )}
     </div>
   );
