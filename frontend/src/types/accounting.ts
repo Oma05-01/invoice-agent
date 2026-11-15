@@ -300,3 +300,84 @@ export interface APAgeingReportResponse {
   available_currencies: string[];
 }
 
+export type VendorPaymentStatus =
+  | "draft"
+  | "posted"
+  | "reversed";
+
+export interface VendorPaymentVendor {
+  id: string;
+  vendor_code: string | null;
+  legal_name: string;
+  display_name: string | null;
+}
+
+export interface VendorPaymentAllocation {
+  id: string;
+  invoice_id: string;
+  invoice_number: string;
+  amount: string;
+  created_at: string;
+}
+
+export interface VendorPayment {
+  id: string;
+  organization_id: string;
+
+  vendor_id: string;
+  vendor: VendorPaymentVendor;
+
+  payment_date: string;
+  reference: string;
+  amount: string;
+  currency: string;
+
+  payment_account_id: string;
+  payment_account: JournalLineAccount;
+
+  journal_entry_id: string;
+  journal_status: JournalStatus | null;
+  journal_reference: string | null;
+
+  status: VendorPaymentStatus;
+
+  created_by_id: string | number | null;
+  posted_by_id: string | number | null;
+  posted_at: string | null;
+
+  reversal_reason: string;
+
+  allocations: VendorPaymentAllocation[];
+
+  created_at: string;
+  updated_at: string;
+}
+
+export interface VendorPaymentListResponse {
+  count: number;
+  payments: VendorPayment[];
+}
+
+export interface VendorPaymentCreateRequest {
+  vendor_id: string;
+  payment_account_id: string;
+  amount: string;
+  currency: string;
+  payment_date?: string;
+  reference?: string;
+  description?: string;
+}
+
+export interface VendorPaymentAllocationRequest {
+  invoice_id: string;
+  amount: string;
+}
+
+export interface VendorPaymentReversalRequest {
+  reversal_reason: string;
+}
+
+export interface VendorPaymentReversalResponse {
+  payment: VendorPayment;
+  reversal_journal: JournalEntry;
+}

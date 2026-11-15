@@ -15,6 +15,13 @@ import type {
   JournalAdjustmentResponse,
   JournalEntryDateUpdateRequest,
   APAgeingReportResponse,
+  VendorPayment,
+  VendorPaymentAllocation,
+  VendorPaymentAllocationRequest,
+  VendorPaymentCreateRequest,
+  VendorPaymentListResponse,
+  VendorPaymentReversalRequest,
+  VendorPaymentReversalResponse,
 } from "@/types/accounting";
 
 async function getErrorMessage(
@@ -70,7 +77,7 @@ async function getCSRFToken(): Promise<string> {
 
 async function accountingMutation<T>(
   url: string,
-  method: "POST" | "PATCH",
+  method: "POST" | "PATCH" | "DELETE",
   payload: object,
 ): Promise<T> {
   const csrfToken = await getCSRFToken();
@@ -86,11 +93,11 @@ async function accountingMutation<T>(
     body: JSON.stringify(payload),
   });
 
-  if (!response.ok) {
-    throw new Error(await getErrorMessage(response));
+  if (response.status === 204) {
+    return undefined as T;
   }
 
-  return response.json() as Promise<T>;
+return response.json() as Promise<T>;
 }
 
 export async function fetchAccountingAccounts(
@@ -389,3 +396,113 @@ export async function fetchAPAgeingReport(
   return response.json() as Promise<APAgeingReportResponse>;
 }
 
+// -----------------------------------------------------------------------------
+// Vendor payments
+// -----------------------------------------------------------------------------
+
+export async function fetchVendorPayments(
+  organizationId: string,
+  signal?: AbortSignal,
+): Promise<VendorPaymentListResponse> {
+  const response = await fetch(
+    `/api/organizations/${encodeURIComponent(organizationId)}/accounting/vendor-payments/`,
+    {
+      method: "GET",
+      credentials: "same-origin",
+      headers: {
+        Accept: "application/json",
+      },
+      cache: "no-store",
+      signal,
+    },
+  );
+
+  if (!response.ok) {
+    throw new Error(await getErrorMessage(response));
+  }
+
+  return response.json() as Promise<VendorPaymentListResponse>;
+}
+
+export async function fetchVendorPayment(
+  organizationId: string,
+  paymentId: string,
+  signal?: AbortSignal,
+): Promise<VendorPayment> {
+  const response = await fetch(
+    `/api/organizations/${encodeURIComponent(organizationId)}/accounting/vendor-payments/${encodeURIComponent(paymentId)}/`,
+    {
+      method: "GET",
+      credentials: "same-origin",
+      headers: {
+        Accept: "application/json",
+      },
+      cache: "no-store",
+      signal,
+    },
+  );
+
+  if (!response.ok) {
+    throw new Error(await getErrorMessage(response));
+  }
+
+  return response.json() as Promise<VendorPayment>;
+}
+
+export async function createVendorPayment(
+  organizationId: string,
+  payload: VendorPaymentCreateRequest,
+): Promise<VendorPayment> {
+  return accountingMutation<VendorPayment>(
+    `/api/organizations/${encodeURIComponent(organizationId)}/accounting/vendor-payments/`,
+    "POST",
+    payload,
+  );
+}
+
+export async function allocateInvoiceToVendorPayment(
+  organizationId: string,
+  paymentId: string,
+  payload: VendorPaymentAllocationRequest,
+): Promise<VendorPaymentAllocation> {
+  return accountingMutation<VendorPaymentAllocation>(
+    `/api/organizations/${encodeURIComponent(organizationId)}/accounting/vendor-payments/${encodeURIComponent(paymentId)}/allocations/`,
+    "POST",
+    payload,
+  );
+}
+
+export async function removeVendorPaymentAllocation(
+  organizationId: string,
+  paymentId: string,
+  invoiceId: string,
+): Promise<void> {
+  return accountingMutation<void>(
+    `/api/organizations/${encodeURIComponent(organizationId)}/accounting/vendor-payments/${encodeURIComponent(paymentId)}/allocations/${encodeURIComponent(invoiceId)}/`,
+    "DELETE",
+    {},
+  );
+}
+
+export async function postVendorPayment(
+  organizationId: string,
+  paymentId: string,
+): Promise<VendorPayment> {
+  return accountingMutation<VendorPayment>(
+    `/api/organizations/${encodeURIComponent(organizationId)}/accounting/vendor-payments/${encodeURIComponent(paymentId)}/post/`,
+    "POST",
+    {},
+  );
+}
+
+export async function reverseVendorPayment(
+  organizationId: string,
+  paymentId: string,
+  payload: VendorPaymentReversalRequest,
+): Promise<VendorPaymentReversalResponse> {
+  return accountingMutation<VendorPaymentReversalResponse>(
+    `/api/organizations/${encodeURIComponent(organizationId)}/accounting/vendor-payments/${encodeURIComponent(paymentId)}/reverse/`,
+    "POST",
+    payload,
+  );
+}
