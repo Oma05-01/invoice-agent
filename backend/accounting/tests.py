@@ -2351,21 +2351,6 @@ class AccountingAPITests(TestCase):
 
         self.assertEqual(PaymentAllocation.objects.count(), 0)
 
-    def test_invoice_without_posted_journal_cannot_be_allocated(self):
-        payment_response = self.create_vendor_payment_via_api()
-
-        response = self.client.post(
-            self.payment_allocation_url(payment_response.data["id"]),
-            {
-                "invoice_id": str(self.invoice.pk),
-                "amount": "100000.00",
-            },
-            format="json",
-        )
-
-        self.assertEqual(response.status_code, 400)
-
-        self.assertEqual(PaymentAllocation.objects.count(), 0)
 
     def test_invoice_without_posted_journal_cannot_be_allocated(self):
         payment_response = self.create_vendor_payment_via_api()
@@ -2383,6 +2368,287 @@ class AccountingAPITests(TestCase):
 
         self.assertEqual(PaymentAllocation.objects.count(), 0)
 
+
+    def test_vendor_payment_list_is_organization_scoped(self):
+        self.authenticate_as(self.operator)
+
+        # 1. Create a payment in the original organization.
+        create_response = self.client.post(
+            self.vendor_payments_url,
+            self.vendor_payment_payload(),
+            format="json",
+        )
+
+        self.assertEqual(create_response.status_code, 201)
+
+        local_payment_id = str(create_response.data["id"])
+
+        # 2. Create another organization.
+        other_organization = Organization.objects.create(
+            name="Foreign Payment Company",
+            slug="foreign-payment-company",
+            default_currency="NGN",
+        )
+
+        OrganizationMembership.objects.create(
+            organization=other_organization,
+            user=self.operator,
+            role=OrganizationMembership.Role.FINANCE_OPERATOR,
+        )
+
+        # 3. Create a vendor and payment in the second organization.
+        foreign_accounts = initialize_chart_of_accounts(
+            organization=other_organization,
+        )
+
+        foreign_vendor = Vendor.objects.create(
+            organization=other_organization,
+            vendor_code="FOREIGN-PAYMENT-001",
+            legal_name="Foreign Payment Vendor",
+        )
+
+        foreign_payment = create_vendor_payment(
+            organization_id=other_organization.pk,
+            vendor_id=foreign_vendor.pk,
+            payment_account_id=foreign_accounts["1000"].pk,
+            amount="5000.00",
+            currency="NGN",
+            actor=self.operator,
+        )
+
+        foreign_payment_id = str(foreign_payment.pk)
+
+        # 4. Retrieve payments from the original organization.
+        local_list_response = self.client.get(
+            self.vendor_payments_url,
+        )
+
+        self.assertEqual(local_list_response.status_code, 200)
+        self.assertEqual(local_list_response.data["count"], 1)
+
+        self.assertEqual(
+            str(local_list_response.data["payments"][0]["id"]),
+            local_payment_id,
+        )
+
+        self.assertEqual(
+            str(local_list_response.data["payments"][0]["organization_id"]),
+            str(self.organization.pk),
+        )
+
+        # 5. Retrieve payments from the second organization.
+        foreign_url = reverse(
+            "accounting-vendor-payment-list",
+            kwargs={
+                "organization_id": other_organization.pk,
+            },
+        )
+
+        foreign_list_response = self.client.get(foreign_url)
+
+        self.assertEqual(foreign_list_response.status_code, 200)
+        self.assertEqual(foreign_list_response.data["count"], 1)
+
+        self.assertEqual(
+            str(foreign_list_response.data["payments"][0]["id"]),
+            foreign_payment_id,
+        )
+
+        # 6. Confirm neither organization's payment appears in the other.
+        self.assertNotEqual(
+            local_payment_id,
+            foreign_payment_id,
+        )
+
+        self.assertNotIn(
+            foreign_payment_id,
+            [
+                str(payment["id"])
+                for payment in local_list_response.data["payments"]
+            ],
+        )
+
+        self.assertNotIn(
+            local_payment_id,
+            [
+                str(payment["id"])
+                for payment in foreign_list_response.data["payments"]
+            ],
+        )
+
+    
+    def test_unauthenticated_user_cannot_list_vendor_payments(self):
+        anonymous_client = APIClient()
+
+        response = anonymous_client.get(self.vendor_payments_url)
+
+        self.assertIn(response.status_code, (401, 403))
+
+
+    def test_missing_vendor_payment_and_allocation_return_404(self):
+        self.authenticate_as(self.operator)
+
+        missing_id = "00000000-0000-0000-0000-000000000001"
+
+        detail_url = reverse(
+            "accounting-vendor-payment-detail",
+            kwargs={
+                "organization_id": self.organization.pk,
+                "payment_id": missing_id,
+            },
+        )
+
+        response = self.client.get(detail_url)
+        self.assertEqual(response.status_code, 404)
+
+        response = self.client.post(
+            self.payment_allocation_url(missing_id),
+            {
+                "invoice_id": str(self.invoice.pk),
+                "amount": "10000.00",
+            },
+            format="json",
+        )
+
+        self.assertEqual(response.status_code, 404)
+
+        payment_response = self.create_vendor_payment_via_api()
+        payment_id = payment_response.data["id"]
+
+        missing_invoice_id = (
+            "00000000-0000-0000-0000-000000000002"
+        )
+
+        response = self.client.post(
+            self.payment_allocation_url(payment_id),
+            {
+                "invoice_id": missing_invoice_id,
+                "amount": "10000.00",
+            },
+            format="json",
+        )
+
+        self.assertEqual(response.status_code, 404)
+
+        remove_url = reverse(
+            "accounting-vendor-payment-allocation-remove",
+            kwargs={
+                "organization_id": self.organization.pk,
+                "payment_id": payment_id,
+                "invoice_id": self.invoice.pk,
+            },
+        )
+
+        response = self.client.delete(remove_url)
+
+        self.assertEqual(response.status_code, 404)
+
+
+    def test_vendor_payment_complete_api_lifecycle(self):
+        as_of_date = timezone.localdate()
+
+        # The helper posts the invoice journal, creates the payment,
+        # and allocates the invoice.
+        payment_response = (
+            self.create_fully_allocated_vendor_payment_via_api()
+        )
+
+        payment_id = payment_response.data["id"]
+
+        # Capture AP after the invoice journal is posted,
+        # but before the vendor payment is posted.
+        before_report = build_ap_ageing_report(
+            organization=self.organization,
+            as_of_date=as_of_date,
+            currency="NGN",
+        )
+
+        before_total = Decimal(
+            before_report["currencies"][0]["total_outstanding"]
+        )
+
+        self.authenticate_as(self.admin)
+
+        # Post the vendor payment.
+        post_response = self.client.post(
+            self.vendor_payment_post_url(payment_id),
+            {},
+            format="json",
+        )
+
+        self.assertEqual(post_response.status_code, 200)
+        self.assertEqual(post_response.data["status"], "posted")
+
+        posted_report = build_ap_ageing_report(
+            organization=self.organization,
+            as_of_date=as_of_date,
+            currency="NGN",
+        )
+
+        posted_total = Decimal(
+            posted_report["currencies"][0]["total_outstanding"]
+        )
+
+        self.assertEqual(
+            before_total - posted_total,
+            Decimal("125000.00"),
+        )
+
+        # Reverse the vendor payment.
+        reversal_response = self.client.post(
+            self.vendor_payment_reverse_url(payment_id),
+            {
+                "reversal_reason": (
+                    "Complete payment lifecycle integration test."
+                ),
+            },
+            format="json",
+        )
+
+        self.assertEqual(reversal_response.status_code, 201)
+        self.assertEqual(
+            reversal_response.data["payment"]["status"],
+            "reversed",
+        )
+        self.assertEqual(
+            reversal_response.data["reversal_journal"]["status"],
+            "posted",
+        )
+
+        payment = VendorPayment.objects.get(pk=payment_id)
+
+        self.assertEqual(payment.allocations.count(), 1)
+
+        # Reversal should restore the original AP balance.
+        restored_report = build_ap_ageing_report(
+            organization=self.organization,
+            as_of_date=as_of_date,
+            currency="NGN",
+        )
+
+        restored_total = Decimal(
+            restored_report["currencies"][0]["total_outstanding"]
+        )
+
+        self.assertEqual(restored_total, before_total)
+
+        # Verify the payment lifecycle audit events.
+        expected_events = (
+            "vendor_payment_draft_created",
+            "vendor_payment_allocation_created",
+            "vendor_payment_posted",
+            "vendor_payment_reversed",
+        )
+
+        for operation in expected_events:
+            self.assertTrue(
+                JournalAuditEvent.objects.filter(
+                    journal_entry=payment.journal_entry,
+                    operation=operation,
+                ).exists(),
+                f"Missing audit event: {operation}",
+            )
+        
     def test_allocation_cannot_exceed_payment_amount_through_api(self):
         self.post_invoice_journal_for_allocation()
 
@@ -2401,6 +2667,7 @@ class AccountingAPITests(TestCase):
 
         self.assertEqual(PaymentAllocation.objects.count(), 0)
 
+
     def vendor_payment_post_url(self, payment_id):
         return reverse(
             "accounting-vendor-payment-post",
@@ -2409,6 +2676,7 @@ class AccountingAPITests(TestCase):
                 "payment_id": payment_id,
             },
         )
+
 
     def vendor_payment_reverse_url(self, payment_id):
         return reverse(
@@ -2439,6 +2707,7 @@ class AccountingAPITests(TestCase):
         self.assertEqual(allocation_response.status_code, 200)
 
         return payment_response
+
 
     def test_finance_admin_can_post_vendor_payment_through_api(self):
         payment_response = (
@@ -2495,6 +2764,7 @@ class AccountingAPITests(TestCase):
             ).exists()
         )
 
+    
     def test_finance_operator_cannot_post_vendor_payment_through_api(self):
         payment_response = (
             self.create_fully_allocated_vendor_payment_via_api()
@@ -2520,6 +2790,7 @@ class AccountingAPITests(TestCase):
             JournalEntry.Status.DRAFT,
         )
 
+
     def test_vendor_payment_api_rejects_posting_without_allocations(self):
         payment_response = self.create_vendor_payment_via_api()
 
@@ -2538,6 +2809,7 @@ class AccountingAPITests(TestCase):
         )
 
         self.assertEqual(payment.status, VendorPayment.Status.DRAFT)
+
 
     def test_vendor_payment_api_rejects_partial_allocation(self):
         self.post_invoice_journal_for_allocation()
@@ -2935,8 +3207,6 @@ class AccountingAPITests(TestCase):
         )
 
         self.assertEqual(restored_total, before_total)
-
-    
 
     
 
