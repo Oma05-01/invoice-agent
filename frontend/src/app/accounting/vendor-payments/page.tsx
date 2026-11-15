@@ -29,6 +29,11 @@ import type {
   VendorPaymentStatus,
 } from "@/types/accounting";
 type AllocationCandidate = APAgeingInvoice;
+type PendingAllocationRemoval = {
+  invoiceId: string;
+  invoiceNumber: string;
+  amount: string;
+};
 function normalizeIntegerString(value: string): string {
   return value.replace(/^0+(?=\d)/, "") || "0";
 }
@@ -192,6 +197,10 @@ function VendorPaymentDetailWorkspace() {
   const [allocationAmount, setAllocationAmount] = useState("");
   const [savingAllocation, setSavingAllocation] = useState(false);
   const [removingInvoiceId, setRemovingInvoiceId] = useState("");
+  const [allocationToRemove, setAllocationToRemove] =
+    useState<PendingAllocationRemoval | null>(null);
+  const [allocationRemovalError, setAllocationRemovalError] =
+    useState("");
   const [confirmationAction, setConfirmationAction] =
     useState<"post" | "reverse" | null>(null);
   const [reversalReason, setReversalReason] = useState("");
@@ -474,19 +483,29 @@ async function handleConfirmPaymentAction(
       setSavingAllocation(false);
     }
   }
-  async function handleRemoveAllocation(
+  function requestRemoveAllocation(
     invoiceId: string,
     invoiceNumber: string,
   ) {
-    if (!payment) return;
-    if (
-      !window.confirm(
-        `Remove the allocation for invoice ${invoiceNumber}?`,
-      )
-    ) {
-      return;
-    }
+    if (!payment || removingInvoiceId) return;
+    const allocation = allocations.find(
+      (item) => item.invoice_id === invoiceId,
+    );
+    if (!allocation) return;
+    setError("");
+    setAllocationError("");
+    setAllocationRemovalError("");
+    setAllocationToRemove({
+      invoiceId,
+      invoiceNumber,
+      amount: allocation.amount,
+    });
+  }
+  async function handleConfirmRemoveAllocation() {
+    if (!payment || !allocationToRemove || removingInvoiceId) return;
+    const { invoiceId, invoiceNumber } = allocationToRemove;
     setRemovingInvoiceId(invoiceId);
+    setAllocationRemovalError("");
     setError("");
     setSuccessMessage("");
     try {
@@ -509,11 +528,12 @@ async function handleConfirmPaymentAction(
         setSelectedInvoiceId("");
         setAllocationAmount("");
       }
+      setAllocationToRemove(null);
       setSuccessMessage(
         `Allocation for ${invoiceNumber} was removed.`,
       );
     } catch (removeError) {
-      setError(
+      setAllocationRemovalError(
         removeError instanceof Error
           ? removeError.message
           : "Unable to remove the invoice allocation.",
@@ -524,6 +544,8 @@ async function handleConfirmPaymentAction(
   }
   function changeOrganization(value: string) {
     setSelectedOrganizationId(value);
+    setAllocationToRemove(null);
+    setAllocationRemovalError("");
     setPayment(null);
     setCandidateInvoices([]);
     setLoading(true);
@@ -899,7 +921,7 @@ async function handleConfirmPaymentAction(
                                       <button
                                         type="button"
                                         onClick={() =>
-                                          handleRemoveAllocation(
+                                          requestRemoveAllocation(
                                             allocation.invoice_id,
                                             allocation.invoice_number,
                                           )
@@ -1250,6 +1272,98 @@ async function handleConfirmPaymentAction(
                 </section>
             </div>
             )}
+        {allocationToRemove && payment && (
+          <div className="fixed inset-0 z-[60] flex items-center justify-center overflow-y-auto bg-slate-950/40 p-4">
+            <section
+              role="dialog"
+              aria-modal="true"
+              aria-labelledby="allocation-removal-title"
+              aria-describedby="allocation-removal-description"
+              className="my-8 w-full max-w-md rounded-2xl bg-white shadow-xl"
+            >
+              <div className="border-b border-slate-100 px-6 py-5">
+                <div className="flex items-center gap-3">
+                  <div className="flex h-10 w-10 items-center justify-center rounded-xl bg-rose-50 text-rose-700">
+                    <Trash2 size={19} />
+                  </div>
+                  <div>
+                    <h2
+                      id="allocation-removal-title"
+                      className="font-bold text-slate-900"
+                    >
+                      Remove invoice allocation?
+                    </h2>
+                    <p className="mt-1 text-xs text-slate-500">
+                      {currentReference}
+                    </p>
+                  </div>
+                </div>
+              </div>
+              <div className="space-y-4 px-6 py-6">
+                <div className="rounded-lg bg-slate-50 p-4">
+                  <div className="flex justify-between gap-3 text-sm">
+                    <span className="text-slate-500">Invoice</span>
+                    <span className="font-semibold text-slate-900">
+                      {allocationToRemove.invoiceNumber}
+                    </span>
+                  </div>
+                  <div className="mt-3 flex justify-between gap-3 text-sm">
+                    <span className="text-slate-500">Allocated amount</span>
+                    <span className="font-semibold tabular-nums text-slate-900">
+                      {formatAmount(
+                        allocationToRemove.amount,
+                        payment.currency,
+                      )}
+                    </span>
+                  </div>
+                </div>
+                <p
+                  id="allocation-removal-description"
+                  className="text-sm leading-relaxed text-slate-600"
+                >
+                  This removes the allocation from this draft payment. It does
+                  not delete the invoice or the vendor payment. You can allocate
+                  the invoice again while the payment remains in draft.
+                </p>
+                {allocationRemovalError && (
+                  <div
+                    role="alert"
+                    className="flex items-start gap-2 rounded-lg border border-rose-200 bg-rose-50 p-3 text-sm text-rose-700"
+                  >
+                    <CircleAlert size={16} className="mt-0.5 shrink-0" />
+                    <p>{allocationRemovalError}</p>
+                  </div>
+                )}
+              </div>
+              <div className="flex flex-wrap justify-end gap-2 border-t border-slate-100 px-6 py-5">
+                <button
+                  type="button"
+                  onClick={() => {
+                    setAllocationToRemove(null);
+                    setAllocationRemovalError("");
+                  }}
+                  disabled={Boolean(removingInvoiceId)}
+                  className="h-10 rounded-lg border border-slate-200 px-4 text-sm font-medium text-slate-700 hover:bg-slate-50 disabled:opacity-50"
+                >
+                  Cancel
+                </button>
+                <button
+                  type="button"
+                  onClick={handleConfirmRemoveAllocation}
+                  disabled={Boolean(removingInvoiceId)}
+                  className="inline-flex h-10 items-center gap-2 rounded-lg bg-rose-600 px-4 text-sm font-semibold text-white hover:bg-rose-700 disabled:cursor-not-allowed disabled:opacity-50"
+                >
+                  {removingInvoiceId ? (
+                    <LoaderCircle size={16} className="animate-spin" />
+                  ) : (
+                    <Trash2 size={15} />
+                  )}
+                  {removingInvoiceId ? "Removing..." : "Remove allocation"}
+                </button>
+              </div>
+            </section>
+          </div>
+        )}
       </main>
     </ProtectedRoute>
   );
