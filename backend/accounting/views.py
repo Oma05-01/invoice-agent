@@ -10,7 +10,13 @@ from rest_framework.permissions import IsAuthenticated
 from rest_framework.response import Response
 from rest_framework.views import APIView
 
-from accounting.models import Account, JournalEntry, JournalLine
+from accounting.models import (
+    Account,
+    JournalEntry,
+    JournalLine,
+    VendorPayment,
+    PaymentAllocation,
+)
 from accounting.serializers import (
     AccountSerializer,
     JournalEntrySerializer,
@@ -23,12 +29,15 @@ from accounting.serializers import (
     JournalAdjustmentCreateSerializer,
     JournalEntryDateUpdateSerializer,
     APAgeingQuerySerializer,
+    VendorPaymentCreateSerializer,
+    VendorPaymentReadSerializer,
 )
 from accounting.services import (
     AccountingConfigurationError,
     AccountingPermissionError,
     AccountingStateError,
     initialize_chart_of_accounts,
+    create_vendor_payment,
     post_journal_entry,
     require_accounting_role,
     reverse_journal_entry,
@@ -110,6 +119,93 @@ class OrganizationAccountingAPIView(APIView):
 
         return membership
 
+def get_vendor_payment_queryset(organization_id):
+    return (
+        VendorPayment.objects
+        .filter(organization_id=organization_id)
+        .select_related(
+            "vendor",
+            "payment_account",
+            "journal_entry",
+            "created_by",
+            "posted_by",
+        )
+        .prefetch_related(
+            Prefetch(
+                "allocations",
+                queryset=PaymentAllocation.objects.select_related(
+                    "invoice"
+                ),
+            )
+        )
+    )
+
+class VendorPaymentListCreateAPIView(
+    OrganizationAccountingAPIView
+):
+    def get(self, request, organization_id):
+        self.get_membership(request, organization_id)
+
+        payments = get_vendor_payment_queryset(
+            organization_id
+        )
+
+        serializer = VendorPaymentReadSerializer(
+            payments,
+            many=True,
+        )
+
+        return Response({
+            "count": payments.count(),
+            "payments": serializer.data,
+        })
+
+    def post(self, request, organization_id):
+        self.get_membership(request, organization_id)
+
+        serializer = VendorPaymentCreateSerializer(
+            data=request.data,
+        )
+        serializer.is_valid(raise_exception=True)
+
+        try:
+            payment = create_vendor_payment(
+                organization_id=organization_id,
+                actor=request.user,
+                **serializer.validated_data,
+            )
+
+            payment = get_vendor_payment_queryset(
+                organization_id
+            ).get(pk=payment.pk)
+
+            return Response(
+                VendorPaymentReadSerializer(payment).data,
+                status=status.HTTP_201_CREATED,
+            )
+
+        except (
+            AccountingPermissionError,
+            AccountingStateError,
+            AccountingConfigurationError,
+            ValidationError,
+        ) as exc:
+            return accounting_error_response(exc)
+
+class VendorPaymentDetailAPIView(
+    OrganizationAccountingAPIView
+):
+    def get(self, request, organization_id, payment_id):
+        self.get_membership(request, organization_id)
+
+        payment = get_object_or_404(
+            get_vendor_payment_queryset(organization_id),
+            pk=payment_id,
+        )
+
+        serializer = VendorPaymentReadSerializer(payment)
+
+        return Response(serializer.data)
 
 class AccountingAccountListAPIView(
     OrganizationAccountingAPIView

@@ -1216,8 +1216,21 @@ class AccountingAPITests(TestCase):
             },
         )
 
+        self.vendor = Vendor.objects.create(
+            organization=self.organization,
+            vendor_code="API-PAYMENT-001",
+            legal_name="Accounting API Payment Vendor",
+        )
+
         self.journals_url = reverse(
             "accounting-journal-list",
+            kwargs={
+                "organization_id": self.organization.id,
+            },
+        )
+
+        self.vendor_payments_url = reverse(
+            "accounting-vendor-payment-list",
             kwargs={
                 "organization_id": self.organization.id,
             },
@@ -1260,6 +1273,20 @@ class AccountingAPITests(TestCase):
 
     def authenticate_as(self, user):
         self.client.force_authenticate(user=user)
+
+
+    def vendor_payment_payload(self, **overrides):
+        payload = {
+            "vendor_id": str(self.vendor.pk),
+            "payment_account_id": str(self.accounts["1000"].pk),
+            "amount": "125000.00",
+            "currency": "NGN",
+            "payment_date": "2026-11-13",
+            "reference": "VP-API-001",
+            "description": "API vendor payment test.",
+        }
+        payload.update(overrides)
+        return payload
 
     def test_read_only_member_can_list_accounts_and_journals(self):
         self.authenticate_as(self.readonly)
@@ -1951,6 +1978,199 @@ class AccountingAPITests(TestCase):
         )
 
         self.assertEqual(response.status_code, 400)
+
+    def test_finance_operator_can_create_draft_vendor_payment(self):
+        self.authenticate_as(self.operator)
+
+        response = self.client.post(
+            self.vendor_payments_url,
+            self.vendor_payment_payload(),
+            format="json",
+        )
+
+        self.assertEqual(response.status_code, 201)
+        self.assertEqual(response.data["status"], "draft")
+        self.assertEqual(response.data["journal_status"], "draft")
+        self.assertEqual(response.data["currency"], "NGN")
+        self.assertEqual(response.data["amount"], "125000.00")
+
+        payment = VendorPayment.objects.get(
+            pk=response.data["id"],
+        )
+
+        self.assertEqual(payment.vendor, self.vendor)
+        self.assertEqual(payment.created_by, self.operator)
+        self.assertEqual(
+            payment.journal_entry.status,
+            JournalEntry.Status.DRAFT,
+        )
+
+        self.assertEqual(
+            payment.journal_entry.lines.count(),
+            2,
+        )
+
+        self.assertTrue(
+            JournalAuditEvent.objects.filter(
+                journal_entry=payment.journal_entry,
+                operation="vendor_payment_draft_created",
+            ).exists()
+        )
+
+    def test_read_only_member_can_list_and_retrieve_vendor_payments(self):
+        self.authenticate_as(self.operator)
+
+        create_response = self.client.post(
+            self.vendor_payments_url,
+            self.vendor_payment_payload(),
+            format="json",
+        )
+
+        self.assertEqual(create_response.status_code, 201)
+
+        payment_id = create_response.data["id"]
+
+        self.authenticate_as(self.readonly)
+
+        list_response = self.client.get(
+            self.vendor_payments_url,
+        )
+
+        self.assertEqual(list_response.status_code, 200)
+        self.assertEqual(list_response.data["count"], 1)
+        self.assertEqual(
+            list_response.data["payments"][0]["id"],
+            payment_id,
+        )
+
+        detail_url = reverse(
+            "accounting-vendor-payment-detail",
+            kwargs={
+                "organization_id": self.organization.id,
+                "payment_id": payment_id,
+            },
+        )
+
+        detail_response = self.client.get(detail_url)
+
+        self.assertEqual(detail_response.status_code, 200)
+        self.assertEqual(detail_response.data["id"], payment_id)
+        self.assertEqual(detail_response.data["vendor"]["id"], str(self.vendor.pk))
+
+    def test_read_only_member_cannot_create_vendor_payment(self):
+        self.authenticate_as(self.readonly)
+
+        response = self.client.post(
+            self.vendor_payments_url,
+            self.vendor_payment_payload(),
+            format="json",
+        )
+
+        self.assertEqual(response.status_code, 403)
+        self.assertEqual(VendorPayment.objects.count(), 0)
+
+    def test_vendor_payment_rejects_invalid_vendor_and_account(self):
+        self.authenticate_as(self.operator)
+
+        invalid_id = "00000000-0000-0000-0000-000000000001"
+
+        invalid_payloads = [
+            {"vendor_id": invalid_id},
+            {"payment_account_id": invalid_id},
+        ]
+
+        for override in invalid_payloads:
+            with self.subTest(override=override):
+                response = self.client.post(
+                    self.vendor_payments_url,
+                    self.vendor_payment_payload(**override),
+                    format="json",
+                )
+
+                self.assertEqual(response.status_code, 400)
+
+        self.assertEqual(VendorPayment.objects.count(), 0)
+
+    def test_vendor_payment_detail_is_organization_scoped(self):
+        self.authenticate_as(self.operator)
+
+        create_response = self.client.post(
+            self.vendor_payments_url,
+            self.vendor_payment_payload(),
+            format="json",
+        )
+
+        self.assertEqual(create_response.status_code, 201)
+
+        another_organization = Organization.objects.create(
+            name="Another Accounting Company",
+            slug="another-accounting-company",
+            default_currency="NGN",
+        )
+
+        OrganizationMembership.objects.create(
+            organization=another_organization,
+            user=self.operator,
+            role=OrganizationMembership.Role.READ_ONLY,
+        )
+
+        detail_url = reverse(
+            "accounting-vendor-payment-detail",
+            kwargs={
+                "organization_id": another_organization.pk,
+                "payment_id": create_response.data["id"],
+            },
+        )
+
+        response = self.client.get(detail_url)
+
+        self.assertEqual(response.status_code, 404)
+
+    def test_draft_vendor_payment_does_not_reduce_ap_balance(self):
+        post_journal_entry(
+            organization_id=self.organization.pk,
+            journal_entry_id=self.entry.pk,
+            actor=self.admin,
+        )
+
+        as_of_date = timezone.localdate()
+
+        before_report = build_ap_ageing_report(
+            organization=self.organization,
+            as_of_date=as_of_date,
+        )
+
+        before_total = sum(
+            Decimal(item["total_outstanding"])
+            for item in before_report["currencies"]
+        )
+
+        self.assertEqual(
+            before_total,
+            Decimal("250000.00"),
+        )
+
+        self.authenticate_as(self.operator)
+
+        response = self.client.post(
+            self.vendor_payments_url,
+            self.vendor_payment_payload(),
+            format="json",
+        )
+
+        self.assertEqual(response.status_code, 201)
+
+        after_report = build_ap_ageing_report(
+            organization=self.organization,
+            as_of_date=as_of_date,
+        )
+
+        after_total = sum(
+            Decimal(item["total_outstanding"])
+            for item in after_report["currencies"]
+        )
+
+        self.assertEqual(after_total, before_total)
 
 
 class AccountingReportingAPITests(TestCase):

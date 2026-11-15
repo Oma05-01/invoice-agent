@@ -2,7 +2,14 @@ from decimal import Decimal
 
 from rest_framework import serializers
 
-from accounting.models import Account, JournalEntry, JournalLine
+from accounting.models import (
+    Account,
+    JournalEntry,
+    JournalLine,
+    VendorPayment,
+    PaymentAllocation,
+)
+from vendors.models import Vendor
 
 
 class AccountSerializer(serializers.ModelSerializer):
@@ -97,6 +104,136 @@ class JournalEntrySerializer(serializers.ModelSerializer):
         )
         read_only_fields = fields
 
+class VendorPaymentVendorSerializer(serializers.ModelSerializer):
+    class Meta:
+        model = Vendor
+        fields = (
+            "id",
+            "vendor_code",
+            "legal_name",
+            "display_name",
+        )
+        read_only_fields = fields
+
+
+class PaymentAllocationReadSerializer(serializers.ModelSerializer):
+    invoice_id = serializers.ReadOnlyField()
+    invoice_number = serializers.CharField(
+        source="invoice.invoice_number",
+        read_only=True,
+    )
+
+    class Meta:
+        model = PaymentAllocation
+        fields = (
+            "id",
+            "invoice_id",
+            "invoice_number",
+            "amount",
+            "created_at",
+        )
+        read_only_fields = fields
+
+
+class VendorPaymentReadSerializer(serializers.ModelSerializer):
+    organization_id = serializers.ReadOnlyField()
+    vendor_id = serializers.ReadOnlyField()
+    payment_account_id = serializers.ReadOnlyField()
+    journal_entry_id = serializers.ReadOnlyField()
+
+    created_by_id = serializers.ReadOnlyField()
+    posted_by_id = serializers.ReadOnlyField()
+
+    vendor = VendorPaymentVendorSerializer(read_only=True)
+    payment_account = JournalLineAccountSerializer(read_only=True)
+
+    allocations = PaymentAllocationReadSerializer(
+        many=True,
+        read_only=True,
+    )
+
+    journal_status = serializers.SerializerMethodField()
+    journal_reference = serializers.SerializerMethodField()
+
+    class Meta:
+        model = VendorPayment
+        fields = (
+            "id",
+            "organization_id",
+            "vendor_id",
+            "vendor",
+            "payment_date",
+            "reference",
+            "amount",
+            "currency",
+            "payment_account_id",
+            "payment_account",
+            "journal_entry_id",
+            "journal_status",
+            "journal_reference",
+            "status",
+            "created_by_id",
+            "posted_by_id",
+            "posted_at",
+            "reversal_reason",
+            "allocations",
+            "created_at",
+            "updated_at",
+        )
+        read_only_fields = fields
+
+    def get_journal_status(self, obj):
+        if obj.journal_entry_id:
+            return obj.journal_entry.status
+        return None
+
+    def get_journal_reference(self, obj):
+        if obj.journal_entry_id:
+            return obj.journal_entry.reference
+        return None
+
+
+class VendorPaymentCreateSerializer(serializers.Serializer):
+    vendor_id = serializers.UUIDField()
+
+    payment_account_id = serializers.UUIDField()
+
+    amount = serializers.DecimalField(
+        max_digits=18,
+        decimal_places=2,
+        min_value=Decimal("0.01"),
+    )
+
+    currency = serializers.CharField(
+        min_length=3,
+        max_length=3,
+    )
+
+    payment_date = serializers.DateField(required=False)
+
+    reference = serializers.CharField(
+        required=False,
+        allow_blank=True,
+        max_length=100,
+        default="",
+    )
+
+    description = serializers.CharField(
+        required=False,
+        allow_blank=True,
+        max_length=500,
+        default="",
+    )
+
+    def validate_currency(self, value):
+        value = value.strip().upper()
+
+        if len(value) != 3 or not value.isalpha():
+            raise serializers.ValidationError(
+                "Currency must be a valid three-letter code."
+            )
+
+        return value
 
 class JournalLineCorrectionSerializer(serializers.Serializer):
     account_id = serializers.UUIDField(
