@@ -19,6 +19,7 @@ from accounting.views import (
     VendorPaymentDetailAPIView,
     VendorPaymentAllocationAPIView,
     VendorPaymentPostAPIView,
+    VendorPaymentReverseAPIView,
 )
 
 
@@ -117,6 +118,11 @@ urlpatterns = [
         "organizations/<uuid:organization_id>/accounting/vendor-payments/<uuid:payment_id>/post/",
         VendorPaymentPostAPIView.as_view(),
         name="accounting-vendor-payment-post",
+    ),
+    path(
+        "organizations/<uuid:organization_id>/accounting/vendor-payments/<uuid:payment_id>/reverse/",
+        VendorPaymentReverseAPIView.as_view(),
+        name="accounting-vendor-payment-reverse",
     ),
 ]
 

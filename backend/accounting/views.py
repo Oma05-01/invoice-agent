@@ -33,6 +33,7 @@ from accounting.serializers import (
     VendorPaymentReadSerializer,
     VendorPaymentAllocationCreateSerializer,
     PaymentAllocationReadSerializer,
+    VendorPaymentReversalSerializer,
 )
 from accounting.services import (
     AccountingConfigurationError,
@@ -49,6 +50,7 @@ from accounting.services import (
     set_vendor_payment_allocation,
     remove_vendor_payment_allocation,
     post_vendor_payment,
+    reverse_vendor_payment,
 )
 
 from accounting.reporting import (
@@ -894,6 +896,74 @@ class VendorPaymentPostAPIView(
 
         except VendorPayment.DoesNotExist:
             raise NotFound("Vendor payment not found.")
+
+        except (
+            AccountingPermissionError,
+            AccountingStateError,
+            AccountingConfigurationError,
+            ValidationError,
+        ) as exc:
+            return accounting_error_response(exc)
+
+class VendorPaymentReverseAPIView(
+    OrganizationAccountingAPIView
+):
+    def post(self, request, organization_id, payment_id):
+        self.get_membership(request, organization_id)
+
+        serializer = VendorPaymentReversalSerializer(
+            data=request.data,
+        )
+        serializer.is_valid(raise_exception=True)
+
+        try:
+            payment, reversal_journal = reverse_vendor_payment(
+                organization_id=organization_id,
+                payment_id=payment_id,
+                actor=request.user,
+                reversal_reason=serializer.validated_data[
+                    "reversal_reason"
+                ],
+            )
+
+            payment = get_vendor_payment_queryset(
+                organization_id
+            ).get(pk=payment.pk)
+
+            reversal_journal = (
+                JournalEntry.objects
+                .filter(
+                    pk=reversal_journal.pk,
+                    organization_id=organization_id,
+                )
+                .prefetch_related(
+                    Prefetch(
+                        "lines",
+                        queryset=JournalLine.objects.select_related(
+                            "account"
+                        ).order_by("line_number"),
+                    )
+                )
+                .get()
+            )
+
+            return Response(
+                {
+                    "payment": VendorPaymentReadSerializer(
+                        payment
+                    ).data,
+                    "reversal_journal": JournalEntrySerializer(
+                        reversal_journal
+                    ).data,
+                },
+                status=status.HTTP_201_CREATED,
+            )
+
+        except VendorPayment.DoesNotExist:
+            raise NotFound("Vendor payment not found.")
+
+        except JournalEntry.DoesNotExist:
+            raise NotFound("Payment journal not found.")
 
         except (
             AccountingPermissionError,

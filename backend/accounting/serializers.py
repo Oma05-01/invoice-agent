@@ -495,3 +495,18 @@ class JournalEntryDateUpdateSerializer(serializers.Serializer):
         trim_whitespace=True,
     )
 
+class VendorPaymentReversalSerializer(serializers.Serializer):
+    reversal_reason = serializers.CharField(
+        allow_blank=False,
+        trim_whitespace=True,
+    )
+
+    def validate_reversal_reason(self, value):
+        if not value.strip():
+            raise serializers.ValidationError(
+                "A reversal reason is required."
+            )
+
+        return value
+
+    

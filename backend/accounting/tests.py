@@ -2410,6 +2410,15 @@ class AccountingAPITests(TestCase):
             },
         )
 
+    def vendor_payment_reverse_url(self, payment_id):
+        return reverse(
+            "accounting-vendor-payment-reverse",
+            kwargs={
+                "organization_id": self.organization.pk,
+                "payment_id": payment_id,
+            },
+        )
+
 
     def create_fully_allocated_vendor_payment_via_api(self):
         self.post_invoice_journal_for_allocation()
@@ -2648,6 +2657,286 @@ class AccountingAPITests(TestCase):
             before_total - after_total,
             Decimal("125000.00"),
         )
+
+    def test_finance_admin_can_reverse_vendor_payment_through_api(self):
+        payment_response = (
+            self.create_fully_allocated_vendor_payment_via_api()
+        )
+        payment_id = payment_response.data["id"]
+
+        self.authenticate_as(self.admin)
+
+        post_response = self.client.post(
+            self.vendor_payment_post_url(payment_id),
+            {},
+            format="json",
+        )
+        self.assertEqual(post_response.status_code, 200)
+
+        reason = "Correcting the original vendor payment."
+
+        response = self.client.post(
+            self.vendor_payment_reverse_url(payment_id),
+            {"reversal_reason": reason},
+            format="json",
+        )
+
+        self.assertEqual(response.status_code, 201)
+
+        payment_data = response.data["payment"]
+        reversal_data = response.data["reversal_journal"]
+
+        self.assertEqual(payment_data["status"], "reversed")
+        self.assertEqual(payment_data["journal_status"], "reversed")
+        self.assertEqual(payment_data["reversal_reason"], reason)
+
+        self.assertEqual(reversal_data["status"], "posted")
+        self.assertIsNotNone(reversal_data["id"])
+
+        payment = VendorPayment.objects.get(pk=payment_id)
+
+        self.assertEqual(
+            payment.status,
+            VendorPayment.Status.REVERSED,
+        )
+        self.assertEqual(payment.reversal_reason, reason)
+
+        self.assertEqual(
+            payment.allocations.count(),
+            1,
+        )
+
+        self.assertTrue(
+            JournalAuditEvent.objects.filter(
+                journal_entry=payment.journal_entry,
+                operation="vendor_payment_reversed",
+            ).exists()
+        )
+
+    def test_finance_operator_cannot_reverse_vendor_payment_through_api(self):
+        payment_response = (
+            self.create_fully_allocated_vendor_payment_via_api()
+        )
+        payment_id = payment_response.data["id"]
+
+        self.authenticate_as(self.admin)
+
+        post_response = self.client.post(
+            self.vendor_payment_post_url(payment_id),
+            {},
+            format="json",
+        )
+        self.assertEqual(post_response.status_code, 200)
+
+        self.authenticate_as(self.operator)
+
+        response = self.client.post(
+            self.vendor_payment_reverse_url(payment_id),
+            {
+                "reversal_reason": "Unauthorized reversal attempt.",
+            },
+            format="json",
+        )
+
+        self.assertEqual(response.status_code, 403)
+
+        payment = VendorPayment.objects.get(pk=payment_id)
+
+        self.assertEqual(
+            payment.status,
+            VendorPayment.Status.POSTED,
+        )
+
+    def test_vendor_payment_reversal_requires_reason_through_api(self):
+        payment_response = (
+            self.create_fully_allocated_vendor_payment_via_api()
+        )
+        payment_id = payment_response.data["id"]
+
+        self.authenticate_as(self.admin)
+
+        self.client.post(
+            self.vendor_payment_post_url(payment_id),
+            {},
+            format="json",
+        )
+
+        invalid_payloads = [
+            {},
+            {"reversal_reason": ""},
+            {"reversal_reason": "   "},
+        ]
+
+        for payload in invalid_payloads:
+            with self.subTest(payload=payload):
+                response = self.client.post(
+                    self.vendor_payment_reverse_url(payment_id),
+                    payload,
+                    format="json",
+                )
+
+                self.assertEqual(response.status_code, 400)
+
+        payment = VendorPayment.objects.get(pk=payment_id)
+
+        self.assertEqual(
+            payment.status,
+            VendorPayment.Status.POSTED,
+        )
+
+        self.assertFalse(
+            JournalEntry.objects.filter(
+                reversal_of=payment.journal_entry,
+            ).exists()
+        )
+
+    def test_draft_vendor_payment_cannot_be_reversed_through_api(self):
+        payment_response = self.create_vendor_payment_via_api()
+        payment_id = payment_response.data["id"]
+
+        self.authenticate_as(self.admin)
+
+        response = self.client.post(
+            self.vendor_payment_reverse_url(payment_id),
+            {
+                "reversal_reason": "Attempt to reverse a draft payment.",
+            },
+            format="json",
+        )
+
+        self.assertEqual(response.status_code, 400)
+
+        payment = VendorPayment.objects.get(pk=payment_id)
+
+        self.assertEqual(
+            payment.status,
+            VendorPayment.Status.DRAFT,
+        )
+
+    def test_vendor_payment_cannot_be_reversed_twice_through_api(self):
+        payment_response = (
+            self.create_fully_allocated_vendor_payment_via_api()
+        )
+        payment_id = payment_response.data["id"]
+
+        self.authenticate_as(self.admin)
+
+        self.client.post(
+            self.vendor_payment_post_url(payment_id),
+            {},
+            format="json",
+        )
+
+        first_response = self.client.post(
+            self.vendor_payment_reverse_url(payment_id),
+            {
+                "reversal_reason": "First authorised reversal.",
+            },
+            format="json",
+        )
+
+        self.assertEqual(first_response.status_code, 201)
+
+        second_response = self.client.post(
+            self.vendor_payment_reverse_url(payment_id),
+            {
+                "reversal_reason": "Attempted second reversal.",
+            },
+            format="json",
+        )
+
+        self.assertEqual(second_response.status_code, 400)
+
+        payment = VendorPayment.objects.get(pk=payment_id)
+
+        self.assertEqual(
+            JournalEntry.objects.filter(
+                reversal_of=payment.journal_entry,
+            ).count(),
+            1,
+        )
+
+    def test_vendor_payment_reversal_restores_ap_balance_through_api(self):
+        self.post_invoice_journal_for_allocation()
+
+        as_of_date = timezone.localdate()
+
+        before_report = build_ap_ageing_report(
+            organization=self.organization,
+            as_of_date=as_of_date,
+            currency="NGN",
+        )
+
+        before_total = Decimal(
+            before_report["currencies"][0]["total_outstanding"]
+        )
+
+        payment_response = self.create_vendor_payment_via_api()
+        payment_id = payment_response.data["id"]
+
+        self.authenticate_as(self.operator)
+
+        allocation_response = self.client.post(
+            self.payment_allocation_url(payment_id),
+            {
+                "invoice_id": str(self.invoice.pk),
+                "amount": "125000.00",
+            },
+            format="json",
+        )
+
+        self.assertEqual(allocation_response.status_code, 200)
+
+        self.authenticate_as(self.admin)
+
+        post_response = self.client.post(
+            self.vendor_payment_post_url(payment_id),
+            {},
+            format="json",
+        )
+
+        self.assertEqual(post_response.status_code, 200)
+
+        posted_report = build_ap_ageing_report(
+            organization=self.organization,
+            as_of_date=as_of_date,
+            currency="NGN",
+        )
+
+        posted_total = Decimal(
+            posted_report["currencies"][0]["total_outstanding"]
+        )
+
+        self.assertEqual(
+            before_total - posted_total,
+            Decimal("125000.00"),
+        )
+
+        reversal_response = self.client.post(
+            self.vendor_payment_reverse_url(payment_id),
+            {
+                "reversal_reason": (
+                    "End-to-end validation of AP restoration."
+                ),
+            },
+            format="json",
+        )
+
+        self.assertEqual(reversal_response.status_code, 201)
+
+        restored_report = build_ap_ageing_report(
+            organization=self.organization,
+            as_of_date=as_of_date,
+            currency="NGN",
+        )
+
+        restored_total = Decimal(
+            restored_report["currencies"][0]["total_outstanding"]
+        )
+
+        self.assertEqual(restored_total, before_total)
+
+    
 
     
 
