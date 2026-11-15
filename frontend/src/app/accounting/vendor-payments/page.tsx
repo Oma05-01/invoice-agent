@@ -1,63 +1,123 @@
-
 "use client";
-
 import Link from "next/link";
-import {
-  useEffect,
-  useMemo,
-  useState,
-  type FormEvent,
-} from "react";
-
+import { useParams } from "next/navigation";
+import { useEffect, useMemo, useState, type FormEvent } from "react";
 import {
   ArrowLeft,
-  CalendarDays,
   CheckCircle2,
   CircleAlert,
   FileText,
   LoaderCircle,
-  Plus,
   RefreshCw,
-  Search,
+  Trash2,
   Wallet,
-  X,
 } from "lucide-react";
-
 import { useAuth } from "@/components/auth-provider";
 import { ProtectedRoute } from "@/components/protected-route";
-
 import {
-  createVendorPayment,
-  fetchAccountingAccounts,
-  fetchVendorPayments,
+  allocateInvoiceToVendorPayment,
+  fetchAPAgeingReport,
+  fetchVendorPayment,
+  removeVendorPaymentAllocation,
+  postVendorPayment,
+  reverseVendorPayment,
 } from "@/lib/accounting";
-
-import { fetchVendors, type Vendor } from "@/lib/invoices";
-
 import type {
-  AccountingAccount,
+  APAgeingInvoice,
+  JournalEntry,
   VendorPayment,
   VendorPaymentStatus,
 } from "@/types/accounting";
-
-type PaymentStatusFilter = "all" | VendorPaymentStatus;
-
-function getLocalDateValue(): string {
-  const now = new Date();
-  const year = now.getFullYear();
-  const month = String(now.getMonth() + 1).padStart(2, "0");
-  const day = String(now.getDate()).padStart(2, "0");
-
-  return `${year}-${month}-${day}`;
+type AllocationCandidate = APAgeingInvoice;
+function normalizeIntegerString(value: string): string {
+  return value.replace(/^0+(?=\d)/, "") || "0";
 }
-
-function formatAmount(amount: string, currency: string): string {
-  const numericAmount = Number(amount);
-
-  if (!Number.isFinite(numericAmount)) {
-    return `${currency} ${amount}`;
+// Convert a monetary decimal string into integer minor units.
+// Calculations use strings so large monetary values do not lose
+// precision through JavaScript floating-point arithmetic.
+function toMinorUnits(value: string): string {
+  const trimmed = value.trim();
+  if (!/^\d+(\.\d{1,2})?$/.test(trimmed)) {
+    return "0";
   }
-
+  const [whole, fraction = ""] = trimmed.split(".");
+  return normalizeIntegerString(
+    `${whole}${fraction.padEnd(2, "0")}`,
+  );
+}
+function compareMinorUnits(left: string, right: string): number {
+  const a = normalizeIntegerString(left);
+  const b = normalizeIntegerString(right);
+  if (a.length !== b.length) {
+    return a.length > b.length ? 1 : -1;
+  }
+  if (a === b) return 0;
+  return a > b ? 1 : -1;
+}
+function addMinorUnits(left: string, right: string): string {
+  let i = left.length - 1;
+  let j = right.length - 1;
+  let carry = 0;
+  let result = "";
+  while (i >= 0 || j >= 0 || carry > 0) {
+    const a = i >= 0 ? Number(left[i]) : 0;
+    const b = j >= 0 ? Number(right[j]) : 0;
+    const sum = a + b + carry;
+    result = String(sum % 10) + result;
+    carry = Math.floor(sum / 10);
+    i -= 1;
+    j -= 1;
+  }
+  return normalizeIntegerString(result);
+}
+// Subtract two unsigned integer strings. The caller must ensure
+// that the first value is greater than or equal to the second.
+function subtractAbsolute(left: string, right: string): string {
+  let i = left.length - 1;
+  let j = right.length - 1;
+  let borrow = 0;
+  let result = "";
+  while (i >= 0) {
+    let a = Number(left[i]) - borrow;
+    const b = j >= 0 ? Number(right[j]) : 0;
+    borrow = 0;
+    if (a < b) {
+      a += 10;
+      borrow = 1;
+    }
+    result = String(a - b) + result;
+    i -= 1;
+    j -= 1;
+  }
+  return normalizeIntegerString(result);
+}
+function subtractMinorUnits(left: string, right: string): string {
+  const comparison = compareMinorUnits(left, right);
+  if (comparison >= 0) {
+    return subtractAbsolute(left, right);
+  }
+  return `-${subtractAbsolute(right, left)}`;
+}
+function sumAmounts(values: string[]): string {
+  return values.reduce(
+    (total, value) =>
+      addMinorUnits(total, toMinorUnits(value)),
+    "0",
+  );
+}
+function minorUnitsToDecimal(value: string): string {
+  const negative = value.startsWith("-");
+  const unsigned = negative ? value.slice(1) : value;
+  const padded = unsigned.padStart(3, "0");
+  const whole = padded.slice(0, -2);
+  const fraction = padded.slice(-2);
+  return `${negative ? "-" : ""}${whole}.${fraction}`;
+}
+function formatAmount(value: string, currency: string): string {
+  const numericAmount = Number(value);
+  if (!Number.isFinite(numericAmount)) {
+    return `${currency} ${value}`;
+  }
   try {
     return new Intl.NumberFormat("en-NG", {
       style: "currency",
@@ -72,286 +132,412 @@ function formatAmount(amount: string, currency: string): string {
     })}`;
   }
 }
-
 function formatDate(value: string | null): string {
   if (!value) return "—";
-
   const date = new Date(`${value.slice(0, 10)}T00:00:00`);
-
   if (Number.isNaN(date.getTime())) return "—";
-
   return new Intl.DateTimeFormat("en-NG", {
     day: "numeric",
     month: "short",
     year: "numeric",
   }).format(date);
 }
-
 function formatRole(role: string): string {
   return role
     .split("_")
     .map((part) => part.charAt(0).toUpperCase() + part.slice(1))
     .join(" ");
 }
-
-function getVendorName(vendor: VendorPayment["vendor"]): string {
-  return vendor.display_name?.trim() || vendor.legal_name;
-}
-
-function getPaymentReference(payment: VendorPayment): string {
-  return (
-    payment.reference ||
-    payment.journal_reference ||
-    payment.id.slice(0, 8)
-  );
-}
-
 const statusLabels: Record<VendorPaymentStatus, string> = {
   draft: "Draft",
   posted: "Posted",
   reversed: "Reversed",
 };
-
 const statusStyles: Record<VendorPaymentStatus, string> = {
-  draft: "bg-amber-50 text-amber-700 ring-amber-600/20",
-  posted: "bg-emerald-50 text-emerald-700 ring-emerald-600/20",
-  reversed: "bg-rose-50 text-rose-700 ring-rose-600/20",
+  draft: "bg-amber-50 text-amber-700",
+  posted: "bg-emerald-50 text-emerald-700",
+  reversed: "bg-rose-50 text-rose-700",
 };
-
-function PaymentStatusBadge({
-  status,
-}: {
-  status: VendorPaymentStatus;
-}) {
-  return (
-    <span
-      className={`inline-flex rounded-full px-2.5 py-1 text-xs font-semibold ring-1 ring-inset ${statusStyles[status]}`}
-    >
-      {statusLabels[status]}
-    </span>
-  );
-}
-
-function VendorPaymentsWorkspace() {
+function VendorPaymentDetailWorkspace() {
+  const params = useParams<{ paymentId: string }>();
+  const paymentId = params.paymentId;
   const { user } = useAuth();
-
   const organizations = user?.organizations ?? [];
-
   const [selectedOrganizationId, setSelectedOrganizationId] =
     useState("");
-
   const organizationId =
     selectedOrganizationId || organizations[0]?.id || "";
-
   const activeOrganization = organizations.find(
     (organization) => organization.id === organizationId,
   );
-
   const role = activeOrganization?.role ?? "";
-
-  const canCreatePayment = [
+  const canPostOrReverse = [
+    "owner",
+    "finance_admin",
+  ].includes(role);
+  const canManageAllocations = [
     "owner",
     "finance_admin",
     "finance_operator",
   ].includes(role);
-
-  const [payments, setPayments] = useState<VendorPayment[]>([]);
-  const [accounts, setAccounts] = useState<AccountingAccount[]>([]);
-  const [vendors, setVendors] = useState<Vendor[]>([]);
-
+  const [payment, setPayment] = useState<VendorPayment | null>(null);
+  const [candidateInvoices, setCandidateInvoices] =
+    useState<AllocationCandidate[]>([]);
   const [loading, setLoading] = useState(true);
   const [refreshKey, setRefreshKey] = useState(0);
-
   const [error, setError] = useState("");
   const [successMessage, setSuccessMessage] = useState("");
-
-  const [searchInput, setSearchInput] = useState("");
-  const [statusFilter, setStatusFilter] =
-    useState<PaymentStatusFilter>("all");
-
-  const [showCreateDialog, setShowCreateDialog] = useState(false);
-  const [saving, setSaving] = useState(false);
-
-  const [vendorId, setVendorId] = useState("");
-  const [paymentAccountId, setPaymentAccountId] = useState("");
-  const [amount, setAmount] = useState("");
-  const [currency, setCurrency] = useState("NGN");
-  const [paymentDate, setPaymentDate] = useState(getLocalDateValue);
-  const [reference, setReference] = useState("");
-  const [description, setDescription] = useState("");
-
-  // Load payments, accounts and vendors for the selected organisation.
-  // Load payments, accounts and vendors for the selected organisation.
-    useEffect(() => {
-  if (!organizationId) return;
-
-  const controller = new AbortController();
-  let active = true;
-
-  async function loadData() {
-    try {
-      const [paymentData, accountData, vendorData] =
-        await Promise.all([
-          fetchVendorPayments(
-            organizationId,
-            controller.signal,
-          ),
-          fetchAccountingAccounts(
-            organizationId,
-            controller.signal,
-          ),
-          fetchVendors(organizationId),
-        ]);
-
-      if (!active) return;
-
-      setPayments(paymentData.payments);
-
-      setAccounts(
-        accountData.accounts.filter(
-          (account) =>
-            account.is_active &&
-            account.account_type === "asset",
-        ),
+  const [allocationError, setAllocationError] = useState("");
+  const [selectedInvoiceId, setSelectedInvoiceId] = useState("");
+  const [allocationAmount, setAllocationAmount] = useState("");
+  const [savingAllocation, setSavingAllocation] = useState(false);
+  const [removingInvoiceId, setRemovingInvoiceId] = useState("");
+  const [confirmationAction, setConfirmationAction] =
+    useState<"post" | "reverse" | null>(null);
+  const [reversalReason, setReversalReason] = useState("");
+  const [processingAction, setProcessingAction] = useState(false);
+  const [reversalJournal, setReversalJournal] =
+    useState<JournalEntry | null>(null);
+async function refreshCandidateInvoices(
+  paymentRecord: VendorPayment,
+) {
+  const ageingData = await fetchAPAgeingReport(
+    organizationId,
+    {
+      currency: paymentRecord.currency,
+    },
+  );
+  const currencyReport = ageingData.currencies.find(
+    (item) => item.currency === paymentRecord.currency,
+  );
+  const vendorReport = currencyReport?.vendors.find(
+    (vendor) => vendor.vendor_id === paymentRecord.vendor_id,
+  );
+  setCandidateInvoices(vendorReport?.invoices ?? []);
+}
+async function handleConfirmPaymentAction(
+  event: FormEvent<HTMLFormElement>,
+) {
+  event.preventDefault();
+  if (!payment || !confirmationAction) return;
+  if (
+    confirmationAction === "post" &&
+    !isFullyAllocated
+  ) {
+    setError(
+      "The payment must be fully allocated before posting.",
+    );
+    return;
+  }
+  if (
+    confirmationAction === "reverse" &&
+    !reversalReason.trim()
+  ) {
+    setError("A reversal reason is required.");
+    return;
+  }
+  setProcessingAction(true);
+  setError("");
+  setSuccessMessage("");
+  try {
+    if (confirmationAction === "post") {
+      const updatedPayment = await postVendorPayment(
+        organizationId,
+        payment.id,
       );
-
-      setVendors(vendorData.results);
-    } catch (loadError) {
-      if (!active || controller.signal.aborted) return;
-
-      setError(
-        loadError instanceof Error
-          ? loadError.message
-          : "Unable to load vendor payment data.",
+      setPayment(updatedPayment);
+      setReversalJournal(null);
+      setConfirmationAction(null);
+      setSuccessMessage(
+        `Payment ${updatedPayment.reference || updatedPayment.id} was posted successfully.`,
       );
-    } finally {
-      if (active) setLoading(false);
+      try {
+        await refreshCandidateInvoices(updatedPayment);
+      } catch {
+        setError(
+          "The payment was posted, but the AP ageing candidates could not be refreshed. Use Refresh to reload them.",
+        );
+      }
+    } else {
+      const result = await reverseVendorPayment(
+        organizationId,
+        payment.id,
+        {
+          reversal_reason: reversalReason.trim(),
+        },
+      );
+      setPayment(result.payment);
+      setReversalJournal(result.reversal_journal);
+      setConfirmationAction(null);
+      setReversalReason("");
+      setSuccessMessage(
+        `Payment ${result.payment.reference || result.payment.id} was reversed successfully.`,
+      );
+      try {
+        await refreshCandidateInvoices(result.payment);
+      } catch {
+        setError(
+          "The payment was reversed, but the AP ageing candidates could not be refreshed. Use Refresh to reload them.",
+        );
+      }
+    }
+  } catch (actionError) {
+    setError(
+      actionError instanceof Error
+        ? actionError.message
+        : "The payment action could not be completed.",
+    );
+  } finally {
+    setProcessingAction(false);
+  }
+}
+  // Retrieve the payment and its vendor's outstanding AP invoices.
+  useEffect(() => {
+    if (!organizationId || !paymentId) return;
+    const controller = new AbortController();
+    let active = true;
+    async function loadData() {
+      try {
+        const paymentData = await fetchVendorPayment(
+          organizationId,
+          paymentId,
+          controller.signal,
+        );
+        const ageingData = await fetchAPAgeingReport(
+          organizationId,
+          {
+            currency: paymentData.currency,
+          },
+        );
+        if (!active) return;
+        const currencyReport = ageingData.currencies.find(
+          (item) => item.currency === paymentData.currency,
+        );
+        const vendorReport = currencyReport?.vendors.find(
+          (vendor) => vendor.vendor_id === paymentData.vendor_id,
+        );
+        setPayment(paymentData);
+        setCandidateInvoices(vendorReport?.invoices ?? []);
+      } catch (loadError) {
+        if (!active || controller.signal.aborted) return;
+        setError(
+          loadError instanceof Error
+            ? loadError.message
+            : "Unable to load vendor payment details.",
+        );
+      } finally {
+        if (active) setLoading(false);
+      }
+    }
+    loadData();
+    return () => {
+      active = false;
+      controller.abort();
+    };
+  }, [organizationId, paymentId, refreshKey]);
+  const allocations = useMemo(
+    () => payment?.allocations ?? [],
+    [payment?.allocations],
+    );
+  const totalAllocated = useMemo(
+    () => sumAmounts(allocations.map((item) => item.amount)),
+    [allocations],
+  );
+  const paymentAmount = payment
+    ? toMinorUnits(payment.amount)
+    : "0";
+  const remainingAmount = subtractMinorUnits(
+    paymentAmount,
+    totalAllocated,
+  );
+  const isFullyAllocated =
+    paymentAmount !== "0" &&
+    compareMinorUnits(totalAllocated, paymentAmount) === 0;
+  const selectedInvoice = candidateInvoices.find(
+    (invoice) => invoice.invoice_id === selectedInvoiceId,
+  );
+  const existingAllocation = allocations.find(
+    (item) => item.invoice_id === selectedInvoiceId,
+  );
+  const existingAllocationAmount = existingAllocation
+    ? toMinorUnits(existingAllocation.amount)
+    : "0";
+  const availablePaymentAmount = addMinorUnits(
+    remainingAmount.startsWith("-") ? "0" : remainingAmount,
+    existingAllocationAmount,
+  );
+  const allocationIsEditable =
+    payment?.status === "draft" && canManageAllocations;
+  const currentReference =
+    payment?.reference ||
+    payment?.journal_reference ||
+    payment?.id.slice(0, 8) ||
+    "";
+  function handleInvoiceSelection(invoiceId: string) {
+    setSelectedInvoiceId(invoiceId);
+    setError("");
+    setAllocationError("");
+    setAllocationAmount("");
+    const existing = allocations.find(
+      (item) => item.invoice_id === invoiceId,
+    );
+    if (existing) {
+      setAllocationAmount(existing.amount);
     }
   }
-
-  loadData();
-
-  return () => {
-    active = false;
-    controller.abort();
-  };
-}, [organizationId, refreshKey]);
-
-  const filteredPayments = useMemo(() => {
-    const query = searchInput.trim().toLowerCase();
-
-    return payments.filter((payment) => {
-      const matchesStatus =
-        statusFilter === "all" ||
-        payment.status === statusFilter;
-
-      const searchableValues = [
-        getPaymentReference(payment),
-        payment.vendor.legal_name,
-        payment.vendor.display_name ?? "",
-        payment.vendor.vendor_code ?? "",
-        payment.payment_account.name,
-        payment.payment_account.code,
-      ];
-
-      const matchesSearch =
-        !query ||
-        searchableValues.some((value) =>
-          value.toLowerCase().includes(query),
-        );
-
-      return matchesStatus && matchesSearch;
-    });
-  }, [payments, searchInput, statusFilter]);
-
-  const draftCount = payments.filter(
-    (payment) => payment.status === "draft",
-  ).length;
-
-  const postedCount = payments.filter(
-    (payment) => payment.status === "posted",
-  ).length;
-
-  const reversedCount = payments.filter(
-    (payment) => payment.status === "reversed",
-  ).length;
-
-  function resetCreateForm() {
-    setVendorId("");
-    setPaymentAccountId("");
-    setAmount("");
-    setCurrency("NGN");
-    setPaymentDate(getLocalDateValue());
-    setReference("");
-    setDescription("");
-  }
-
-  async function handleCreatePayment(
+  async function handleSaveAllocation(
     event: FormEvent<HTMLFormElement>,
   ) {
     event.preventDefault();
-
-    if (!organizationId) {
-      setError("Select an organisation before creating a payment.");
+    if (!payment || !selectedInvoice) return;
+    const amountValue = allocationAmount.trim();
+    if (!/^\d+(\.\d{1,2})?$/.test(amountValue)) {
+      setAllocationError(
+        "Enter a valid amount with no more than two decimal places.",
+      );
       return;
     }
-
-    setSaving(true);
+    const requestedAmount = toMinorUnits(amountValue);
+    const invoiceOutstanding = toMinorUnits(
+      selectedInvoice.outstanding_amount,
+    );
+    if (requestedAmount === "0") {
+      setAllocationError(
+        "Allocation amount must be greater than zero.",
+      );
+      return;
+    }
+    if (
+      compareMinorUnits(
+        requestedAmount,
+        availablePaymentAmount,
+      ) > 0
+    ) {
+      setAllocationError(
+        "The allocation exceeds the remaining available payment amount.",
+      );
+      return;
+    }
+    if (
+      compareMinorUnits(
+        requestedAmount,
+        invoiceOutstanding,
+      ) > 0
+    ) {
+      setAllocationError(
+        "The allocation exceeds the invoice's reported outstanding AP balance.",
+      );
+      return;
+    }
+    setSavingAllocation(true);
     setError("");
+    setAllocationError("");
     setSuccessMessage("");
-
     try {
-      const createdPayment = await createVendorPayment(
+      const result = await allocateInvoiceToVendorPayment(
         organizationId,
+        payment.id,
         {
-          vendor_id: vendorId,
-          payment_account_id: paymentAccountId,
-          amount: amount.trim(),
-          currency: currency.trim().toUpperCase(),
-          payment_date: paymentDate,
-          reference: reference.trim(),
-          description: description.trim(),
+          invoice_id: selectedInvoice.invoice_id,
+          amount: amountValue,
         },
       );
-
-      setPayments((current) => [
-        createdPayment,
-        ...current,
-      ]);
-
-      setShowCreateDialog(false);
-      resetCreateForm();
-
+      setPayment((current) => {
+        if (!current) return current;
+        const updatedAllocations = [
+          ...current.allocations.filter(
+            (item) => item.invoice_id !== result.invoice_id,
+          ),
+          result,
+        ].sort((a, b) =>
+          a.invoice_number.localeCompare(b.invoice_number),
+        );
+        return {
+          ...current,
+          allocations: updatedAllocations,
+        };
+      });
+      setSelectedInvoiceId("");
+      setAllocationAmount("");
       setSuccessMessage(
-        `Draft payment ${getPaymentReference(createdPayment)} was created successfully.`,
+        existingAllocation
+          ? `Allocation for ${result.invoice_number} was updated.`
+          : `Invoice ${result.invoice_number} was allocated successfully.`,
       );
-    } catch (createError) {
-      setError(
-        createError instanceof Error
-          ? createError.message
-          : "Unable to create the vendor payment.",
+    } catch (saveError) {
+      setAllocationError(
+        saveError instanceof Error
+          ? saveError.message
+          : "Unable to save the invoice allocation.",
       );
     } finally {
-      setSaving(false);
+      setSavingAllocation(false);
     }
   }
-
+  async function handleRemoveAllocation(
+    invoiceId: string,
+    invoiceNumber: string,
+  ) {
+    if (!payment) return;
+    if (
+      !window.confirm(
+        `Remove the allocation for invoice ${invoiceNumber}?`,
+      )
+    ) {
+      return;
+    }
+    setRemovingInvoiceId(invoiceId);
+    setError("");
+    setSuccessMessage("");
+    try {
+      await removeVendorPaymentAllocation(
+        organizationId,
+        payment.id,
+        invoiceId,
+      );
+      setPayment((current) =>
+        current
+          ? {
+              ...current,
+              allocations: current.allocations.filter(
+                (item) => item.invoice_id !== invoiceId,
+              ),
+            }
+          : current,
+      );
+      if (selectedInvoiceId === invoiceId) {
+        setSelectedInvoiceId("");
+        setAllocationAmount("");
+      }
+      setSuccessMessage(
+        `Allocation for ${invoiceNumber} was removed.`,
+      );
+    } catch (removeError) {
+      setError(
+        removeError instanceof Error
+          ? removeError.message
+          : "Unable to remove the invoice allocation.",
+      );
+    } finally {
+      setRemovingInvoiceId("");
+    }
+  }
   function changeOrganization(value: string) {
     setSelectedOrganizationId(value);
+    setPayment(null);
+    setCandidateInvoices([]);
     setLoading(true);
-    setSearchInput("");
-    setStatusFilter("all");
-    setSuccessMessage("");
-    setError("");
-    }
-
-  function openCreateDialog() {
     setError("");
     setSuccessMessage("");
-    resetCreateForm();
-    setShowCreateDialog(true);
+    setSelectedInvoiceId("");
+    setAllocationAmount("");
   }
-
+  function refreshPayment() {
+    setLoading(true);
+    setError("");
+    setSuccessMessage("");
+    setRefreshKey((current) => current + 1);
+  }
   return (
     <ProtectedRoute>
       <main className="min-h-screen bg-[#f5f7fb] text-slate-900">
@@ -359,39 +545,36 @@ function VendorPaymentsWorkspace() {
           <div className="mx-auto flex w-full max-w-[1600px] flex-wrap items-center justify-between gap-4 px-4 py-5 sm:px-6 xl:px-8">
             <div className="flex items-center gap-3">
               <Link
-                href="/accounting"
+                href="/accounting/vendor-payments"
                 className="flex h-10 w-10 items-center justify-center rounded-lg border border-slate-200 text-slate-600 transition hover:bg-slate-50"
-                aria-label="Back to accounting"
+                aria-label="Back to vendor payments"
               >
                 <ArrowLeft size={18} />
               </Link>
-
               <div>
                 <p className="text-xs font-medium uppercase tracking-wide text-slate-400">
-                  Accounting / Payables
+                  Accounting / Payables / Vendor Payments
                 </p>
                 <h1 className="mt-0.5 text-xl font-bold tracking-tight text-slate-900 sm:text-2xl">
-                  Vendor Payments
+                  Payment details
                 </h1>
               </div>
             </div>
-
             {organizations.length > 0 && (
               <div className="min-w-[220px]">
                 <label
-                  htmlFor="payment-organization"
+                  htmlFor="detail-organization"
                   className="mb-1.5 block text-xs font-semibold text-slate-500"
                 >
                   Organisation
                 </label>
-
                 <select
-                  id="payment-organization"
+                  id="detail-organization"
                   value={organizationId}
                   onChange={(event) =>
                     changeOrganization(event.target.value)
                   }
-                  className="h-10 w-full rounded-lg border border-slate-200 bg-white px-3 text-sm text-slate-700 outline-none focus:border-blue-500"
+                  className="h-10 w-full rounded-lg border border-slate-200 bg-white px-3 text-sm outline-none focus:border-blue-500"
                 >
                   {organizations.map((organization) => (
                     <option
@@ -406,26 +589,18 @@ function VendorPaymentsWorkspace() {
             )}
           </div>
         </header>
-
         <div className="mx-auto w-full max-w-[1600px] p-4 sm:p-6 xl:p-8">
           {organizations.length === 0 ? (
-            <div className="rounded-xl border border-amber-200 bg-amber-50 p-6">
-              <h2 className="font-semibold text-amber-900">
-                No active organisation
-              </h2>
-              <p className="mt-2 text-sm text-amber-800">
-                Your account does not currently have an active
-                organisation membership.
-              </p>
+            <div className="rounded-xl border border-amber-200 bg-amber-50 p-6 text-sm text-amber-800">
+              Your account does not currently have an active organisation membership.
             </div>
           ) : (
             <>
-              <section className="mb-6 flex flex-wrap items-center justify-between gap-4 rounded-xl border border-slate-200 bg-white px-5 py-4">
+              <section className="mb-6 flex flex-wrap items-center justify-between gap-3 rounded-xl border border-slate-200 bg-white p-5">
                 <div className="flex items-center gap-3">
                   <div className="flex h-10 w-10 items-center justify-center rounded-xl bg-blue-50 text-blue-700">
                     <Wallet size={19} />
                   </div>
-
                   <div>
                     <p className="text-sm font-semibold text-slate-800">
                       {activeOrganization?.name}
@@ -435,39 +610,63 @@ function VendorPaymentsWorkspace() {
                     </p>
                   </div>
                 </div>
-
                 <div className="flex flex-wrap items-center gap-2">
-                  <button
+                {canPostOrReverse && payment?.status === "draft" && (
+                    <button
                     type="button"
                     onClick={() => {
-                    setLoading(true);
-                    setError("");
-                    setSuccessMessage("");
-                    setRefreshKey((current) => current + 1);
+                        setError("");
+                        setConfirmationAction("post");
                     }}
-                    disabled={loading}
-                    className="inline-flex h-10 items-center gap-2 rounded-lg border border-slate-200 bg-white px-3 text-sm font-medium text-slate-700 transition hover:bg-slate-50 disabled:opacity-50"
-                  >
+                    disabled={!isFullyAllocated || processingAction}
+                    title={
+                        isFullyAllocated
+                        ? "Post this fully allocated payment"
+                        : "Allocate the entire payment before posting"
+                    }
+                    className="inline-flex h-10 items-center gap-2 rounded-lg bg-emerald-600 px-4 text-sm font-semibold text-white transition hover:bg-emerald-700 disabled:cursor-not-allowed disabled:opacity-50"
+                    >
+                    <CheckCircle2 size={16} />
+                    Post payment
+                    </button>
+                )}
+                {canPostOrReverse && payment?.status === "posted" && (
+                    <button
+                    type="button"
+                    onClick={() => {
+                        setError("");
+                        setReversalReason("");
+                        setConfirmationAction("reverse");
+                    }}
+                    disabled={processingAction}
+                    className="inline-flex h-10 items-center gap-2 rounded-lg border border-rose-200 bg-white px-4 text-sm font-semibold text-rose-700 transition hover:bg-rose-50 disabled:opacity-50"
+                    >
+                    <CircleAlert size={16} />
+                    Reverse payment
+                    </button>
+                )}
+                <button
+                    type="button"
+                    onClick={refreshPayment}
+                    disabled={loading || processingAction}
+                    className="inline-flex h-10 items-center gap-2 rounded-lg border border-slate-200 px-3 text-sm font-medium text-slate-700 hover:bg-slate-50 disabled:opacity-50"
+                >
                     <RefreshCw
-                      size={16}
-                      className={loading ? "animate-spin" : ""}
+                    size={16}
+                    className={loading ? "animate-spin" : ""}
                     />
                     Refresh
-                  </button>
-
-                  {canCreatePayment && (
-                    <button
-                      type="button"
-                      onClick={openCreateDialog}
-                      className="inline-flex h-10 items-center gap-2 rounded-lg bg-blue-600 px-4 text-sm font-semibold text-white transition hover:bg-blue-700"
-                    >
-                      <Plus size={17} />
-                      Create payment
-                    </button>
-                  )}
+                </button>
                 </div>
+                {canPostOrReverse &&
+                payment?.status === "draft" &&
+                !isFullyAllocated && (
+                    <p className="mt-3 text-xs text-amber-700">
+                    Posting is unavailable until the total invoice allocations
+                    equal the payment amount exactly.
+                    </p>
+                )}
               </section>
-
               {error && (
                 <div
                   role="alert"
@@ -477,7 +676,6 @@ function VendorPaymentsWorkspace() {
                   <p>{error}</p>
                 </div>
               )}
-
               {successMessage && (
                 <div
                   role="status"
@@ -487,479 +685,579 @@ function VendorPaymentsWorkspace() {
                   {successMessage}
                 </div>
               )}
-
-              <section className="mb-6 grid gap-4 sm:grid-cols-2 xl:grid-cols-4">
-                {[
-                  {
-                    label: "All payments",
-                    value: payments.length,
-                    description: "Payments in this organisation",
-                  },
-                  {
-                    label: "Draft",
-                    value: draftCount,
-                    description: "Awaiting allocation and posting",
-                  },
-                  {
-                    label: "Posted",
-                    value: postedCount,
-                    description: "Successfully posted payments",
-                  },
-                  {
-                    label: "Reversed",
-                    value: reversedCount,
-                    description: "Payments with posted reversals",
-                  },
-                ].map((item) => (
-                  <div
-                    key={item.label}
-                    className="rounded-xl border border-slate-200 bg-white p-5 shadow-sm"
-                  >
-                    <p className="text-xs font-medium text-slate-500">
-                      {item.label}
-                    </p>
-                    <p className="mt-2 text-2xl font-bold tracking-tight text-slate-900">
-                      {loading ? "—" : item.value}
-                    </p>
-                    <p className="mt-1 text-xs text-slate-400">
-                      {item.description}
-                    </p>
-                  </div>
-                ))}
-              </section>
-
-              <section className="overflow-hidden rounded-xl border border-slate-200 bg-white shadow-sm">
-                <div className="flex flex-wrap items-center justify-between gap-4 border-b border-slate-100 px-5 py-5">
-                  <div>
-                    <h2 className="font-semibold text-slate-900">
-                      Payment register
-                    </h2>
-                    <p className="mt-1 text-xs text-slate-400">
-                      View and manage payments made to registered vendors.
-                    </p>
-                  </div>
-
-                  <div className="flex w-full flex-wrap gap-2 sm:w-auto">
-                    <div className="relative min-w-[200px] flex-1 sm:flex-none">
-                      <Search
-                        size={16}
-                        className="absolute left-3 top-1/2 -translate-y-1/2 text-slate-400"
-                      />
-                      <input
-                        type="search"
-                        value={searchInput}
-                        onChange={(event) =>
-                          setSearchInput(event.target.value)
-                        }
-                        placeholder="Search payments..."
-                        aria-label="Search payments"
-                        className="h-10 w-full rounded-lg border border-slate-200 bg-white pl-9 pr-3 text-sm outline-none focus:border-blue-500 sm:w-60"
+              {loading ? (
+                <div className="rounded-xl border border-slate-200 bg-white py-20 text-center">
+                  <LoaderCircle
+                    size={24}
+                    className="mx-auto animate-spin text-blue-600"
+                  />
+                  <p className="mt-3 text-sm text-slate-500">
+                    Loading payment details...
+                  </p>
+                </div>
+              ) : payment ? (
+                <>
+                  <section className="mb-6 grid gap-4 md:grid-cols-2 xl:grid-cols-4">
+                    <div className="rounded-xl border border-slate-200 bg-white p-5">
+                      <p className="text-xs font-medium text-slate-500">
+                        Payment reference
+                      </p>
+                      <p className="mt-2 break-all font-semibold text-slate-900">
+                        {currentReference}
+                      </p>
+                    </div>
+                    <div className="rounded-xl border border-slate-200 bg-white p-5">
+                      <p className="text-xs font-medium text-slate-500">
+                        Vendor
+                      </p>
+                      <p className="mt-2 font-semibold text-slate-900">
+                        {payment.vendor.display_name ||
+                          payment.vendor.legal_name}
+                      </p>
+                      <p className="mt-1 text-xs text-slate-400">
+                        {payment.vendor.vendor_code || "No vendor code"}
+                      </p>
+                    </div>
+                    <div className="rounded-xl border border-slate-200 bg-white p-5">
+                      <p className="text-xs font-medium text-slate-500">
+                        Payment amount
+                      </p>
+                      <p className="mt-2 font-semibold text-slate-900">
+                        {formatAmount(payment.amount, payment.currency)}
+                      </p>
+                      <p className="mt-1 text-xs text-slate-400">
+                        {formatDate(payment.payment_date)}
+                      </p>
+                    </div>
+                    <div className="rounded-xl border border-slate-200 bg-white p-5">
+                      <p className="text-xs font-medium text-slate-500">
+                        Payment status
+                      </p>
+                      <span
+                        className={`mt-2 inline-flex rounded-full px-3 py-1 text-xs font-semibold ${statusStyles[payment.status]}`}
+                      >
+                        {statusLabels[payment.status]}
+                      </span>
+                      <p className="mt-1 text-xs text-slate-400">
+                        Journal: {payment.journal_status || "Unavailable"}
+                      </p>
+                    </div>
+                  </section>
+                  {reversalJournal && (
+                    <section className="mb-6 rounded-xl border border-rose-200 bg-rose-50 p-5">
+                        <h2 className="font-semibold text-rose-900">
+                        Reversal journal created
+                        </h2>
+                        <div className="mt-3 grid gap-3 sm:grid-cols-3">
+                        <div>
+                            <p className="text-xs text-rose-700">Journal reference</p>
+                            <p className="mt-1 text-sm font-semibold text-rose-950">
+                            {reversalJournal.reference}
+                            </p>
+                        </div>
+                        <div>
+                            <p className="text-xs text-rose-700">Journal status</p>
+                            <p className="mt-1 text-sm font-semibold text-rose-950">
+                            {reversalJournal.status}
+                            </p>
+                        </div>
+                        <div>
+                            <p className="text-xs text-rose-700">Entry date</p>
+                            <p className="mt-1 text-sm font-semibold text-rose-950">
+                            {formatDate(reversalJournal.entry_date)}
+                            </p>
+                        </div>
+                        </div>
+                    </section>
+                    )}
+                  <section className="mb-6 rounded-xl border border-slate-200 bg-white p-5">
+                    <div className="grid gap-5 sm:grid-cols-3">
+                      <div>
+                        <p className="text-xs font-medium text-slate-500">
+                          Total payment
+                        </p>
+                        <p className="mt-2 text-xl font-bold text-slate-900">
+                          {formatAmount(payment.amount, payment.currency)}
+                        </p>
+                      </div>
+                      <div>
+                        <p className="text-xs font-medium text-slate-500">
+                          Total allocated
+                        </p>
+                        <p className="mt-2 text-xl font-bold text-slate-900">
+                          {formatAmount(
+                            minorUnitsToDecimal(totalAllocated),
+                            payment.currency,
+                          )}
+                        </p>
+                      </div>
+                      <div>
+                        <p className="text-xs font-medium text-slate-500">
+                          Unallocated amount
+                        </p>
+                        <p className="mt-2 text-xl font-bold text-blue-700">
+                          {formatAmount(
+                            minorUnitsToDecimal(remainingAmount),
+                            payment.currency,
+                          )}
+                        </p>
+                      </div>
+                    </div>
+                    <div className="mt-5 h-2 overflow-hidden rounded-full bg-slate-100">
+                      <div
+                        className="h-full rounded-full bg-blue-600 transition-all"
+                        style={{
+                          width: `${Math.min(
+                            100,
+                            paymentAmount === "0"
+                              ? 0
+                              : (Number(totalAllocated) /
+                                  Number(paymentAmount)) *
+                                  100,
+                          )}%`,
+                        }}
                       />
                     </div>
-
-                    <select
-                      value={statusFilter}
-                      onChange={(event) =>
-                        setStatusFilter(
-                          event.target.value as PaymentStatusFilter,
-                        )
-                      }
-                      aria-label="Filter by payment status"
-                      className="h-10 rounded-lg border border-slate-200 bg-white px-3 text-sm text-slate-700 outline-none focus:border-blue-500"
-                    >
-                      <option value="all">All statuses</option>
-                      <option value="draft">Draft</option>
-                      <option value="posted">Posted</option>
-                      <option value="reversed">Reversed</option>
-                    </select>
-                  </div>
-                </div>
-
-                <div className="overflow-x-auto">
-                  <table className="w-full min-w-[900px] text-left text-sm">
-                    <thead className="bg-slate-50 text-xs uppercase tracking-wide text-slate-500">
-                      <tr>
-                        <th className="px-5 py-3.5 font-semibold">
-                          Payment
-                        </th>
-                        <th className="px-5 py-3.5 font-semibold">
-                          Vendor
-                        </th>
-                        <th className="px-5 py-3.5 font-semibold">
-                          Payment account
-                        </th>
-                        <th className="px-5 py-3.5 font-semibold">
-                          Amount
-                        </th>
-                        <th className="px-5 py-3.5 font-semibold">
-                          Allocations
-                        </th>
-                        <th className="px-5 py-3.5 font-semibold">
-                          Status
-                        </th>
-                      </tr>
-                    </thead>
-
-                    <tbody className="divide-y divide-slate-100">
-                      {loading ? (
-                        <tr>
-                          <td colSpan={6} className="px-5 py-16 text-center">
-                            <LoaderCircle
-                              size={22}
-                              className="mx-auto animate-spin text-blue-600"
-                            />
-                            <p className="mt-3 text-sm text-slate-500">
-                              Loading vendor payments...
-                            </p>
-                          </td>
-                        </tr>
-                      ) : filteredPayments.length === 0 ? (
-                        <tr>
-                          <td colSpan={6} className="px-5 py-16 text-center">
-                            <div className="mx-auto flex h-12 w-12 items-center justify-center rounded-xl bg-slate-100 text-slate-400">
-                              <FileText size={22} />
-                            </div>
-                            <p className="mt-3 font-medium text-slate-700">
-                              {payments.length === 0
-                                ? "No vendor payments yet"
-                                : "No matching payments"}
-                            </p>
-                            <p className="mt-1 text-xs text-slate-400">
-                              {payments.length === 0
-                                ? "Create a draft payment to get started."
-                                : "Try changing your search or status filter."}
-                            </p>
-                          </td>
-                        </tr>
-                      ) : (
-                        filteredPayments.map((payment) => (
-                          <tr
-                            key={payment.id}
-                            className="transition hover:bg-slate-50/70"
-                          >
-                            <td className="px-5 py-4">
-                              <Link
-                                href={`/accounting/vendor-payments/${payment.id}`}
-                                className="font-semibold text-blue-700 hover:text-blue-900 hover:underline"
-                                >
-                                {getPaymentReference(payment)}
-                                </Link>
-                              <p className="mt-1 flex items-center gap-1.5 text-xs text-slate-400">
-                                <CalendarDays size={13} />
-                                {formatDate(payment.payment_date)}
-                              </p>
-                            </td>
-
-                            <td className="px-5 py-4">
-                              <p className="font-medium text-slate-800">
-                                {getVendorName(payment.vendor)}
-                              </p>
-                              <p className="mt-1 text-xs text-slate-400">
-                                {payment.vendor.vendor_code || "No vendor code"}
-                              </p>
-                            </td>
-
-                            <td className="px-5 py-4">
-                              <p className="font-medium text-slate-700">
-                                {payment.payment_account.name}
-                              </p>
-                              <p className="mt-1 text-xs text-slate-400">
-                                {payment.payment_account.code}
-                              </p>
-                            </td>
-
-                            <td className="px-5 py-4 font-semibold tabular-nums text-slate-900">
-                              {formatAmount(
-                                payment.amount,
-                                payment.currency,
-                              )}
-                            </td>
-
-                            <td className="px-5 py-4 text-slate-600">
-                              {payment.allocations.length}
-                              {payment.allocations.length === 1
-                                ? " invoice"
-                                : " invoices"}
-                            </td>
-
-                            <td className="px-5 py-4">
-                              <PaymentStatusBadge
-                                status={payment.status}
-                              />
-                            </td>
+                  </section>
+                  <section className="mb-6 overflow-hidden rounded-xl border border-slate-200 bg-white">
+                    <div className="border-b border-slate-100 px-5 py-5">
+                      <h2 className="font-semibold text-slate-900">
+                        Invoice allocations
+                      </h2>
+                      <p className="mt-1 text-xs text-slate-400">
+                        Invoices currently assigned to this vendor payment.
+                      </p>
+                    </div>
+                    <div className="overflow-x-auto">
+                      <table className="w-full min-w-[600px] text-left text-sm">
+                        <thead className="bg-slate-50 text-xs uppercase tracking-wide text-slate-500">
+                          <tr>
+                            <th className="px-5 py-3 font-semibold">
+                              Invoice
+                            </th>
+                            <th className="px-5 py-3 font-semibold">
+                              Allocation date
+                            </th>
+                            <th className="px-5 py-3 font-semibold">
+                              Allocated amount
+                            </th>
+                            <th className="px-5 py-3 font-semibold">
+                              Actions
+                            </th>
                           </tr>
-                        ))
+                        </thead>
+                        <tbody className="divide-y divide-slate-100">
+                          {allocations.length === 0 ? (
+                            <tr>
+                              <td
+                                colSpan={4}
+                                className="px-5 py-12 text-center"
+                              >
+                                <FileText
+                                  size={22}
+                                  className="mx-auto text-slate-300"
+                                />
+                                <p className="mt-3 font-medium text-slate-700">
+                                  No invoice allocations
+                                </p>
+                                <p className="mt-1 text-xs text-slate-400">
+                                  This payment has not been assigned to any invoices.
+                                </p>
+                              </td>
+                            </tr>
+                          ) : (
+                            allocations.map((allocation) => (
+                              <tr key={allocation.id}>
+                                <td className="px-5 py-4 font-medium text-slate-800">
+                                  {allocation.invoice_number}
+                                </td>
+                                <td className="px-5 py-4 text-slate-500">
+                                  {formatDate(
+                                    allocation.created_at,
+                                  )}
+                                </td>
+                                <td className="px-5 py-4 font-semibold tabular-nums text-slate-900">
+                                  {formatAmount(
+                                    allocation.amount,
+                                    payment.currency,
+                                  )}
+                                </td>
+                                <td className="px-5 py-4">
+                                  {allocationIsEditable && (
+                                    <div className="flex items-center gap-2">
+                                      <button
+                                        type="button"
+                                        onClick={() =>
+                                          handleInvoiceSelection(
+                                            allocation.invoice_id,
+                                          )
+                                        }
+                                        className="text-xs font-semibold text-blue-700 hover:underline"
+                                      >
+                                        Edit
+                                      </button>
+                                      <button
+                                        type="button"
+                                        onClick={() =>
+                                          handleRemoveAllocation(
+                                            allocation.invoice_id,
+                                            allocation.invoice_number,
+                                          )
+                                        }
+                                        disabled={
+                                          removingInvoiceId ===
+                                          allocation.invoice_id
+                                        }
+                                        aria-label={`Remove allocation for ${allocation.invoice_number}`}
+                                        className="inline-flex items-center gap-1 text-xs font-semibold text-rose-600 hover:underline disabled:opacity-50"
+                                      >
+                                        {removingInvoiceId ===
+                                        allocation.invoice_id ? (
+                                          <LoaderCircle
+                                            size={13}
+                                            className="animate-spin"
+                                          />
+                                        ) : (
+                                          <Trash2 size={13} />
+                                        )}
+                                        Remove
+                                      </button>
+                                    </div>
+                                  )}
+                                </td>
+                              </tr>
+                            ))
+                          )}
+                        </tbody>
+                      </table>
+                    </div>
+                  </section>
+                  {allocationIsEditable && (
+                    <section className="rounded-xl border border-slate-200 bg-white p-5">
+                      <div className="mb-5">
+                        <h2 className="font-semibold text-slate-900">
+                          {existingAllocation
+                            ? "Update invoice allocation"
+                            : "Allocate an invoice"}
+                        </h2>
+                        <p className="mt-1 text-xs text-slate-400">
+                          Only outstanding invoices for this vendor and payment currency are shown.
+                        </p>
+                      </div>
+                      {allocationError && (
+                        <div
+                          role="alert"
+                          className="mb-4 flex items-start gap-2 rounded-lg border border-rose-200 bg-rose-50 p-3 text-sm text-rose-700"
+                        >
+                          <CircleAlert size={16} className="mt-0.5 shrink-0" />
+                          <p>{allocationError}</p>
+                        </div>
                       )}
-                    </tbody>
-                  </table>
-                </div>
-
-                <div className="flex flex-wrap items-center justify-between gap-2 border-t border-slate-100 px-5 py-4">
-                  <p className="text-xs text-slate-400">
-                    Showing {filteredPayments.length} of {payments.length} payments
+                      {candidateInvoices.length === 0 ? (
+                        <div className="rounded-lg border border-amber-200 bg-amber-50 p-4 text-sm text-amber-800">
+                          No outstanding invoices were found for this vendor in {payment.currency}.
+                        </div>
+                      ) : (
+                        <form
+                          onSubmit={handleSaveAllocation}
+                          className="grid gap-4 md:grid-cols-[2fr_1fr_auto]"
+                        >
+                          <div>
+                            <label
+                              htmlFor="allocation-invoice"
+                              className="mb-1.5 block text-sm font-medium text-slate-700"
+                            >
+                              Invoice
+                            </label>
+                            <select
+                              id="allocation-invoice"
+                              value={selectedInvoiceId}
+                              onChange={(event) =>
+                                handleInvoiceSelection(
+                                  event.target.value,
+                                )
+                              }
+                              required
+                              disabled={savingAllocation}
+                              className="h-11 w-full rounded-lg border border-slate-200 bg-white px-3 text-sm outline-none focus:border-blue-500"
+                            >
+                              <option value="">
+                                Select an outstanding invoice
+                              </option>
+                              {candidateInvoices.map((invoice) => {
+                                const isAllocated = allocations.some(
+                                  (allocation) =>
+                                    allocation.invoice_id ===
+                                    invoice.invoice_id,
+                                );
+                                return (
+                                  <option
+                                    key={invoice.invoice_id}
+                                    value={invoice.invoice_id}
+                                  >
+                                    {invoice.invoice_number}
+                                    {isAllocated ? " (Already allocated)" : ""}
+                                    {" — Outstanding: "}
+                                    {formatAmount(
+                                      invoice.outstanding_amount,
+                                      payment.currency,
+                                    )}
+                                  </option>
+                                );
+                              })}
+                            </select>
+                            {selectedInvoice && (
+                              <p className="mt-1.5 text-xs text-slate-500">
+                                Reported AP outstanding:{" "}
+                                {formatAmount(
+                                  selectedInvoice.outstanding_amount,
+                                  payment.currency,
+                                )}
+                              </p>
+                            )}
+                          </div>
+                          <div>
+                            <label
+                              htmlFor="allocation-amount"
+                              className="mb-1.5 block text-sm font-medium text-slate-700"
+                            >
+                              Allocation amount
+                            </label>
+                            <input
+                              id="allocation-amount"
+                              type="number"
+                              min="0.01"
+                              step="0.01"
+                              required
+                              value={allocationAmount}
+                              onChange={(event) => {
+                                setAllocationAmount(event.target.value);
+                                setAllocationError("");
+                              }}
+                              disabled={savingAllocation}
+                              placeholder="0.00"
+                              className="h-11 w-full rounded-lg border border-slate-200 px-3 text-sm outline-none focus:border-blue-500"
+                            />
+                          </div>
+                          <div className="flex items-end">
+                            <button
+                              type="submit"
+                              disabled={
+                                savingAllocation ||
+                                !selectedInvoiceId ||
+                                remainingAmount.startsWith("-") ||
+                                availablePaymentAmount === "0"
+                              }
+                              className="inline-flex h-11 w-full items-center justify-center gap-2 rounded-lg bg-blue-600 px-4 text-sm font-semibold text-white transition hover:bg-blue-700 disabled:cursor-not-allowed disabled:opacity-50 md:w-auto"
+                            >
+                              {savingAllocation && (
+                                <LoaderCircle
+                                  size={16}
+                                  className="animate-spin"
+                                />
+                              )}
+                              {savingAllocation
+                                ? "Saving..."
+                                : existingAllocation
+                                  ? "Update allocation"
+                                  : "Allocate invoice"}
+                            </button>
+                          </div>
+                        </form>
+                      )}
+                      <div className="mt-5 rounded-lg bg-slate-50 p-4 text-xs leading-relaxed text-slate-500">
+                        The AP ageing report supplies candidate invoices and their posted-basis outstanding balances. The accounting backend performs the authoritative checks for approval, posted journal status, currency, invoice balance and allocations reserved by other draft payments. Draft allocations do not reduce reported AP.
+                      </div>
+                    </section>
+                  )}
+                  {!allocationIsEditable && (
+                    <section className="rounded-xl border border-slate-200 bg-slate-50 p-5">
+                      <p className="text-sm font-medium text-slate-700">
+                        Allocations are read-only.
+                      </p>
+                      <p className="mt-1 text-xs text-slate-500">
+                        {payment.status !== "draft"
+                          ? "Only draft payments can have their allocations changed."
+                          : "Your organisation role does not permit allocation changes."}
+                      </p>
+                    </section>
+                  )}
+                </>
+              ) : (
+                <section className="rounded-xl border border-slate-200 bg-white p-10 text-center">
+                  <CircleAlert
+                    size={24}
+                    className="mx-auto text-slate-400"
+                  />
+                  <p className="mt-3 font-semibold text-slate-800">
+                    Payment unavailable
                   </p>
-                  <p className="text-xs text-slate-400">
-                    Payment records are restricted to the selected organisation.
+                  <p className="mt-1 text-sm text-slate-500">
+                    The payment could not be found or accessed in this organisation.
                   </p>
-                </div>
-              </section>
+                  <Link
+                    href="/accounting/vendor-payments"
+                    className="mt-4 inline-flex text-sm font-semibold text-blue-700 hover:underline"
+                  >
+                    Return to payment register
+                  </Link>
+                </section>
+              )}
             </>
           )}
         </div>
-
-        {showCreateDialog && (
-          <div className="fixed inset-0 z-50 flex items-center justify-center overflow-y-auto bg-slate-950/40 p-4">
-            <section
-              role="dialog"
-              aria-modal="true"
-              aria-labelledby="create-payment-title"
-              className="my-8 w-full max-w-2xl rounded-2xl bg-white shadow-xl"
-            >
-              <div className="flex items-start justify-between border-b border-slate-100 px-6 py-5">
-                <div>
-                  <h2
-                    id="create-payment-title"
-                    className="text-lg font-bold text-slate-900"
-                  >
-                    Create vendor payment
-                  </h2>
-                  <p className="mt-1 text-sm text-slate-500">
-                    Create a draft payment before allocating it to invoices.
-                  </p>
-                </div>
-
-                <button
-                  type="button"
-                  onClick={() => setShowCreateDialog(false)}
-                  disabled={saving}
-                  aria-label="Close dialog"
-                  className="rounded-lg p-2 text-slate-400 transition hover:bg-slate-100 hover:text-slate-700 disabled:opacity-50"
+        {confirmationAction && payment && (
+            <div className="fixed inset-0 z-50 flex items-center justify-center overflow-y-auto bg-slate-950/40 p-4">
+                <section
+                role="dialog"
+                aria-modal="true"
+                aria-labelledby="payment-action-title"
+                className="my-8 w-full max-w-lg rounded-2xl bg-white shadow-xl"
                 >
-                  <X size={19} />
-                </button>
-              </div>
-
-              <form onSubmit={handleCreatePayment}>
-                <div className="grid gap-5 px-6 py-6 sm:grid-cols-2">
-                  <div className="sm:col-span-2">
-                    <label
-                      htmlFor="payment-vendor"
-                      className="mb-1.5 block text-sm font-medium text-slate-700"
-                    >
-                      Vendor
-                    </label>
-                    <select
-                      id="payment-vendor"
-                      value={vendorId}
-                      onChange={(event) => setVendorId(event.target.value)}
-                      required
-                      disabled={saving || vendors.length === 0}
-                      className="h-11 w-full rounded-lg border border-slate-200 bg-white px-3 text-sm outline-none focus:border-blue-500 disabled:bg-slate-50"
-                    >
-                      <option value="">Select a vendor</option>
-                      {vendors.map((vendor) => (
-                        <option key={vendor.id} value={vendor.id}>
-                          {vendor.display_name || vendor.legal_name}
-                          {vendor.vendor_code
-                            ? ` (${vendor.vendor_code})`
-                            : ""}
-                        </option>
-                      ))}
-                    </select>
-                    {vendors.length === 0 && (
-                      <p className="mt-1.5 text-xs text-amber-700">
-                        No vendors are available for this organisation.
-                      </p>
+                <form onSubmit={handleConfirmPaymentAction}>
+                    <div className="border-b border-slate-100 px-6 py-5">
+                    <div className="flex items-center gap-3">
+                        <div
+                        className={`flex h-10 w-10 items-center justify-center rounded-xl ${
+                            confirmationAction === "post"
+                            ? "bg-emerald-50 text-emerald-700"
+                            : "bg-rose-50 text-rose-700"
+                        }`}
+                        >
+                        {confirmationAction === "post" ? (
+                            <CheckCircle2 size={20} />
+                        ) : (
+                            <CircleAlert size={20} />
+                        )}
+                        </div>
+                        <div>
+                        <h2
+                            id="payment-action-title"
+                            className="font-bold text-slate-900"
+                        >
+                            {confirmationAction === "post"
+                            ? "Confirm payment posting"
+                            : "Confirm payment reversal"}
+                        </h2>
+                        <p className="mt-1 text-xs text-slate-500">
+                            {currentReference}
+                        </p>
+                        </div>
+                    </div>
+                    </div>
+                    <div className="space-y-4 px-6 py-6">
+                    <div className="rounded-lg bg-slate-50 p-4">
+                        <div className="flex justify-between gap-3 text-sm">
+                        <span className="text-slate-500">Vendor</span>
+                        <span className="font-medium text-slate-800">
+                            {payment.vendor.display_name ||
+                            payment.vendor.legal_name}
+                        </span>
+                        </div>
+                        <div className="mt-3 flex justify-between gap-3 text-sm">
+                        <span className="text-slate-500">Payment amount</span>
+                        <span className="font-semibold text-slate-900">
+                            {formatAmount(payment.amount, payment.currency)}
+                        </span>
+                        </div>
+                        <div className="mt-3 flex justify-between gap-3 text-sm">
+                        <span className="text-slate-500">Allocated amount</span>
+                        <span className="font-semibold text-slate-900">
+                            {formatAmount(
+                            minorUnitsToDecimal(totalAllocated),
+                            payment.currency,
+                            )}
+                        </span>
+                        </div>
+                    </div>
+                    {confirmationAction === "post" ? (
+                        <p className="text-sm leading-relaxed text-slate-600">
+                        You are about to post this vendor payment. Its
+                        accounting journal will be posted and the allocated
+                        amount will reduce the vendor&apos;s outstanding
+                        Accounts Payable balance. This action cannot be
+                        edited after posting; a reversal will be required
+                        to undo it.
+                        </p>
+                    ) : (
+                        <>
+                        <p className="text-sm leading-relaxed text-slate-600">
+                            A reversal journal will be created for this
+                            posted payment. The original payment and its
+                            allocations will remain in the audit history.
+                        </p>
+                        <div>
+                            <label
+                            htmlFor="payment-reversal-reason"
+                            className="mb-1.5 block text-sm font-medium text-slate-700"
+                            >
+                            Reversal reason
+                            </label>
+                            <textarea
+                            id="payment-reversal-reason"
+                            rows={4}
+                            required
+                            value={reversalReason}
+                            onChange={(event) =>
+                                setReversalReason(event.target.value)
+                            }
+                            placeholder="Explain why this payment needs to be reversed..."
+                            disabled={processingAction}
+                            className="w-full resize-y rounded-lg border border-slate-200 px-3 py-2.5 text-sm outline-none focus:border-rose-500 disabled:bg-slate-50"
+                            />
+                        </div>
+                        </>
                     )}
-                  </div>
-
-                  <div className="sm:col-span-2">
-                    <label
-                      htmlFor="payment-account"
-                      className="mb-1.5 block text-sm font-medium text-slate-700"
+                    </div>
+                    <div className="flex flex-wrap justify-end gap-2 border-t border-slate-100 px-6 py-5">
+                    <button
+                        type="button"
+                        onClick={() => {
+                        setConfirmationAction(null);
+                        setReversalReason("");
+                        }}
+                        disabled={processingAction}
+                        className="h-10 rounded-lg border border-slate-200 px-4 text-sm font-medium text-slate-700 hover:bg-slate-50 disabled:opacity-50"
                     >
-                      Payment account
-                    </label>
-                    <select
-                      id="payment-account"
-                      value={paymentAccountId}
-                      onChange={(event) =>
-                        setPaymentAccountId(event.target.value)
-                      }
-                      required
-                      disabled={saving || accounts.length === 0}
-                      className="h-11 w-full rounded-lg border border-slate-200 bg-white px-3 text-sm outline-none focus:border-blue-500 disabled:bg-slate-50"
+                        Cancel
+                    </button>
+                    <button
+                        type="submit"
+                        disabled={
+                        processingAction ||
+                        (confirmationAction === "post" &&
+                            !isFullyAllocated) ||
+                        (confirmationAction === "reverse" &&
+                            !reversalReason.trim())
+                        }
+                        className={`inline-flex h-10 items-center gap-2 rounded-lg px-4 text-sm font-semibold text-white disabled:cursor-not-allowed disabled:opacity-50 ${
+                        confirmationAction === "post"
+                            ? "bg-emerald-600 hover:bg-emerald-700"
+                            : "bg-rose-600 hover:bg-rose-700"
+                        }`}
                     >
-                      <option value="">Select an asset account</option>
-                      {accounts.map((account) => (
-                        <option key={account.id} value={account.id}>
-                          {account.code} — {account.name}
-                        </option>
-                      ))}
-                    </select>
-                    {accounts.length === 0 && (
-                      <p className="mt-1.5 text-xs text-amber-700">
-                        No active asset accounts are available. Check the organisation chart of accounts.
-                      </p>
-                    )}
-                  </div>
-
-                  <div>
-                    <label
-                      htmlFor="payment-amount"
-                      className="mb-1.5 block text-sm font-medium text-slate-700"
-                    >
-                      Amount
-                    </label>
-                    <input
-                      id="payment-amount"
-                      type="number"
-                      min="0.01"
-                      step="0.01"
-                      required
-                      value={amount}
-                      onChange={(event) => setAmount(event.target.value)}
-                      placeholder="0.00"
-                      disabled={saving}
-                      className="h-11 w-full rounded-lg border border-slate-200 px-3 text-sm outline-none focus:border-blue-500"
-                    />
-                  </div>
-
-                  <div>
-                    <label
-                      htmlFor="payment-currency"
-                      className="mb-1.5 block text-sm font-medium text-slate-700"
-                    >
-                      Currency
-                    </label>
-                    <input
-                      id="payment-currency"
-                      type="text"
-                      minLength={3}
-                      maxLength={3}
-                      required
-                      value={currency}
-                      onChange={(event) =>
-                        setCurrency(
-                          event.target.value
-                            .replace(/[^a-zA-Z]/g, "")
-                            .toUpperCase()
-                            .slice(0, 3),
-                        )
-                      }
-                      placeholder="NGN"
-                      disabled={saving}
-                      className="h-11 w-full rounded-lg border border-slate-200 px-3 text-sm uppercase outline-none focus:border-blue-500"
-                    />
-                    <p className="mt-1 text-xs text-slate-400">
-                      Enter a three-letter currency code.
-                    </p>
-                  </div>
-
-                  <div>
-                    <label
-                      htmlFor="payment-date"
-                      className="mb-1.5 block text-sm font-medium text-slate-700"
-                    >
-                      Payment date
-                    </label>
-                    <input
-                      id="payment-date"
-                      type="date"
-                      required
-                      value={paymentDate}
-                      onChange={(event) =>
-                        setPaymentDate(event.target.value)
-                      }
-                      disabled={saving}
-                      className="h-11 w-full rounded-lg border border-slate-200 px-3 text-sm outline-none focus:border-blue-500"
-                    />
-                  </div>
-
-                  <div>
-                    <label
-                      htmlFor="payment-reference"
-                      className="mb-1.5 block text-sm font-medium text-slate-700"
-                    >
-                      Payment reference
-                    </label>
-                    <input
-                      id="payment-reference"
-                      type="text"
-                      maxLength={100}
-                      value={reference}
-                      onChange={(event) =>
-                        setReference(event.target.value)
-                      }
-                      placeholder="e.g. BANK-TRANSFER-001"
-                      disabled={saving}
-                      className="h-11 w-full rounded-lg border border-slate-200 px-3 text-sm outline-none focus:border-blue-500"
-                    />
-                  </div>
-
-                  <div className="sm:col-span-2">
-                    <label
-                      htmlFor="payment-description"
-                      className="mb-1.5 block text-sm font-medium text-slate-700"
-                    >
-                      Description
-                      <span className="ml-1 font-normal text-slate-400">
-                        (optional)
-                      </span>
-                    </label>
-                    <textarea
-                      id="payment-description"
-                      rows={3}
-                      maxLength={500}
-                      value={description}
-                      onChange={(event) =>
-                        setDescription(event.target.value)
-                      }
-                      placeholder="Add a short description for this payment..."
-                      disabled={saving}
-                      className="w-full resize-y rounded-lg border border-slate-200 px-3 py-2.5 text-sm outline-none focus:border-blue-500"
-                    />
-                  </div>
-                </div>
-
-                <div className="flex flex-wrap justify-end gap-2 border-t border-slate-100 px-6 py-5">
-                  <button
-                    type="button"
-                    onClick={() => setShowCreateDialog(false)}
-                    disabled={saving}
-                    className="h-10 rounded-lg border border-slate-200 px-4 text-sm font-medium text-slate-700 transition hover:bg-slate-50 disabled:opacity-50"
-                  >
-                    Cancel
-                  </button>
-
-                  <button
-                    type="submit"
-                    disabled={
-                      saving ||
-                      vendors.length === 0 ||
-                      accounts.length === 0
-                    }
-                    className="inline-flex h-10 items-center gap-2 rounded-lg bg-blue-600 px-4 text-sm font-semibold text-white transition hover:bg-blue-700 disabled:cursor-not-allowed disabled:opacity-50"
-                  >
-                    {saving && (
-                      <LoaderCircle size={16} className="animate-spin" />
-                    )}
-                    {saving ? "Creating..." : "Create draft payment"}
-                  </button>
-                </div>
-              </form>
-            </section>
-          </div>
-        )}
+                        {processingAction && (
+                        <LoaderCircle size={16} className="animate-spin" />
+                        )}
+                        {processingAction
+                        ? "Processing..."
+                        : confirmationAction === "post"
+                            ? "Confirm posting"
+                            : "Confirm reversal"}
+                    </button>
+                    </div>
+                </form>
+                </section>
+            </div>
+            )}
       </main>
     </ProtectedRoute>
   );
 }
-
-export default function VendorPaymentsPage() {
+export default function VendorPaymentDetailPage() {
   return (
     <ProtectedRoute>
-      <VendorPaymentsWorkspace />
+      <VendorPaymentDetailWorkspace />
     </ProtectedRoute>
   );
 }
