@@ -1321,7 +1321,7 @@ class AccountingAPITests(TestCase):
                 "payment_id": payment_id,
             },
         )
-    
+
     def test_read_only_member_can_list_accounts_and_journals(self):
         self.authenticate_as(self.readonly)
 
@@ -1382,7 +1382,7 @@ class AccountingAPITests(TestCase):
 
         self.assertEqual(response.status_code, 404)
 
-    
+
     def test_foreign_organization_journal_is_not_accessible(self):
         foreign_organization = Organization.objects.create(
             name="Foreign Accounting Company",
@@ -2476,7 +2476,7 @@ class AccountingAPITests(TestCase):
             ],
         )
 
-    
+
     def test_unauthenticated_user_cannot_list_vendor_payments(self):
         anonymous_client = APIClient()
 
@@ -2648,7 +2648,7 @@ class AccountingAPITests(TestCase):
                 ).exists(),
                 f"Missing audit event: {operation}",
             )
-        
+
     def test_allocation_cannot_exceed_payment_amount_through_api(self):
         self.post_invoice_journal_for_allocation()
 
@@ -2764,7 +2764,7 @@ class AccountingAPITests(TestCase):
             ).exists()
         )
 
-    
+
     def test_finance_operator_cannot_post_vendor_payment_through_api(self):
         payment_response = (
             self.create_fully_allocated_vendor_payment_via_api()
@@ -3208,7 +3208,7 @@ class AccountingAPITests(TestCase):
 
         self.assertEqual(restored_total, before_total)
 
-    
+
 
 class AccountingReportingAPITests(TestCase):
 
