@@ -235,6 +235,15 @@ class VendorPaymentCreateSerializer(serializers.Serializer):
 
         return value
 
+class VendorPaymentAllocationCreateSerializer(serializers.Serializer):
+    invoice_id = serializers.UUIDField()
+
+    amount = serializers.DecimalField(
+        max_digits=18,
+        decimal_places=2,
+        min_value=Decimal("0.01"),
+    )
+
 class JournalLineCorrectionSerializer(serializers.Serializer):
     account_id = serializers.UUIDField(
         required=False,

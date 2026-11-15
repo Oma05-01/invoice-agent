@@ -1222,6 +1222,9 @@ class AccountingAPITests(TestCase):
             legal_name="Accounting API Payment Vendor",
         )
 
+        self.invoice.vendor = self.vendor
+        self.invoice.save(update_fields=["vendor"])
+
         self.journals_url = reverse(
             "accounting-journal-list",
             kwargs={
@@ -1288,6 +1291,37 @@ class AccountingAPITests(TestCase):
         payload.update(overrides)
         return payload
 
+    def create_vendor_payment_via_api(self):
+        self.authenticate_as(self.operator)
+
+        response = self.client.post(
+            self.vendor_payments_url,
+            self.vendor_payment_payload(),
+            format="json",
+        )
+
+        self.assertEqual(response.status_code, 201)
+
+        return response
+
+
+    def post_invoice_journal_for_allocation(self):
+        post_journal_entry(
+            organization_id=self.organization.pk,
+            journal_entry_id=self.entry.pk,
+            actor=self.admin,
+        )
+
+
+    def payment_allocation_url(self, payment_id):
+        return reverse(
+            "accounting-vendor-payment-allocation-create",
+            kwargs={
+                "organization_id": self.organization.pk,
+                "payment_id": payment_id,
+            },
+        )
+    
     def test_read_only_member_can_list_accounts_and_journals(self):
         self.authenticate_as(self.readonly)
 
@@ -2172,6 +2206,202 @@ class AccountingAPITests(TestCase):
 
         self.assertEqual(after_total, before_total)
 
+    def test_finance_operator_can_allocate_invoice_to_payment(self):
+        self.post_invoice_journal_for_allocation()
+
+        payment_response = self.create_vendor_payment_via_api()
+        payment_id = payment_response.data["id"]
+
+        self.authenticate_as(self.operator)
+
+        response = self.client.post(
+            self.payment_allocation_url(payment_id),
+            {
+                "invoice_id": str(self.invoice.pk),
+                "amount": "100000.00",
+            },
+            format="json",
+        )
+
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual(response.data["amount"], "100000.00")
+        self.assertEqual(
+            response.data["invoice_number"],
+            self.invoice.invoice_number,
+        )
+
+        allocation = PaymentAllocation.objects.get(
+            payment_id=payment_id,
+            invoice=self.invoice,
+        )
+
+        self.assertEqual(allocation.amount, Decimal("100000.00"))
+
+        self.assertTrue(
+            JournalAuditEvent.objects.filter(
+                journal_entry_id=payment_response.data["journal_entry_id"],
+                operation="vendor_payment_allocation_created",
+            ).exists()
+        )
+
+    def test_vendor_payment_allocation_can_be_updated_through_api(self):
+        self.post_invoice_journal_for_allocation()
+
+        payment_response = self.create_vendor_payment_via_api()
+        payment_id = payment_response.data["id"]
+
+        url = self.payment_allocation_url(payment_id)
+
+        first_response = self.client.post(
+            url,
+            {
+                "invoice_id": str(self.invoice.pk),
+                "amount": "100000.00",
+            },
+            format="json",
+        )
+
+        self.assertEqual(first_response.status_code, 200)
+
+        second_response = self.client.post(
+            url,
+            {
+                "invoice_id": str(self.invoice.pk),
+                "amount": "75000.00",
+            },
+            format="json",
+        )
+
+        self.assertEqual(second_response.status_code, 200)
+
+        self.assertEqual(
+            second_response.data["amount"],
+            "75000.00",
+        )
+
+        self.assertEqual(
+            PaymentAllocation.objects.filter(
+                payment_id=payment_id,
+                invoice=self.invoice,
+            ).count(),
+            1,
+        )
+
+    def test_finance_operator_can_remove_payment_allocation(self):
+        self.post_invoice_journal_for_allocation()
+
+        payment_response = self.create_vendor_payment_via_api()
+        payment_id = payment_response.data["id"]
+
+        allocation_response = self.client.post(
+            self.payment_allocation_url(payment_id),
+            {
+                "invoice_id": str(self.invoice.pk),
+                "amount": "100000.00",
+            },
+            format="json",
+        )
+
+        self.assertEqual(allocation_response.status_code, 200)
+
+        remove_url = reverse(
+            "accounting-vendor-payment-allocation-remove",
+            kwargs={
+                "organization_id": self.organization.pk,
+                "payment_id": payment_id,
+                "invoice_id": self.invoice.pk,
+            },
+        )
+
+        response = self.client.delete(remove_url)
+
+        self.assertEqual(response.status_code, 204)
+
+        self.assertFalse(
+            PaymentAllocation.objects.filter(
+                payment_id=payment_id,
+                invoice=self.invoice,
+            ).exists()
+        )
+
+        self.assertTrue(
+            JournalAuditEvent.objects.filter(
+                journal_entry_id=payment_response.data["journal_entry_id"],
+                operation="vendor_payment_allocation_removed",
+            ).exists()
+        )
+
+    def test_read_only_member_cannot_allocate_vendor_payment(self):
+        self.post_invoice_journal_for_allocation()
+
+        payment_response = self.create_vendor_payment_via_api()
+
+        self.authenticate_as(self.readonly)
+
+        response = self.client.post(
+            self.payment_allocation_url(payment_response.data["id"]),
+            {
+                "invoice_id": str(self.invoice.pk),
+                "amount": "100000.00",
+            },
+            format="json",
+        )
+
+        self.assertEqual(response.status_code, 403)
+
+        self.assertEqual(PaymentAllocation.objects.count(), 0)
+
+    def test_invoice_without_posted_journal_cannot_be_allocated(self):
+        payment_response = self.create_vendor_payment_via_api()
+
+        response = self.client.post(
+            self.payment_allocation_url(payment_response.data["id"]),
+            {
+                "invoice_id": str(self.invoice.pk),
+                "amount": "100000.00",
+            },
+            format="json",
+        )
+
+        self.assertEqual(response.status_code, 400)
+
+        self.assertEqual(PaymentAllocation.objects.count(), 0)
+
+    def test_invoice_without_posted_journal_cannot_be_allocated(self):
+        payment_response = self.create_vendor_payment_via_api()
+
+        response = self.client.post(
+            self.payment_allocation_url(payment_response.data["id"]),
+            {
+                "invoice_id": str(self.invoice.pk),
+                "amount": "100000.00",
+            },
+            format="json",
+        )
+
+        self.assertEqual(response.status_code, 400)
+
+        self.assertEqual(PaymentAllocation.objects.count(), 0)
+
+    def test_allocation_cannot_exceed_payment_amount_through_api(self):
+        self.post_invoice_journal_for_allocation()
+
+        payment_response = self.create_vendor_payment_via_api()
+
+        response = self.client.post(
+            self.payment_allocation_url(payment_response.data["id"]),
+            {
+                "invoice_id": str(self.invoice.pk),
+                "amount": "150000.00",
+            },
+            format="json",
+        )
+
+        self.assertEqual(response.status_code, 400)
+
+        self.assertEqual(PaymentAllocation.objects.count(), 0)
+
+    
 
 class AccountingReportingAPITests(TestCase):
 

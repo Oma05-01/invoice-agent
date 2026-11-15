@@ -17,6 +17,7 @@ from accounting.views import (
     APAgeingReportAPIView,
     VendorPaymentListCreateAPIView,
     VendorPaymentDetailAPIView,
+    VendorPaymentAllocationAPIView,
 )
 
 
@@ -100,6 +101,16 @@ urlpatterns = [
         "organizations/<uuid:organization_id>/accounting/vendor-payments/<uuid:payment_id>/",
         VendorPaymentDetailAPIView.as_view(),
         name="accounting-vendor-payment-detail",
+    ),
+        path(
+        "organizations/<uuid:organization_id>/accounting/vendor-payments/<uuid:payment_id>/allocations/",
+        VendorPaymentAllocationAPIView.as_view(),
+        name="accounting-vendor-payment-allocation-create",
+    ),
+    path(
+        "organizations/<uuid:organization_id>/accounting/vendor-payments/<uuid:payment_id>/allocations/<uuid:invoice_id>/",
+        VendorPaymentAllocationAPIView.as_view(),
+        name="accounting-vendor-payment-allocation-remove",
     ),
 
 ]

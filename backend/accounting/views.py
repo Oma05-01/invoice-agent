@@ -31,6 +31,8 @@ from accounting.serializers import (
     APAgeingQuerySerializer,
     VendorPaymentCreateSerializer,
     VendorPaymentReadSerializer,
+    VendorPaymentAllocationCreateSerializer,
+    PaymentAllocationReadSerializer,
 )
 from accounting.services import (
     AccountingConfigurationError,
@@ -43,7 +45,9 @@ from accounting.services import (
     reverse_journal_entry,
     update_draft_journal_line,
     create_adjustment_journal,
-    update_draft_journal_entry_date
+    update_draft_journal_entry_date,
+    set_vendor_payment_allocation,
+    remove_vendor_payment_allocation,
 )
 
 from accounting.reporting import (
@@ -53,6 +57,8 @@ from accounting.reporting import (
     build_balance_sheet,
     build_ap_ageing_report
 )
+
+from invoices.models import Invoice
 
 from django.utils import timezone
 
@@ -206,6 +212,83 @@ class VendorPaymentDetailAPIView(
         serializer = VendorPaymentReadSerializer(payment)
 
         return Response(serializer.data)
+
+
+class VendorPaymentAllocationAPIView(
+    OrganizationAccountingAPIView
+):
+    def post(self, request, organization_id, payment_id):
+        self.get_membership(request, organization_id)
+
+        serializer = VendorPaymentAllocationCreateSerializer(
+            data=request.data,
+        )
+        serializer.is_valid(raise_exception=True)
+
+        try:
+            allocation = set_vendor_payment_allocation(
+                organization_id=organization_id,
+                payment_id=payment_id,
+                invoice_id=serializer.validated_data["invoice_id"],
+                amount=serializer.validated_data["amount"],
+                actor=request.user,
+            )
+
+            return Response(
+                PaymentAllocationReadSerializer(allocation).data,
+                status=status.HTTP_200_OK,
+            )
+
+        except VendorPayment.DoesNotExist:
+            raise NotFound("Vendor payment not found.")
+
+        except Invoice.DoesNotExist:
+            raise NotFound("Invoice not found.")
+
+        except (
+            AccountingPermissionError,
+            AccountingStateError,
+            AccountingConfigurationError,
+            ValidationError,
+        ) as exc:
+            return accounting_error_response(exc)
+
+    def delete(
+        self,
+        request,
+        organization_id,
+        payment_id,
+        invoice_id,
+    ):
+        self.get_membership(request, organization_id)
+
+        try:
+            remove_vendor_payment_allocation(
+                organization_id=organization_id,
+                payment_id=payment_id,
+                invoice_id=invoice_id,
+                actor=request.user,
+            )
+
+            return Response(status=status.HTTP_204_NO_CONTENT)
+
+        except VendorPayment.DoesNotExist:
+            raise NotFound("Vendor payment not found.")
+
+        except Invoice.DoesNotExist:
+            raise NotFound("Invoice not found.")
+
+        except PaymentAllocation.DoesNotExist:
+            raise NotFound("Payment allocation not found.")
+
+        except (
+            AccountingPermissionError,
+            AccountingStateError,
+            AccountingConfigurationError,
+            ValidationError,
+        ) as exc:
+            return accounting_error_response(exc)
+
 
 class AccountingAccountListAPIView(
     OrganizationAccountingAPIView
