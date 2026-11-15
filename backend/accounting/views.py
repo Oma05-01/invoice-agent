@@ -48,6 +48,7 @@ from accounting.services import (
     update_draft_journal_entry_date,
     set_vendor_payment_allocation,
     remove_vendor_payment_allocation,
+    post_vendor_payment,
 )
 
 from accounting.reporting import (
@@ -860,6 +861,39 @@ class JournalEntryDateUpdateAPIView(
 
         except JournalEntry.DoesNotExist:
             raise NotFound("Journal entry not found.")
+
+        except (
+            AccountingPermissionError,
+            AccountingStateError,
+            AccountingConfigurationError,
+            ValidationError,
+        ) as exc:
+            return accounting_error_response(exc)
+
+class VendorPaymentPostAPIView(
+    OrganizationAccountingAPIView
+):
+    def post(self, request, organization_id, payment_id):
+        self.get_membership(request, organization_id)
+
+        try:
+            post_vendor_payment(
+                organization_id=organization_id,
+                payment_id=payment_id,
+                actor=request.user,
+            )
+
+            payment = get_vendor_payment_queryset(
+                organization_id
+            ).get(pk=payment_id)
+
+            return Response(
+                VendorPaymentReadSerializer(payment).data,
+                status=status.HTTP_200_OK,
+            )
+
+        except VendorPayment.DoesNotExist:
+            raise NotFound("Vendor payment not found.")
 
         except (
             AccountingPermissionError,

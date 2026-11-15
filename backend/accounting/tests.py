@@ -2401,6 +2401,254 @@ class AccountingAPITests(TestCase):
 
         self.assertEqual(PaymentAllocation.objects.count(), 0)
 
+    def vendor_payment_post_url(self, payment_id):
+        return reverse(
+            "accounting-vendor-payment-post",
+            kwargs={
+                "organization_id": self.organization.pk,
+                "payment_id": payment_id,
+            },
+        )
+
+
+    def create_fully_allocated_vendor_payment_via_api(self):
+        self.post_invoice_journal_for_allocation()
+
+        payment_response = self.create_vendor_payment_via_api()
+
+        self.authenticate_as(self.operator)
+
+        allocation_response = self.client.post(
+            self.payment_allocation_url(payment_response.data["id"]),
+            {
+                "invoice_id": str(self.invoice.pk),
+                "amount": "125000.00",
+            },
+            format="json",
+        )
+
+        self.assertEqual(allocation_response.status_code, 200)
+
+        return payment_response
+
+    def test_finance_admin_can_post_vendor_payment_through_api(self):
+        payment_response = (
+            self.create_fully_allocated_vendor_payment_via_api()
+        )
+
+        payment_id = payment_response.data["id"]
+
+        self.authenticate_as(self.admin)
+
+        response = self.client.post(
+            self.vendor_payment_post_url(payment_id),
+            {},
+            format="json",
+        )
+
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual(response.data["status"], "posted")
+        self.assertEqual(response.data["journal_status"], "posted")
+        self.assertEqual(
+            response.data["posted_by_id"],
+            self.admin.pk,
+        )
+        self.assertIsNotNone(response.data["posted_at"])
+
+        payment = VendorPayment.objects.get(pk=payment_id)
+        journal = payment.journal_entry
+
+        self.assertEqual(payment.status, VendorPayment.Status.POSTED)
+        self.assertEqual(journal.status, JournalEntry.Status.POSTED)
+
+        payable_line = journal.lines.get(line_number=1)
+        payment_line = journal.lines.get(line_number=2)
+
+        self.assertEqual(payable_line.account.code, "2000")
+        self.assertEqual(payable_line.debit, Decimal("125000.00"))
+        self.assertEqual(payable_line.credit, Decimal("0.00"))
+
+        self.assertEqual(payment_line.account.code, "1000")
+        self.assertEqual(payment_line.debit, Decimal("0.00"))
+        self.assertEqual(payment_line.credit, Decimal("125000.00"))
+
+        self.assertTrue(
+            JournalAuditEvent.objects.filter(
+                journal_entry=journal,
+                operation="vendor_payment_posted",
+            ).exists()
+        )
+
+        self.assertTrue(
+            JournalAuditEvent.objects.filter(
+                journal_entry=journal,
+                operation="journal_posted",
+            ).exists()
+        )
+
+    def test_finance_operator_cannot_post_vendor_payment_through_api(self):
+        payment_response = (
+            self.create_fully_allocated_vendor_payment_via_api()
+        )
+
+        self.authenticate_as(self.operator)
+
+        response = self.client.post(
+            self.vendor_payment_post_url(payment_response.data["id"]),
+            {},
+            format="json",
+        )
+
+        self.assertEqual(response.status_code, 403)
+
+        payment = VendorPayment.objects.get(
+            pk=payment_response.data["id"],
+        )
+
+        self.assertEqual(payment.status, VendorPayment.Status.DRAFT)
+        self.assertEqual(
+            payment.journal_entry.status,
+            JournalEntry.Status.DRAFT,
+        )
+
+    def test_vendor_payment_api_rejects_posting_without_allocations(self):
+        payment_response = self.create_vendor_payment_via_api()
+
+        self.authenticate_as(self.admin)
+
+        response = self.client.post(
+            self.vendor_payment_post_url(payment_response.data["id"]),
+            {},
+            format="json",
+        )
+
+        self.assertEqual(response.status_code, 400)
+
+        payment = VendorPayment.objects.get(
+            pk=payment_response.data["id"],
+        )
+
+        self.assertEqual(payment.status, VendorPayment.Status.DRAFT)
+
+    def test_vendor_payment_api_rejects_partial_allocation(self):
+        self.post_invoice_journal_for_allocation()
+
+        payment_response = self.create_vendor_payment_via_api()
+
+        self.client.post(
+            self.payment_allocation_url(payment_response.data["id"]),
+            {
+                "invoice_id": str(self.invoice.pk),
+                "amount": "50000.00",
+            },
+            format="json",
+        )
+
+        self.authenticate_as(self.admin)
+
+        response = self.client.post(
+            self.vendor_payment_post_url(payment_response.data["id"]),
+            {},
+            format="json",
+        )
+
+        self.assertEqual(response.status_code, 400)
+
+        payment = VendorPayment.objects.get(
+            pk=payment_response.data["id"],
+        )
+
+        self.assertEqual(payment.status, VendorPayment.Status.DRAFT)
+
+    def test_vendor_payment_cannot_be_posted_twice_through_api(self):
+        payment_response = (
+            self.create_fully_allocated_vendor_payment_via_api()
+        )
+
+        payment_id = payment_response.data["id"]
+
+        self.authenticate_as(self.admin)
+
+        first_response = self.client.post(
+            self.vendor_payment_post_url(payment_id),
+            {},
+            format="json",
+        )
+
+        self.assertEqual(first_response.status_code, 200)
+
+        second_response = self.client.post(
+            self.vendor_payment_post_url(payment_id),
+            {},
+            format="json",
+        )
+
+        self.assertEqual(second_response.status_code, 400)
+
+        self.assertEqual(
+            JournalEntry.objects.filter(
+                vendor_payment__pk=payment_id,
+                status=JournalEntry.Status.POSTED,
+            ).count(),
+            1,
+        )
+
+    def test_posting_vendor_payment_reduces_ap_balance_through_api(self):
+        self.post_invoice_journal_for_allocation()
+
+        before_report = build_ap_ageing_report(
+            organization=self.organization,
+            as_of_date=timezone.localdate(),
+            currency="NGN",
+        )
+
+        before_total = Decimal(
+            before_report["currencies"][0]["total_outstanding"]
+        )
+
+        self.assertEqual(before_total, Decimal("250000.00"))
+
+        payment_response = self.create_vendor_payment_via_api()
+
+        self.authenticate_as(self.operator)
+
+        allocation_response = self.client.post(
+            self.payment_allocation_url(payment_response.data["id"]),
+            {
+                "invoice_id": str(self.invoice.pk),
+                "amount": "125000.00",
+            },
+            format="json",
+        )
+
+        self.assertEqual(allocation_response.status_code, 200)
+
+        self.authenticate_as(self.admin)
+
+        post_response = self.client.post(
+            self.vendor_payment_post_url(payment_response.data["id"]),
+            {},
+            format="json",
+        )
+
+        self.assertEqual(post_response.status_code, 200)
+
+        after_report = build_ap_ageing_report(
+            organization=self.organization,
+            as_of_date=timezone.localdate(),
+            currency="NGN",
+        )
+
+        after_total = Decimal(
+            after_report["currencies"][0]["total_outstanding"]
+        )
+
+        self.assertEqual(after_total, Decimal("125000.00"))
+        self.assertEqual(
+            before_total - after_total,
+            Decimal("125000.00"),
+        )
+
     
 
 class AccountingReportingAPITests(TestCase):

@@ -18,6 +18,7 @@ from accounting.views import (
     VendorPaymentListCreateAPIView,
     VendorPaymentDetailAPIView,
     VendorPaymentAllocationAPIView,
+    VendorPaymentPostAPIView,
 )
 
 
@@ -112,6 +113,10 @@ urlpatterns = [
         VendorPaymentAllocationAPIView.as_view(),
         name="accounting-vendor-payment-allocation-remove",
     ),
-
+    path(
+        "organizations/<uuid:organization_id>/accounting/vendor-payments/<uuid:payment_id>/post/",
+        VendorPaymentPostAPIView.as_view(),
+        name="accounting-vendor-payment-post",
+    ),
 ]
 
