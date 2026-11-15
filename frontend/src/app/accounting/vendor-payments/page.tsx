@@ -638,9 +638,12 @@ function VendorPaymentsWorkspace() {
                             className="transition hover:bg-slate-50/70"
                           >
                             <td className="px-5 py-4">
-                              <p className="font-semibold text-slate-800">
+                              <Link
+                                href={`/accounting/vendor-payments/${payment.id}`}
+                                className="font-semibold text-blue-700 hover:text-blue-900 hover:underline"
+                                >
                                 {getPaymentReference(payment)}
-                              </p>
+                                </Link>
                               <p className="mt-1 flex items-center gap-1.5 text-xs text-slate-400">
                                 <CalendarDays size={13} />
                                 {formatDate(payment.payment_date)}
