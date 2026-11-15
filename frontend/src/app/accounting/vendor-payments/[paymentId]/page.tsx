@@ -1,10 +1,7 @@
-
 "use client";
-
 import Link from "next/link";
 import { useParams } from "next/navigation";
 import { useEffect, useMemo, useState, type FormEvent } from "react";
-
 import {
   ArrowLeft,
   CheckCircle2,
@@ -15,81 +12,64 @@ import {
   Trash2,
   Wallet,
 } from "lucide-react";
-
 import { useAuth } from "@/components/auth-provider";
 import { ProtectedRoute } from "@/components/protected-route";
-
 import {
   allocateInvoiceToVendorPayment,
   fetchAPAgeingReport,
   fetchVendorPayment,
   removeVendorPaymentAllocation,
+  postVendorPayment,
+  reverseVendorPayment,
 } from "@/lib/accounting";
-
 import type {
   APAgeingInvoice,
+  JournalEntry,
   VendorPayment,
   VendorPaymentStatus,
 } from "@/types/accounting";
-
 type AllocationCandidate = APAgeingInvoice;
-
 function normalizeIntegerString(value: string): string {
   return value.replace(/^0+(?=\d)/, "") || "0";
 }
-
 // Convert a monetary decimal string into integer minor units.
 // Calculations use strings so large monetary values do not lose
 // precision through JavaScript floating-point arithmetic.
 function toMinorUnits(value: string): string {
   const trimmed = value.trim();
-
   if (!/^\d+(\.\d{1,2})?$/.test(trimmed)) {
     return "0";
   }
-
   const [whole, fraction = ""] = trimmed.split(".");
-
   return normalizeIntegerString(
     `${whole}${fraction.padEnd(2, "0")}`,
   );
 }
-
 function compareMinorUnits(left: string, right: string): number {
   const a = normalizeIntegerString(left);
   const b = normalizeIntegerString(right);
-
   if (a.length !== b.length) {
     return a.length > b.length ? 1 : -1;
   }
-
   if (a === b) return 0;
-
   return a > b ? 1 : -1;
 }
-
 function addMinorUnits(left: string, right: string): string {
   let i = left.length - 1;
   let j = right.length - 1;
   let carry = 0;
   let result = "";
-
   while (i >= 0 || j >= 0 || carry > 0) {
     const a = i >= 0 ? Number(left[i]) : 0;
     const b = j >= 0 ? Number(right[j]) : 0;
-
     const sum = a + b + carry;
-
     result = String(sum % 10) + result;
     carry = Math.floor(sum / 10);
-
     i -= 1;
     j -= 1;
   }
-
   return normalizeIntegerString(result);
 }
-
 // Subtract two unsigned integer strings. The caller must ensure
 // that the first value is greater than or equal to the second.
 function subtractAbsolute(left: string, right: string): string {
@@ -97,37 +77,27 @@ function subtractAbsolute(left: string, right: string): string {
   let j = right.length - 1;
   let borrow = 0;
   let result = "";
-
   while (i >= 0) {
     let a = Number(left[i]) - borrow;
     const b = j >= 0 ? Number(right[j]) : 0;
-
     borrow = 0;
-
     if (a < b) {
       a += 10;
       borrow = 1;
     }
-
     result = String(a - b) + result;
-
     i -= 1;
     j -= 1;
   }
-
   return normalizeIntegerString(result);
 }
-
 function subtractMinorUnits(left: string, right: string): string {
   const comparison = compareMinorUnits(left, right);
-
   if (comparison >= 0) {
     return subtractAbsolute(left, right);
   }
-
   return `-${subtractAbsolute(right, left)}`;
 }
-
 function sumAmounts(values: string[]): string {
   return values.reduce(
     (total, value) =>
@@ -135,25 +105,19 @@ function sumAmounts(values: string[]): string {
     "0",
   );
 }
-
 function minorUnitsToDecimal(value: string): string {
   const negative = value.startsWith("-");
   const unsigned = negative ? value.slice(1) : value;
   const padded = unsigned.padStart(3, "0");
-
   const whole = padded.slice(0, -2);
   const fraction = padded.slice(-2);
-
   return `${negative ? "-" : ""}${whole}.${fraction}`;
 }
-
 function formatAmount(value: string, currency: string): string {
   const numericAmount = Number(value);
-
   if (!Number.isFinite(numericAmount)) {
     return `${currency} ${value}`;
   }
-
   try {
     return new Intl.NumberFormat("en-NG", {
       style: "currency",
@@ -168,90 +132,169 @@ function formatAmount(value: string, currency: string): string {
     })}`;
   }
 }
-
 function formatDate(value: string | null): string {
   if (!value) return "—";
-
   const date = new Date(`${value.slice(0, 10)}T00:00:00`);
-
   if (Number.isNaN(date.getTime())) return "—";
-
   return new Intl.DateTimeFormat("en-NG", {
     day: "numeric",
     month: "short",
     year: "numeric",
   }).format(date);
 }
-
 function formatRole(role: string): string {
   return role
     .split("_")
     .map((part) => part.charAt(0).toUpperCase() + part.slice(1))
     .join(" ");
 }
-
 const statusLabels: Record<VendorPaymentStatus, string> = {
   draft: "Draft",
   posted: "Posted",
   reversed: "Reversed",
 };
-
 const statusStyles: Record<VendorPaymentStatus, string> = {
   draft: "bg-amber-50 text-amber-700",
   posted: "bg-emerald-50 text-emerald-700",
   reversed: "bg-rose-50 text-rose-700",
 };
-
 function VendorPaymentDetailWorkspace() {
   const params = useParams<{ paymentId: string }>();
   const paymentId = params.paymentId;
-
   const { user } = useAuth();
-
   const organizations = user?.organizations ?? [];
-
   const [selectedOrganizationId, setSelectedOrganizationId] =
     useState("");
-
   const organizationId =
     selectedOrganizationId || organizations[0]?.id || "";
-
   const activeOrganization = organizations.find(
     (organization) => organization.id === organizationId,
   );
-
   const role = activeOrganization?.role ?? "";
-
+  const canPostOrReverse = [
+    "owner",
+    "finance_admin",
+  ].includes(role);
   const canManageAllocations = [
     "owner",
     "finance_admin",
     "finance_operator",
   ].includes(role);
-
   const [payment, setPayment] = useState<VendorPayment | null>(null);
-
   const [candidateInvoices, setCandidateInvoices] =
     useState<AllocationCandidate[]>([]);
-
   const [loading, setLoading] = useState(true);
   const [refreshKey, setRefreshKey] = useState(0);
-
   const [error, setError] = useState("");
   const [successMessage, setSuccessMessage] = useState("");
-
   const [selectedInvoiceId, setSelectedInvoiceId] = useState("");
   const [allocationAmount, setAllocationAmount] = useState("");
-
   const [savingAllocation, setSavingAllocation] = useState(false);
   const [removingInvoiceId, setRemovingInvoiceId] = useState("");
-
+  const [confirmationAction, setConfirmationAction] =
+    useState<"post" | "reverse" | null>(null);
+  const [reversalReason, setReversalReason] = useState("");
+  const [processingAction, setProcessingAction] = useState(false);
+  const [reversalJournal, setReversalJournal] =
+    useState<JournalEntry | null>(null);
+async function refreshCandidateInvoices(
+  paymentRecord: VendorPayment,
+) {
+  const ageingData = await fetchAPAgeingReport(
+    organizationId,
+    {
+      currency: paymentRecord.currency,
+    },
+  );
+  const currencyReport = ageingData.currencies.find(
+    (item) => item.currency === paymentRecord.currency,
+  );
+  const vendorReport = currencyReport?.vendors.find(
+    (vendor) => vendor.vendor_id === paymentRecord.vendor_id,
+  );
+  setCandidateInvoices(vendorReport?.invoices ?? []);
+}
+async function handleConfirmPaymentAction(
+  event: FormEvent<HTMLFormElement>,
+) {
+  event.preventDefault();
+  if (!payment || !confirmationAction) return;
+  if (
+    confirmationAction === "post" &&
+    !isFullyAllocated
+  ) {
+    setError(
+      "The payment must be fully allocated before posting.",
+    );
+    return;
+  }
+  if (
+    confirmationAction === "reverse" &&
+    !reversalReason.trim()
+  ) {
+    setError("A reversal reason is required.");
+    return;
+  }
+  setProcessingAction(true);
+  setError("");
+  setSuccessMessage("");
+  try {
+    if (confirmationAction === "post") {
+      const updatedPayment = await postVendorPayment(
+        organizationId,
+        payment.id,
+      );
+      setPayment(updatedPayment);
+      setReversalJournal(null);
+      setConfirmationAction(null);
+      setSuccessMessage(
+        `Payment ${updatedPayment.reference || updatedPayment.id} was posted successfully.`,
+      );
+      try {
+        await refreshCandidateInvoices(updatedPayment);
+      } catch {
+        setError(
+          "The payment was posted, but the AP ageing candidates could not be refreshed. Use Refresh to reload them.",
+        );
+      }
+    } else {
+      const result = await reverseVendorPayment(
+        organizationId,
+        payment.id,
+        {
+          reversal_reason: reversalReason.trim(),
+        },
+      );
+      setPayment(result.payment);
+      setReversalJournal(result.reversal_journal);
+      setConfirmationAction(null);
+      setReversalReason("");
+      setSuccessMessage(
+        `Payment ${result.payment.reference || result.payment.id} was reversed successfully.`,
+      );
+      try {
+        await refreshCandidateInvoices(result.payment);
+      } catch {
+        setError(
+          "The payment was reversed, but the AP ageing candidates could not be refreshed. Use Refresh to reload them.",
+        );
+      }
+    }
+  } catch (actionError) {
+    setError(
+      actionError instanceof Error
+        ? actionError.message
+        : "The payment action could not be completed.",
+    );
+  } finally {
+    setProcessingAction(false);
+  }
+}
   // Retrieve the payment and its vendor's outstanding AP invoices.
   useEffect(() => {
     if (!organizationId || !paymentId) return;
-
     const controller = new AbortController();
     let active = true;
-
     async function loadData() {
       try {
         const paymentData = await fetchVendorPayment(
@@ -259,29 +302,23 @@ function VendorPaymentDetailWorkspace() {
           paymentId,
           controller.signal,
         );
-
         const ageingData = await fetchAPAgeingReport(
           organizationId,
           {
             currency: paymentData.currency,
           },
         );
-
         if (!active) return;
-
         const currencyReport = ageingData.currencies.find(
           (item) => item.currency === paymentData.currency,
         );
-
         const vendorReport = currencyReport?.vendors.find(
           (vendor) => vendor.vendor_id === paymentData.vendor_id,
         );
-
         setPayment(paymentData);
         setCandidateInvoices(vendorReport?.invoices ?? []);
       } catch (loadError) {
         if (!active || controller.signal.aborted) return;
-
         setError(
           loadError instanceof Error
             ? loadError.message
@@ -291,98 +328,79 @@ function VendorPaymentDetailWorkspace() {
         if (active) setLoading(false);
       }
     }
-
     loadData();
-
     return () => {
       active = false;
       controller.abort();
     };
   }, [organizationId, paymentId, refreshKey]);
-
   const allocations = useMemo(
     () => payment?.allocations ?? [],
     [payment?.allocations],
     );
-
   const totalAllocated = useMemo(
     () => sumAmounts(allocations.map((item) => item.amount)),
     [allocations],
   );
-
   const paymentAmount = payment
     ? toMinorUnits(payment.amount)
     : "0";
-
   const remainingAmount = subtractMinorUnits(
     paymentAmount,
     totalAllocated,
   );
-
+  const isFullyAllocated =
+    paymentAmount !== "0" &&
+    compareMinorUnits(totalAllocated, paymentAmount) === 0;
   const selectedInvoice = candidateInvoices.find(
     (invoice) => invoice.invoice_id === selectedInvoiceId,
   );
-
   const existingAllocation = allocations.find(
     (item) => item.invoice_id === selectedInvoiceId,
   );
-
   const existingAllocationAmount = existingAllocation
     ? toMinorUnits(existingAllocation.amount)
     : "0";
-
   const availablePaymentAmount = addMinorUnits(
     remainingAmount.startsWith("-") ? "0" : remainingAmount,
     existingAllocationAmount,
   );
-
   const allocationIsEditable =
     payment?.status === "draft" && canManageAllocations;
-
   const currentReference =
     payment?.reference ||
     payment?.journal_reference ||
     payment?.id.slice(0, 8) ||
     "";
-
   function handleInvoiceSelection(invoiceId: string) {
     setSelectedInvoiceId(invoiceId);
     setError("");
     setAllocationAmount("");
-
     const existing = allocations.find(
       (item) => item.invoice_id === invoiceId,
     );
-
     if (existing) {
       setAllocationAmount(existing.amount);
     }
   }
-
   async function handleSaveAllocation(
     event: FormEvent<HTMLFormElement>,
   ) {
     event.preventDefault();
-
     if (!payment || !selectedInvoice) return;
-
     const amountValue = allocationAmount.trim();
-
     if (!/^\d+(\.\d{1,2})?$/.test(amountValue)) {
       setError("Enter a valid amount with no more than two decimal places.");
       return;
     }
-
     const requestedAmount = toMinorUnits(amountValue);
     const invoiceOutstanding = toMinorUnits(
       selectedInvoice.outstanding_amount,
     );
-
     if (requestedAmount === "0") {
       setError("Allocation amount must be greater than zero.");
       return;
     }
-
     if (
       compareMinorUnits(
         requestedAmount,
@@ -394,7 +412,6 @@ function VendorPaymentDetailWorkspace() {
       );
       return;
     }
-
     if (
       compareMinorUnits(
         requestedAmount,
@@ -406,11 +423,9 @@ function VendorPaymentDetailWorkspace() {
       );
       return;
     }
-
     setSavingAllocation(true);
     setError("");
     setSuccessMessage("");
-
     try {
       const result = await allocateInvoiceToVendorPayment(
         organizationId,
@@ -420,10 +435,8 @@ function VendorPaymentDetailWorkspace() {
           amount: amountValue,
         },
       );
-
       setPayment((current) => {
         if (!current) return current;
-
         const updatedAllocations = [
           ...current.allocations.filter(
             (item) => item.invoice_id !== result.invoice_id,
@@ -432,16 +445,13 @@ function VendorPaymentDetailWorkspace() {
         ].sort((a, b) =>
           a.invoice_number.localeCompare(b.invoice_number),
         );
-
         return {
           ...current,
           allocations: updatedAllocations,
         };
       });
-
       setSelectedInvoiceId("");
       setAllocationAmount("");
-
       setSuccessMessage(
         existingAllocation
           ? `Allocation for ${result.invoice_number} was updated.`
@@ -457,13 +467,11 @@ function VendorPaymentDetailWorkspace() {
       setSavingAllocation(false);
     }
   }
-
   async function handleRemoveAllocation(
     invoiceId: string,
     invoiceNumber: string,
   ) {
     if (!payment) return;
-
     if (
       !window.confirm(
         `Remove the allocation for invoice ${invoiceNumber}?`,
@@ -471,18 +479,15 @@ function VendorPaymentDetailWorkspace() {
     ) {
       return;
     }
-
     setRemovingInvoiceId(invoiceId);
     setError("");
     setSuccessMessage("");
-
     try {
       await removeVendorPaymentAllocation(
         organizationId,
         payment.id,
         invoiceId,
       );
-
       setPayment((current) =>
         current
           ? {
@@ -493,12 +498,10 @@ function VendorPaymentDetailWorkspace() {
             }
           : current,
       );
-
       if (selectedInvoiceId === invoiceId) {
         setSelectedInvoiceId("");
         setAllocationAmount("");
       }
-
       setSuccessMessage(
         `Allocation for ${invoiceNumber} was removed.`,
       );
@@ -512,7 +515,6 @@ function VendorPaymentDetailWorkspace() {
       setRemovingInvoiceId("");
     }
   }
-
   function changeOrganization(value: string) {
     setSelectedOrganizationId(value);
     setPayment(null);
@@ -523,14 +525,12 @@ function VendorPaymentDetailWorkspace() {
     setSelectedInvoiceId("");
     setAllocationAmount("");
   }
-
   function refreshPayment() {
     setLoading(true);
     setError("");
     setSuccessMessage("");
     setRefreshKey((current) => current + 1);
   }
-
   return (
     <ProtectedRoute>
       <main className="min-h-screen bg-[#f5f7fb] text-slate-900">
@@ -544,7 +544,6 @@ function VendorPaymentDetailWorkspace() {
               >
                 <ArrowLeft size={18} />
               </Link>
-
               <div>
                 <p className="text-xs font-medium uppercase tracking-wide text-slate-400">
                   Accounting / Payables / Vendor Payments
@@ -554,7 +553,6 @@ function VendorPaymentDetailWorkspace() {
                 </h1>
               </div>
             </div>
-
             {organizations.length > 0 && (
               <div className="min-w-[220px]">
                 <label
@@ -563,7 +561,6 @@ function VendorPaymentDetailWorkspace() {
                 >
                   Organisation
                 </label>
-
                 <select
                   id="detail-organization"
                   value={organizationId}
@@ -585,7 +582,6 @@ function VendorPaymentDetailWorkspace() {
             )}
           </div>
         </header>
-
         <div className="mx-auto w-full max-w-[1600px] p-4 sm:p-6 xl:p-8">
           {organizations.length === 0 ? (
             <div className="rounded-xl border border-amber-200 bg-amber-50 p-6 text-sm text-amber-800">
@@ -598,7 +594,6 @@ function VendorPaymentDetailWorkspace() {
                   <div className="flex h-10 w-10 items-center justify-center rounded-xl bg-blue-50 text-blue-700">
                     <Wallet size={19} />
                   </div>
-
                   <div>
                     <p className="text-sm font-semibold text-slate-800">
                       {activeOrganization?.name}
@@ -608,21 +603,63 @@ function VendorPaymentDetailWorkspace() {
                     </p>
                   </div>
                 </div>
-
+                <div className="flex flex-wrap items-center gap-2">
+                {canPostOrReverse && payment?.status === "draft" && (
+                    <button
+                    type="button"
+                    onClick={() => {
+                        setError("");
+                        setConfirmationAction("post");
+                    }}
+                    disabled={!isFullyAllocated || processingAction}
+                    title={
+                        isFullyAllocated
+                        ? "Post this fully allocated payment"
+                        : "Allocate the entire payment before posting"
+                    }
+                    className="inline-flex h-10 items-center gap-2 rounded-lg bg-emerald-600 px-4 text-sm font-semibold text-white transition hover:bg-emerald-700 disabled:cursor-not-allowed disabled:opacity-50"
+                    >
+                    <CheckCircle2 size={16} />
+                    Post payment
+                    </button>
+                )}
+                {canPostOrReverse && payment?.status === "posted" && (
+                    <button
+                    type="button"
+                    onClick={() => {
+                        setError("");
+                        setReversalReason("");
+                        setConfirmationAction("reverse");
+                    }}
+                    disabled={processingAction}
+                    className="inline-flex h-10 items-center gap-2 rounded-lg border border-rose-200 bg-white px-4 text-sm font-semibold text-rose-700 transition hover:bg-rose-50 disabled:opacity-50"
+                    >
+                    <CircleAlert size={16} />
+                    Reverse payment
+                    </button>
+                )}
                 <button
-                  type="button"
-                  onClick={refreshPayment}
-                  disabled={loading}
-                  className="inline-flex h-10 items-center gap-2 rounded-lg border border-slate-200 px-3 text-sm font-medium text-slate-700 hover:bg-slate-50 disabled:opacity-50"
+                    type="button"
+                    onClick={refreshPayment}
+                    disabled={loading || processingAction}
+                    className="inline-flex h-10 items-center gap-2 rounded-lg border border-slate-200 px-3 text-sm font-medium text-slate-700 hover:bg-slate-50 disabled:opacity-50"
                 >
-                  <RefreshCw
+                    <RefreshCw
                     size={16}
                     className={loading ? "animate-spin" : ""}
-                  />
-                  Refresh
+                    />
+                    Refresh
                 </button>
+                </div>
+                {canPostOrReverse &&
+                payment?.status === "draft" &&
+                !isFullyAllocated && (
+                    <p className="mt-3 text-xs text-amber-700">
+                    Posting is unavailable until the total invoice allocations
+                    equal the payment amount exactly.
+                    </p>
+                )}
               </section>
-
               {error && (
                 <div
                   role="alert"
@@ -632,7 +669,6 @@ function VendorPaymentDetailWorkspace() {
                   <p>{error}</p>
                 </div>
               )}
-
               {successMessage && (
                 <div
                   role="status"
@@ -642,7 +678,6 @@ function VendorPaymentDetailWorkspace() {
                   {successMessage}
                 </div>
               )}
-
               {loading ? (
                 <div className="rounded-xl border border-slate-200 bg-white py-20 text-center">
                   <LoaderCircle
@@ -664,7 +699,6 @@ function VendorPaymentDetailWorkspace() {
                         {currentReference}
                       </p>
                     </div>
-
                     <div className="rounded-xl border border-slate-200 bg-white p-5">
                       <p className="text-xs font-medium text-slate-500">
                         Vendor
@@ -677,7 +711,6 @@ function VendorPaymentDetailWorkspace() {
                         {payment.vendor.vendor_code || "No vendor code"}
                       </p>
                     </div>
-
                     <div className="rounded-xl border border-slate-200 bg-white p-5">
                       <p className="text-xs font-medium text-slate-500">
                         Payment amount
@@ -689,7 +722,6 @@ function VendorPaymentDetailWorkspace() {
                         {formatDate(payment.payment_date)}
                       </p>
                     </div>
-
                     <div className="rounded-xl border border-slate-200 bg-white p-5">
                       <p className="text-xs font-medium text-slate-500">
                         Payment status
@@ -704,7 +736,33 @@ function VendorPaymentDetailWorkspace() {
                       </p>
                     </div>
                   </section>
-
+                  {reversalJournal && (
+                    <section className="mb-6 rounded-xl border border-rose-200 bg-rose-50 p-5">
+                        <h2 className="font-semibold text-rose-900">
+                        Reversal journal created
+                        </h2>
+                        <div className="mt-3 grid gap-3 sm:grid-cols-3">
+                        <div>
+                            <p className="text-xs text-rose-700">Journal reference</p>
+                            <p className="mt-1 text-sm font-semibold text-rose-950">
+                            {reversalJournal.reference}
+                            </p>
+                        </div>
+                        <div>
+                            <p className="text-xs text-rose-700">Journal status</p>
+                            <p className="mt-1 text-sm font-semibold text-rose-950">
+                            {reversalJournal.status}
+                            </p>
+                        </div>
+                        <div>
+                            <p className="text-xs text-rose-700">Entry date</p>
+                            <p className="mt-1 text-sm font-semibold text-rose-950">
+                            {formatDate(reversalJournal.entry_date)}
+                            </p>
+                        </div>
+                        </div>
+                    </section>
+                    )}
                   <section className="mb-6 rounded-xl border border-slate-200 bg-white p-5">
                     <div className="grid gap-5 sm:grid-cols-3">
                       <div>
@@ -715,7 +773,6 @@ function VendorPaymentDetailWorkspace() {
                           {formatAmount(payment.amount, payment.currency)}
                         </p>
                       </div>
-
                       <div>
                         <p className="text-xs font-medium text-slate-500">
                           Total allocated
@@ -727,7 +784,6 @@ function VendorPaymentDetailWorkspace() {
                           )}
                         </p>
                       </div>
-
                       <div>
                         <p className="text-xs font-medium text-slate-500">
                           Unallocated amount
@@ -740,7 +796,6 @@ function VendorPaymentDetailWorkspace() {
                         </p>
                       </div>
                     </div>
-
                     <div className="mt-5 h-2 overflow-hidden rounded-full bg-slate-100">
                       <div
                         className="h-full rounded-full bg-blue-600 transition-all"
@@ -757,7 +812,6 @@ function VendorPaymentDetailWorkspace() {
                       />
                     </div>
                   </section>
-
                   <section className="mb-6 overflow-hidden rounded-xl border border-slate-200 bg-white">
                     <div className="border-b border-slate-100 px-5 py-5">
                       <h2 className="font-semibold text-slate-900">
@@ -767,7 +821,6 @@ function VendorPaymentDetailWorkspace() {
                         Invoices currently assigned to this vendor payment.
                       </p>
                     </div>
-
                     <div className="overflow-x-auto">
                       <table className="w-full min-w-[600px] text-left text-sm">
                         <thead className="bg-slate-50 text-xs uppercase tracking-wide text-slate-500">
@@ -786,7 +839,6 @@ function VendorPaymentDetailWorkspace() {
                             </th>
                           </tr>
                         </thead>
-
                         <tbody className="divide-y divide-slate-100">
                           {allocations.length === 0 ? (
                             <tr>
@@ -837,7 +889,6 @@ function VendorPaymentDetailWorkspace() {
                                       >
                                         Edit
                                       </button>
-
                                       <button
                                         type="button"
                                         onClick={() =>
@@ -874,7 +925,6 @@ function VendorPaymentDetailWorkspace() {
                       </table>
                     </div>
                   </section>
-
                   {allocationIsEditable && (
                     <section className="rounded-xl border border-slate-200 bg-white p-5">
                       <div className="mb-5">
@@ -887,7 +937,6 @@ function VendorPaymentDetailWorkspace() {
                           Only outstanding invoices for this vendor and payment currency are shown.
                         </p>
                       </div>
-
                       {candidateInvoices.length === 0 ? (
                         <div className="rounded-lg border border-amber-200 bg-amber-50 p-4 text-sm text-amber-800">
                           No outstanding invoices were found for this vendor in {payment.currency}.
@@ -904,7 +953,6 @@ function VendorPaymentDetailWorkspace() {
                             >
                               Invoice
                             </label>
-
                             <select
                               id="allocation-invoice"
                               value={selectedInvoiceId}
@@ -920,14 +968,12 @@ function VendorPaymentDetailWorkspace() {
                               <option value="">
                                 Select an outstanding invoice
                               </option>
-
                               {candidateInvoices.map((invoice) => {
                                 const isAllocated = allocations.some(
                                   (allocation) =>
                                     allocation.invoice_id ===
                                     invoice.invoice_id,
                                 );
-
                                 return (
                                   <option
                                     key={invoice.invoice_id}
@@ -944,7 +990,6 @@ function VendorPaymentDetailWorkspace() {
                                 );
                               })}
                             </select>
-
                             {selectedInvoice && (
                               <p className="mt-1.5 text-xs text-slate-500">
                                 Reported AP outstanding:{" "}
@@ -955,7 +1000,6 @@ function VendorPaymentDetailWorkspace() {
                               </p>
                             )}
                           </div>
-
                           <div>
                             <label
                               htmlFor="allocation-amount"
@@ -963,7 +1007,6 @@ function VendorPaymentDetailWorkspace() {
                             >
                               Allocation amount
                             </label>
-
                             <input
                               id="allocation-amount"
                               type="number"
@@ -981,7 +1024,6 @@ function VendorPaymentDetailWorkspace() {
                               className="h-11 w-full rounded-lg border border-slate-200 px-3 text-sm outline-none focus:border-blue-500"
                             />
                           </div>
-
                           <div className="flex items-end">
                             <button
                               type="submit"
@@ -1008,13 +1050,11 @@ function VendorPaymentDetailWorkspace() {
                           </div>
                         </form>
                       )}
-
                       <div className="mt-5 rounded-lg bg-slate-50 p-4 text-xs leading-relaxed text-slate-500">
                         The AP ageing report supplies candidate invoices and their posted-basis outstanding balances. The accounting backend performs the authoritative checks for approval, posted journal status, currency, invoice balance and allocations reserved by other draft payments. Draft allocations do not reduce reported AP.
                       </div>
                     </section>
                   )}
-
                   {!allocationIsEditable && (
                     <section className="rounded-xl border border-slate-200 bg-slate-50 p-5">
                       <p className="text-sm font-medium text-slate-700">
@@ -1051,11 +1091,154 @@ function VendorPaymentDetailWorkspace() {
             </>
           )}
         </div>
+        {confirmationAction && payment && (
+            <div className="fixed inset-0 z-50 flex items-center justify-center overflow-y-auto bg-slate-950/40 p-4">
+                <section
+                role="dialog"
+                aria-modal="true"
+                aria-labelledby="payment-action-title"
+                className="my-8 w-full max-w-lg rounded-2xl bg-white shadow-xl"
+                >
+                <form onSubmit={handleConfirmPaymentAction}>
+                    <div className="border-b border-slate-100 px-6 py-5">
+                    <div className="flex items-center gap-3">
+                        <div
+                        className={`flex h-10 w-10 items-center justify-center rounded-xl ${
+                            confirmationAction === "post"
+                            ? "bg-emerald-50 text-emerald-700"
+                            : "bg-rose-50 text-rose-700"
+                        }`}
+                        >
+                        {confirmationAction === "post" ? (
+                            <CheckCircle2 size={20} />
+                        ) : (
+                            <CircleAlert size={20} />
+                        )}
+                        </div>
+                        <div>
+                        <h2
+                            id="payment-action-title"
+                            className="font-bold text-slate-900"
+                        >
+                            {confirmationAction === "post"
+                            ? "Confirm payment posting"
+                            : "Confirm payment reversal"}
+                        </h2>
+                        <p className="mt-1 text-xs text-slate-500">
+                            {currentReference}
+                        </p>
+                        </div>
+                    </div>
+                    </div>
+                    <div className="space-y-4 px-6 py-6">
+                    <div className="rounded-lg bg-slate-50 p-4">
+                        <div className="flex justify-between gap-3 text-sm">
+                        <span className="text-slate-500">Vendor</span>
+                        <span className="font-medium text-slate-800">
+                            {payment.vendor.display_name ||
+                            payment.vendor.legal_name}
+                        </span>
+                        </div>
+                        <div className="mt-3 flex justify-between gap-3 text-sm">
+                        <span className="text-slate-500">Payment amount</span>
+                        <span className="font-semibold text-slate-900">
+                            {formatAmount(payment.amount, payment.currency)}
+                        </span>
+                        </div>
+                        <div className="mt-3 flex justify-between gap-3 text-sm">
+                        <span className="text-slate-500">Allocated amount</span>
+                        <span className="font-semibold text-slate-900">
+                            {formatAmount(
+                            minorUnitsToDecimal(totalAllocated),
+                            payment.currency,
+                            )}
+                        </span>
+                        </div>
+                    </div>
+                    {confirmationAction === "post" ? (
+                        <p className="text-sm leading-relaxed text-slate-600">
+                        You are about to post this vendor payment. Its
+                        accounting journal will be posted and the allocated
+                        amount will reduce the vendor&apos;s outstanding
+                        Accounts Payable balance. This action cannot be
+                        edited after posting; a reversal will be required
+                        to undo it.
+                        </p>
+                    ) : (
+                        <>
+                        <p className="text-sm leading-relaxed text-slate-600">
+                            A reversal journal will be created for this
+                            posted payment. The original payment and its
+                            allocations will remain in the audit history.
+                        </p>
+                        <div>
+                            <label
+                            htmlFor="payment-reversal-reason"
+                            className="mb-1.5 block text-sm font-medium text-slate-700"
+                            >
+                            Reversal reason
+                            </label>
+                            <textarea
+                            id="payment-reversal-reason"
+                            rows={4}
+                            required
+                            value={reversalReason}
+                            onChange={(event) =>
+                                setReversalReason(event.target.value)
+                            }
+                            placeholder="Explain why this payment needs to be reversed..."
+                            disabled={processingAction}
+                            className="w-full resize-y rounded-lg border border-slate-200 px-3 py-2.5 text-sm outline-none focus:border-rose-500 disabled:bg-slate-50"
+                            />
+                        </div>
+                        </>
+                    )}
+                    </div>
+                    <div className="flex flex-wrap justify-end gap-2 border-t border-slate-100 px-6 py-5">
+                    <button
+                        type="button"
+                        onClick={() => {
+                        setConfirmationAction(null);
+                        setReversalReason("");
+                        }}
+                        disabled={processingAction}
+                        className="h-10 rounded-lg border border-slate-200 px-4 text-sm font-medium text-slate-700 hover:bg-slate-50 disabled:opacity-50"
+                    >
+                        Cancel
+                    </button>
+                    <button
+                        type="submit"
+                        disabled={
+                        processingAction ||
+                        (confirmationAction === "post" &&
+                            !isFullyAllocated) ||
+                        (confirmationAction === "reverse" &&
+                            !reversalReason.trim())
+                        }
+                        className={`inline-flex h-10 items-center gap-2 rounded-lg px-4 text-sm font-semibold text-white disabled:cursor-not-allowed disabled:opacity-50 ${
+                        confirmationAction === "post"
+                            ? "bg-emerald-600 hover:bg-emerald-700"
+                            : "bg-rose-600 hover:bg-rose-700"
+                        }`}
+                    >
+                        {processingAction && (
+                        <LoaderCircle size={16} className="animate-spin" />
+                        )}
+                        {processingAction
+                        ? "Processing..."
+                        : confirmationAction === "post"
+                            ? "Confirm posting"
+                            : "Confirm reversal"}
+                    </button>
+                    </div>
+                </form>
+                </section>
+            </div>
+            )}
       </main>
     </ProtectedRoute>
   );
 }
-
 export default function VendorPaymentDetailPage() {
   return (
     <ProtectedRoute>
