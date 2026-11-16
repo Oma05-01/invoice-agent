@@ -35,6 +35,8 @@ import type {
   APAgeingBucket,
 } from "@/types/accounting";
 
+import { ExpenditureReport } from "./expenditure-report";
+
 
 type Props = {
   organizationId: string;
@@ -46,7 +48,8 @@ type ReportTab =
   | "trial-balance"
   | "income-statement"
   | "balance-sheet"
-  | "ap-ageing";
+  | "ap-ageing"
+  | "expenditure";
 
 const apAgeingBucketOrder: APAgeingBucket[] = [
   "current",
@@ -1709,6 +1712,19 @@ export function AccountingReports({
           <FileBarChart size={15} />
           AP Ageing
         </button>
+
+        <button
+          type="button"
+          onClick={() => setActiveReport("expenditure")}
+          className={`inline-flex items-center gap-2 border-b-2 py-4 text-xs font-semibold transition ${
+            activeReport === "expenditure"
+              ? "border-blue-700 text-blue-700"
+              : "border-transparent text-slate-400 hover:text-slate-700"
+          }`}
+        >
+          <CalendarDays size={15} />
+          Expenditure Analysis
+        </button>
       </div>
 
       {activeReport === "ledger" && (
@@ -1725,6 +1741,12 @@ export function AccountingReports({
       )}
       {activeReport === "ap-ageing" && (
         <APAgeingReport organizationId={organizationId} />
+      )}
+      {activeReport === "expenditure" && (
+        <ExpenditureReport
+          key={organizationId}
+          organizationId={organizationId}
+        />
       )}
     </div>
   );
