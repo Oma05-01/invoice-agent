@@ -223,9 +223,19 @@ class FinancialAssistantService:
 
         history_messages = _normalise_conversation_history(history)
         available_tools = list(self.registry.available_tools(context) or [])
+        reporting_date_note = (
+            f"Organisation timezone: {context.organization.timezone}\n"
+            f"Current date in that timezone: {context.local_today.isoformat()}\n\n"
+            "Date interpretation rules:\n"
+            "- January to the current month ends on the supplied current date, not the calendar month-end.\n"
+            "- For a fully completed historical month, use that month's calendar month-end.\n"
+            "- Do not choose a start_date or end_date later than the supplied current date.\n"
+            "- If the user explicitly requests a future period, do not silently shorten it; explain that the requested future dates are unavailable.\n"
+        )
         system_content = (
             f"{FINANCIAL_ASSISTANT_SYSTEM_PROMPT}\n\n"
-            f"{CONVERSATION_HISTORY_SYSTEM_NOTE}"
+            f"{CONVERSATION_HISTORY_SYSTEM_NOTE}\n\n"
+            f"{reporting_date_note}"
         )
         messages: list[Any] = [
             {"role": "system", "content": system_content},

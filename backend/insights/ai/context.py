@@ -1,6 +1,9 @@
 from dataclasses import dataclass
+from datetime import date
 from typing import Any
+from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
+from django.utils import timezone as django_timezone
 from organizations.models import OrganizationMembership
 
 
@@ -36,3 +39,17 @@ class ToolContext:
     @property
     def role(self) -> str:
         return self.membership.role
+
+    @property
+    def timezone_name(self) -> str:
+        """Return the organisation's configured IANA timezone."""
+        return self.organization.timezone or "UTC"
+
+    @property
+    def local_today(self) -> date:
+        """Return today's date in the organisation's timezone."""
+        try:
+            organization_timezone = ZoneInfo(self.timezone_name)
+        except (ZoneInfoNotFoundError, TypeError) as exc:
+            raise ValueError("The organisation timezone is invalid.") from exc
+        return django_timezone.now().astimezone(organization_timezone).date()

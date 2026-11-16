@@ -13,10 +13,16 @@ class SpendByArguments(BaseModel):
         description="How to group expenditure: vendor, expense account, or accounting month.",
     )
     start_date: date = Field(
-        description="First accounting entry date to include, in YYYY-MM-DD format.",
+        description=(
+            "First accounting entry date to include, in YYYY-MM-DD format. "
+            "Must not be later than the organisation current local date supplied in system context."
+        ),
     )
     end_date: date = Field(
-        description="Last accounting entry date to include, in YYYY-MM-DD format.",
+        description=(
+            "Last accounting entry date to include, in YYYY-MM-DD format. "
+            "Must not be later than the organisation current local date supplied in system context."
+        ),
     )
     limit: int = Field(
         default=20,

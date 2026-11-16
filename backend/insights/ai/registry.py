@@ -127,6 +127,19 @@ class ToolRegistry:
 
 
 def _run_spend_by(context: ToolContext, arguments: SpendByArguments) -> dict[str, Any]:
+    """Run expenditure reporting without permitting future accounting dates."""
+    current_date = context.local_today
+    if arguments.start_date > current_date:
+        raise SpendReportError(
+            f"start_date {arguments.start_date.isoformat()} is after "
+            f"the organisation's current date ({current_date.isoformat()})."
+        )
+    if arguments.end_date > current_date:
+        raise SpendReportError(
+            f"end_date {arguments.end_date.isoformat()} is after the "
+            f"organisation's current date ({current_date.isoformat()})."
+        )
+
     return spend_by(
         context.organization,
         dimension=arguments.dimension,

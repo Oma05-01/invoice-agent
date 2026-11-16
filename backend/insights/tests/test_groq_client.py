@@ -1,3 +1,4 @@
+from datetime import date
 from types import SimpleNamespace
 from unittest.mock import Mock
 
@@ -84,7 +85,10 @@ class FakeRegistry:
 
 class FinancialAssistantServiceTests(SimpleTestCase):
     def setUp(self):
-        self.context = object()
+        self.context = SimpleNamespace(
+            local_today=date(2026, 11, 16),
+            organization=SimpleNamespace(timezone="Africa/Lagos"),
+        )
 
     def make_service(self, responses, *, registry=None, max_tool_calls=4):
         client = FakeClient(responses)
@@ -252,7 +256,10 @@ class FinancialAssistantServiceTests(SimpleTestCase):
 
 class FinancialAssistantConversationHistoryTests(SimpleTestCase):
     def setUp(self):
-        self.context = object()
+        self.context = SimpleNamespace(
+            local_today=date(2026, 11, 16),
+            organization=SimpleNamespace(timezone="Africa/Lagos"),
+        )
 
     def make_service(self, responses):
         client = FakeClient(responses)
