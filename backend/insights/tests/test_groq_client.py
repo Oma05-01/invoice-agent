@@ -130,6 +130,14 @@ class FinancialAssistantServiceTests(SimpleTestCase):
             result.tool_invocations,
             (ToolInvocation("call_1", "spend_by", True),),
         )
+        self.assertEqual(
+            result.report_artifacts,
+            ({
+                "schema_version": 1,
+                "tool": "spend_by",
+                "report": {"total_expenditure": "1250.00"},
+            },),
+        )
         self.assertEqual(registry.available_contexts, [self.context])
         self.assertEqual(registry.executions, [("spend_by", '{"dimension":"vendor"}', self.context)])
 
@@ -139,6 +147,8 @@ class FinancialAssistantServiceTests(SimpleTestCase):
         self.assertEqual(tool_messages[0]["tool_call_id"], "call_1")
         self.assertIn('"ok":true', tool_messages[0]["content"])
         self.assertIn('"total_expenditure":"1250.00"', tool_messages[0]["content"])
+
+
 
     def test_tool_calls_are_executed_sequentially_and_parallel_calls_are_disabled(self):
         registry = FakeRegistry()
@@ -181,6 +191,8 @@ class FinancialAssistantServiceTests(SimpleTestCase):
         tool_messages = [message for message in client.chat.completions.requests[1]["messages"] if isinstance(message, dict) and message.get("role") == "tool"]
         self.assertIn('"ok":false', tool_messages[0]["content"])
         self.assertIn("Invalid reporting dimension.", tool_messages[0]["content"])
+        self.assertEqual(result.report_artifacts, ())
+        
 
     def test_tool_call_budget_is_checked_before_any_call_in_the_batch_executes(self):
         registry = FakeRegistry()

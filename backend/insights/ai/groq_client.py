@@ -114,11 +114,12 @@ class ToolInvocation:
 
 @dataclass(frozen=True)
 class FinancialAssistantResponse:
-    """Final user-facing answer and minimal tool-call metadata."""
+    """Final answer, tool metadata, and structured report artifacts."""
 
     answer: str
     model: str
     tool_invocations: tuple[ToolInvocation, ...]
+    report_artifacts: tuple[dict[str, Any], ...] = ()
 
     @property
     def tool_call_count(self) -> int:
@@ -266,6 +267,7 @@ class FinancialAssistantService:
             {"role": "user", "content": question},
         ]
         invocations: list[ToolInvocation] = []
+        report_artifacts: list[dict[str, Any]] = []
 
         while True:
             response = self._create_completion(
@@ -285,6 +287,7 @@ class FinancialAssistantService:
                     answer=content.strip(),
                     model=self.model,
                     tool_invocations=tuple(invocations),
+                    report_artifacts=tuple(report_artifacts),
                 )
 
             if len(invocations) + len(tool_calls) > self.max_tool_calls:
@@ -307,6 +310,18 @@ class FinancialAssistantService:
                     context=context,
                 )
                 succeeded = payload.get("ok") is True
+                report_data = payload.get("data")
+
+                if (
+                    succeeded
+                    and function_name == "spend_by"
+                    and isinstance(report_data, dict)
+                ):
+                    report_artifacts.append({
+                        "schema_version": 1,
+                        "tool": "spend_by",
+                        "report": report_data,
+                    })
                 invocations.append(
                     ToolInvocation(
                         tool_call_id=tool_call_id,

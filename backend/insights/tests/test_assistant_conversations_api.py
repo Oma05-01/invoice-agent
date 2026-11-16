@@ -13,6 +13,44 @@ from insights.ai.groq_client import (
 from insights.models import AssistantConversation, AssistantMessage
 from organizations.models import Organization, OrganizationMembership
 
+VALID_REPORT_ARTIFACT = {
+    "schema_version": 1,
+    "tool": "spend_by",
+    "report": {
+        "dimension": "vendor",
+        "period": {
+            "start_date": "2026-10-01",
+            "end_date": "2026-10-31",
+        },
+        "limit_per_currency": 20,
+        "currencies": [
+            {
+                "currency": "NGN",
+                "rows": [
+                    {
+                        "vendor_id": "00000000-0000-0000-0000-000000000001",
+                        "vendor_name": "Northstar",
+                        "amount": "1250.00",
+                        "gross_debits": "1250.00",
+                        "gross_credits": "0.00",
+                        "journal_count": 1,
+                        "journal_line_count": 1,
+                    }
+                ],
+                "total_expenditure": "1250.00",
+                "gross_debits": "1250.00",
+                "gross_credits": "0.00",
+                "journal_count": 1,
+                "journal_line_count": 1,
+                "displayed_rows_expenditure": "1250.00",
+                "group_count": 1,
+                "returned_group_count": 1,
+                "is_truncated": False,
+            }
+        ],
+        "report_basis": "Posted expense journal activity, grouped by vendor.",
+    },
+}
 
 class PersistentFinancialAssistantAPITests(TestCase):
     def setUp(self):
@@ -71,11 +109,12 @@ class PersistentFinancialAssistantAPITests(TestCase):
     def authenticate_as(self, user):
         self.client.force_authenticate(user=user)
 
-    def make_result(self, answer="Grounded financial answer."):
+    def make_result(self, answer="Grounded financial answer.", report_artifacts=()):
         return FinancialAssistantResponse(
             answer=answer,
             model="openai/gpt-oss-20b",
             tool_invocations=(ToolInvocation("call_1", "spend_by", True),),
+            report_artifacts=report_artifacts,
         )
 
     def create_conversation(self, *, creator=None, organization=None):
@@ -103,7 +142,9 @@ class PersistentFinancialAssistantAPITests(TestCase):
     def test_first_question_creates_conversation_and_persists_complete_exchange(
         self, service_class
     ):
-        service_class.return_value.answer.return_value = self.make_result()
+        service_class.return_value.answer.return_value = self.make_result(
+            report_artifacts=(VALID_REPORT_ARTIFACT,)
+        )
         self.authenticate_as(self.owner)
 
         response = self.client.post(
@@ -133,6 +174,14 @@ class PersistentFinancialAssistantAPITests(TestCase):
             [{"name": "spend_by", "succeeded": True}],
         )
         self.assertEqual(service_class.return_value.answer.call_args.kwargs["history"], [])
+        self.assertEqual(
+            messages[1].report_artifacts,
+            [VALID_REPORT_ARTIFACT],
+        )
+        self.assertEqual(
+            response.data["report_artifacts"],
+            [VALID_REPORT_ARTIFACT],
+        )
 
     @patch("insights.assistant_api.FinancialAssistantService")
     def test_follow_up_loads_ordered_history_and_appends_next_exchange(
@@ -284,6 +333,9 @@ class PersistentFinancialAssistantAPITests(TestCase):
 
     def test_conversation_detail_returns_ordered_messages_and_minimal_metadata(self):
         conversation = self.create_conversation()
+        assistant_message = conversation.messages.get(sequence=2)
+        assistant_message.report_artifacts = [VALID_REPORT_ARTIFACT]
+        assistant_message.save(update_fields=["report_artifacts"])
         self.authenticate_as(self.owner)
         detail_url = reverse(
             "insights-assistant-conversation-detail",
@@ -307,6 +359,10 @@ class PersistentFinancialAssistantAPITests(TestCase):
         )
         self.assertNotIn("tool_arguments", response.data["messages"][1])
         self.assertNotIn("tool_results", response.data["messages"][1])
+        self.assertEqual(
+            response.data["messages"][1]["report_artifacts"],
+            [VALID_REPORT_ARTIFACT],
+        )
 
     def test_other_member_cannot_read_conversation_detail(self):
         conversation = self.create_conversation()

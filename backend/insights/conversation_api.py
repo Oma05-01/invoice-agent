@@ -94,6 +94,7 @@ def _message_data(message: AssistantMessage) -> dict:
         "model": message.model,
         "tool_call_count": message.tool_call_count,
         "tool_invocations": message.tool_invocations,
+        "report_artifacts": message.report_artifacts,
         "created_at": message.created_at.isoformat(),
     }
 
@@ -175,6 +176,9 @@ def _persist_exchange(
             model=result.model,
             tool_call_count=result.tool_call_count,
             tool_invocations=invocations,
+            report_artifacts=list(
+                getattr(result, "report_artifacts", ()) or ()
+            ),
         )
         assistant_message.full_clean()
         assistant_message.save(force_insert=True)
@@ -295,6 +299,9 @@ class FinancialAssistantChatAPIView(OrganizationInsightsAPIView):
                     }
                     for invocation in result.tool_invocations
                 ],
+                "report_artifacts": list(
+                    getattr(result, "report_artifacts", ()) or ()
+                ),
             },
             status=status.HTTP_200_OK,
         )

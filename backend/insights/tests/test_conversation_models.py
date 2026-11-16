@@ -10,6 +10,45 @@ from django.utils import timezone
 from insights.models import AssistantConversation, AssistantMessage
 from organizations.models import Organization
 
+VALID_REPORT_ARTIFACT = {
+    "schema_version": 1,
+    "tool": "spend_by",
+    "report": {
+        "dimension": "vendor",
+        "period": {
+            "start_date": "2026-10-01",
+            "end_date": "2026-10-31",
+        },
+        "limit_per_currency": 20,
+        "currencies": [
+            {
+                "currency": "NGN",
+                "rows": [
+                    {
+                        "vendor_id": "00000000-0000-0000-0000-000000000001",
+                        "vendor_name": "Northstar",
+                        "amount": "1250.00",
+                        "gross_debits": "1250.00",
+                        "gross_credits": "0.00",
+                        "journal_count": 1,
+                        "journal_line_count": 1,
+                    }
+                ],
+                "total_expenditure": "1250.00",
+                "gross_debits": "1250.00",
+                "gross_credits": "0.00",
+                "journal_count": 1,
+                "journal_line_count": 1,
+                "displayed_rows_expenditure": "1250.00",
+                "group_count": 1,
+                "returned_group_count": 1,
+                "is_truncated": False,
+            }
+        ],
+        "report_basis": "Posted expense journal activity, grouped by vendor.",
+    },
+}
+
 
 class AssistantConversationModelTests(TestCase):
     def setUp(self):
@@ -213,3 +252,47 @@ class AssistantMessageModelTests(TestCase):
         self.assertFalse(
             AssistantMessage.objects.filter(conversation_id=conversation_id).exists()
         )
+
+    def test_assistant_message_defaults_to_empty_report_artifacts(self):
+        message = AssistantMessage(
+            conversation=self.conversation,
+            sequence=1,
+            role=AssistantMessage.Role.ASSISTANT,
+            content="No report was generated.",
+        )
+
+        self.assertEqual(message.report_artifacts, [])
+
+    def test_assistant_message_accepts_valid_report_artifact(self):
+        message = AssistantMessage(
+            conversation=self.conversation,
+            sequence=1,
+            role=AssistantMessage.Role.ASSISTANT,
+            content="Northstar expenditure was NGN 1,250.00.",
+            report_artifacts=[VALID_REPORT_ARTIFACT],
+        )
+
+        message.full_clean()
+        message.save()
+
+        self.assertEqual(message.report_artifacts, [VALID_REPORT_ARTIFACT])
+
+    def test_report_artifact_rejects_unknown_fields(self):
+        invalid_artifact = {
+            **VALID_REPORT_ARTIFACT,
+            "tool_arguments": {"organization_id": "not-allowed"},
+        }
+        message = AssistantMessage(
+            conversation=self.conversation,
+            sequence=1,
+            role=AssistantMessage.Role.ASSISTANT,
+            content="Report summary.",
+            report_artifacts=[invalid_artifact],
+        )
+
+        with self.assertRaises(ValidationError) as context:
+            message.full_clean()
+
+        self.assertIn("report_artifacts", context.exception.message_dict)
+
+    

@@ -139,6 +139,9 @@ class FinancialAssistantChatAPIView(OrganizationInsightsAPIView):
                     }
                     for invocation in result.tool_invocations
                 ],
+                "report_artifacts": list(
+                    getattr(result, "report_artifacts", ()) or ()
+                ),
             },
             status=status.HTTP_200_OK,
         )
