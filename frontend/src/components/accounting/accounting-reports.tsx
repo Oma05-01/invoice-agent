@@ -3,6 +3,7 @@
 import { useState, type FormEvent } from "react";
 
 import {
+  Bot,
   BookOpen,
   CalendarDays,
   CheckCircle2,
@@ -36,6 +37,7 @@ import type {
 } from "@/types/accounting";
 
 import { ExpenditureReport } from "./expenditure-report";
+import { FinancialAssistant } from "./financial-assistant";
 
 
 type Props = {
@@ -49,7 +51,8 @@ type ReportTab =
   | "income-statement"
   | "balance-sheet"
   | "ap-ageing"
-  | "expenditure";
+  | "expenditure"
+  | "assistant";
 
 const apAgeingBucketOrder: APAgeingBucket[] = [
   "current",
@@ -1725,6 +1728,19 @@ export function AccountingReports({
           <CalendarDays size={15} />
           Expenditure Analysis
         </button>
+
+        <button
+          type="button"
+          onClick={() => setActiveReport("assistant")}
+          className={`inline-flex items-center gap-2 border-b-2 py-4 text-xs font-semibold transition ${
+            activeReport === "assistant"
+              ? "border-blue-700 text-blue-700"
+              : "border-transparent text-slate-400 hover:text-slate-700"
+          }`}
+        >
+          <Bot size={15} />
+          Financial Assistant
+        </button>
       </div>
 
       {activeReport === "ledger" && (
@@ -1744,6 +1760,12 @@ export function AccountingReports({
       )}
       {activeReport === "expenditure" && (
         <ExpenditureReport
+          key={organizationId}
+          organizationId={organizationId}
+        />
+      )}
+      {activeReport === "assistant" && (
+        <FinancialAssistant
           key={organizationId}
           organizationId={organizationId}
         />
