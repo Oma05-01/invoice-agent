@@ -12,6 +12,7 @@ from accounting.services import (
     post_journal_entry,
     reverse_journal_entry,
     update_draft_journal_line,
+    create_adjustment_journal,
 )
 from approvals.models import ApprovalDecision, ApprovalRequest
 from insights.services.spend import SpendReportError, spend_by
@@ -374,6 +375,11 @@ class SpendReportServiceTests(TestCase):
         self.assertEqual(report["rows"], [])
         self.assertEqual(report["total_expenditure"], "0.00")
         self.assertEqual(report["group_count"], 0)
+        self.assertEqual(report["gross_debits"], "0.00")
+        self.assertEqual(report["gross_credits"], "0.00")
+        self.assertEqual(report["journal_count"], 0)
+        self.assertEqual(report["journal_line_count"], 0)
+        self.assertEqual(report["displayed_rows_expenditure"], "0.00")
 
     def test_foreign_organization_expenditure_is_not_included(self):
         own_vendor = self.create_vendor()
@@ -477,3 +483,90 @@ class SpendReportServiceTests(TestCase):
                 start_date=self.today,
                 end_date=self.today - timedelta(days=1),
             )
+
+    def test_adjustment_is_attributed_to_original_invoice_vendor(self):
+        vendor = self.create_vendor(
+            display_name="ClearWave Digital Systems",
+            legal_name="ClearWave Digital Systems Ltd",
+        )
+        original_date = self.today - timedelta(days=10)
+
+        _invoice, original_entry = self.create_posted_expense(
+            invoice_number="CW-ADJUSTMENT-001",
+            amount="900.00",
+            vendor=vendor,
+            entry_date=original_date,
+            expense_account_code="5000",
+        )
+
+        reversal = reverse_journal_entry(
+            organization_id=self.organization.id,
+            journal_entry_id=original_entry.id,
+            actor=self.admin,
+            reversal_reason="Reverse original ClearWave expense.",
+        )
+
+        adjustment = create_adjustment_journal(
+            organization_id=self.organization.id,
+            original_journal_id=original_entry.id,
+            actor=self.operator,
+            entry_date=reversal.entry_date,
+            reason="Restore the original vendor balance.",
+            description="ClearWave post-reversal balance restoration.",
+            lines=[
+                {
+                    "account_id": self.accounts["5000"].id,
+                    "debit": "900.00",
+                    "credit": "0.00",
+                    "description": "Restore expense balance.",
+                },
+                {
+                    "account_id": self.accounts["2000"].id,
+                    "debit": "0.00",
+                    "credit": "900.00",
+                    "description": "Restore accounts payable balance.",
+                },
+            ],
+        )
+
+        adjustment = post_journal_entry(
+            organization_id=self.organization.id,
+            journal_entry_id=adjustment.id,
+            actor=self.admin,
+        )
+
+        self.assertEqual(
+            adjustment.adjustment_record.original_journal_id,
+            original_entry.id,
+        )
+
+        result = spend_by(
+            self.organization,
+            dimension="vendor",
+            start_date=reversal.entry_date,
+            end_date=adjustment.entry_date,
+        )
+        report = self.get_currency_report(result)
+
+        clearwave_row = next(
+            row
+            for row in report["rows"]
+            if row["vendor_id"] == str(vendor.id)
+        )
+
+        self.assertEqual(report["total_expenditure"], "0.00")
+        self.assertEqual(report["gross_debits"], "900.00")
+        self.assertEqual(report["gross_credits"], "900.00")
+        self.assertEqual(report["journal_count"], 2)
+        self.assertEqual(report["journal_line_count"], 2)
+
+        self.assertEqual(
+            clearwave_row["vendor_name"],
+            vendor.display_name,
+        )
+        self.assertEqual(clearwave_row["amount"], "0.00")
+        self.assertEqual(clearwave_row["gross_debits"], "900.00")
+        self.assertEqual(clearwave_row["gross_credits"], "900.00")
+        self.assertEqual(clearwave_row["journal_count"], 2)
+        self.assertEqual(clearwave_row["journal_line_count"], 2)
+

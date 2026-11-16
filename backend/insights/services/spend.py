@@ -8,6 +8,7 @@ from django.db.models import (
     CharField,
     F,
     Sum,
+    Count,
     UUIDField,
     Value,
     When,
@@ -94,6 +95,25 @@ def _vendor_grouped_rows(queryset, *, organization_id):
         output_field=CharField(),
     )
 
+    adjustment_vendor_name = Coalesce(
+        NullIf(
+            F(
+                "entry__adjustment_record__original_journal"
+                "__source_invoice__vendor__display_name"
+            ),
+            Value(""),
+        ),
+        NullIf(
+            F(
+                "entry__adjustment_record__original_journal"
+                "__source_invoice__vendor__legal_name"
+            ),
+            Value(""),
+        ),
+        Value("Unattributed", output_field=CharField()),
+        output_field=CharField(),
+    )
+
     vendor_id = Case(
         When(
             entry__source_invoice__organization_id=organization_id,
@@ -104,6 +124,16 @@ def _vendor_grouped_rows(queryset, *, organization_id):
             entry__reversal_of__source_invoice__organization_id=organization_id,
             entry__reversal_of__source_invoice__vendor__organization_id=organization_id,
             then=F("entry__reversal_of__source_invoice__vendor_id"),
+        ),
+        When(
+            entry__adjustment_record__organization_id=organization_id,
+            entry__adjustment_record__original_journal__organization_id=organization_id,
+            entry__adjustment_record__original_journal__source_invoice__organization_id=organization_id,
+            entry__adjustment_record__original_journal__source_invoice__vendor__organization_id=organization_id,
+            then=F(
+                "entry__adjustment_record__original_journal"
+                "__source_invoice__vendor_id"
+            ),
         ),
         default=Value(None, output_field=UUIDField()),
         output_field=UUIDField(),
@@ -118,6 +148,13 @@ def _vendor_grouped_rows(queryset, *, organization_id):
             entry__reversal_of__source_invoice__organization_id=organization_id,
             entry__reversal_of__source_invoice__vendor__organization_id=organization_id,
             then=reversal_vendor_name,
+        ),
+        When(
+            entry__adjustment_record__organization_id=organization_id,
+            entry__adjustment_record__original_journal__organization_id=organization_id,
+            entry__adjustment_record__original_journal__source_invoice__organization_id=organization_id,
+            entry__adjustment_record__original_journal__source_invoice__vendor__organization_id=organization_id,
+            then=adjustment_vendor_name,
         ),
         default=Value("Unattributed", output_field=CharField()),
         output_field=CharField(),
@@ -136,6 +173,8 @@ def _vendor_grouped_rows(queryset, *, organization_id):
         .annotate(
             total_debit=Sum("debit"),
             total_credit=Sum("credit"),
+            journal_count=Count("entry_id", distinct=True),
+            journal_line_count=Count("pk"),
         )
     )
 
@@ -151,6 +190,8 @@ def _account_grouped_rows(queryset):
         .annotate(
             total_debit=Sum("debit"),
             total_credit=Sum("credit"),
+            journal_count=Count("entry_id", distinct=True),
+            journal_line_count=Count("pk"),
         )
     )
 
@@ -162,6 +203,8 @@ def _month_grouped_rows(queryset):
         .annotate(
             total_debit=Sum("debit"),
             total_credit=Sum("credit"),
+            journal_count=Count("entry_id", distinct=True),
+            journal_line_count=Count("pk"),
         )
     )
 
@@ -171,12 +214,20 @@ def _serialize_group(row, *, dimension):
     credit = row["total_credit"] or ZERO
     amount = debit - credit
 
+    activity = {
+        "amount": money(amount),
+        "gross_debits": money(debit),
+        "gross_credits": money(credit),
+        "journal_count": row["journal_count"],
+        "journal_line_count": row["journal_line_count"],
+    }
+
     if dimension == "vendor":
         vendor_id = row["report_vendor_id"]
         return {
             "vendor_id": str(vendor_id) if vendor_id else None,
             "vendor_name": row["report_vendor_name"] or "Unattributed",
-            "amount": money(amount),
+            **activity,
         }, amount
 
     if dimension == "account":
@@ -184,7 +235,7 @@ def _serialize_group(row, *, dimension):
             "account_id": str(row["account_id"]),
             "account_code": row["account__code"],
             "account_name": row["account__name"],
-            "amount": money(amount),
+            **activity,
         }, amount
 
     month = row["report_month"]
@@ -193,7 +244,7 @@ def _serialize_group(row, *, dimension):
 
     return {
         "month": month.isoformat(),
-        "amount": money(amount),
+        **activity,
     }, amount
 
 
@@ -240,6 +291,21 @@ def spend_by(
     if currency:
         queryset = queryset.filter(entry__currency=currency)
 
+    currency_totals = (
+        queryset.values("entry__currency")
+        .annotate(
+            gross_debits=Sum("debit"),
+            gross_credits=Sum("credit"),
+            journal_count=Count("entry_id", distinct=True),
+            journal_line_count=Count("pk"),
+        )
+    )
+
+    currency_metrics = {
+        row["entry__currency"] or "UNKNOWN": row
+        for row in currency_totals
+    }
+
     if dimension == "vendor":
         grouped_rows = _vendor_grouped_rows(
             queryset, organization_id=organization.pk
@@ -255,22 +321,21 @@ def spend_by(
         serialized, amount = _serialize_group(row, dimension=dimension)
         bucket = grouped_by_currency.setdefault(
             currency_code,
-            {"rows": [], "total_expenditure": ZERO},
+            {"rows": []},
         )
         bucket["rows"].append((serialized, amount))
-        bucket["total_expenditure"] += amount
 
     # Preserve the organisation's reporting currency for an empty unfiltered
-    # report, matching the behaviour of the existing financial statements.
+    # Preserve the organisation's reporting currency for an empty report.
     if not grouped_by_currency:
         empty_currency = currency or organization.default_currency
         if empty_currency:
             grouped_by_currency[empty_currency] = {
                 "rows": [],
-                "total_expenditure": ZERO,
             }
 
     currency_reports = []
+
     for currency_code in sorted(grouped_by_currency):
         bucket = grouped_by_currency[currency_code]
         all_rows = bucket["rows"]
@@ -289,7 +354,14 @@ def spend_by(
             )
             selected_rows = all_rows[:limit]
 
-        returned_expenditure = sum(
+        metrics = currency_metrics.get(currency_code, {})
+
+        gross_debits = metrics.get("gross_debits") or ZERO
+        gross_credits = metrics.get("gross_credits") or ZERO
+
+        total_expenditure = gross_debits - gross_credits
+
+        displayed_rows_expenditure = sum(
             (amount for _row, amount in selected_rows),
             ZERO,
         )
@@ -297,8 +369,16 @@ def spend_by(
         currency_reports.append({
             "currency": currency_code,
             "rows": [row for row, _amount in selected_rows],
-            "total_expenditure": money(bucket["total_expenditure"]),
-            "returned_expenditure": money(returned_expenditure),
+            "total_expenditure": money(total_expenditure),
+            "gross_debits": money(gross_debits),
+            "gross_credits": money(gross_credits),
+            "journal_count": metrics.get("journal_count", 0),
+            "journal_line_count": metrics.get(
+                "journal_line_count", 0
+            ),
+            "displayed_rows_expenditure": money(
+                displayed_rows_expenditure
+            ),
             "group_count": len(all_rows),
             "returned_group_count": len(selected_rows),
             "is_truncated": len(all_rows) > len(selected_rows),
@@ -313,13 +393,25 @@ def spend_by(
         "limit_per_currency": limit,
         "currencies": currency_reports,
         "report_basis": (
-            "Expenditure is calculated from expense-account journal lines "
-            "using debits minus credits. Posted journals and original "
-            "journals marked reversed are included; draft journals are "
-            "excluded. Reversal journals are reported on their own entry "
-            "dates and attributed to the original invoice vendor when one "
-            "exists. Non-invoice expenditure is grouped as Unattributed "
+            "Expenditure is calculated from expense-account journal "
+            "lines using debits minus credits. Gross debits and gross "
+            "credits show the underlying expense activity before netting. "
+            "Journal count is the number of distinct journals containing "
+            "expense lines; journal-line count is the number of included "
+            "expense-account lines. "
+            "Posted journals and original journals marked reversed are "
+            "included. A reversal journal is included on its own entry "
+            "date, so both the original and reversal remain visible in "
+            "historical reporting. Draft journals are excluded. "
+            "Reversal journals are attributed to the original invoice "
+            "vendor when one exists. Linked adjustment journals are "
+            "attributed to the vendor on their original journal's invoice "
+            "when one exists and belongs to the same organisation. "
+            "Other non-invoice expenditure is grouped as Unattributed "
             "when reporting by vendor. Amounts are reported separately "
-            "by currency without conversion."
+            "by currency without conversion. "
+            "Displayed rows expenditure is the sum of the selected "
+            "returned groups and may differ from total expenditure "
+            "when the report is truncated."
         ),
     }

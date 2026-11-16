@@ -53,6 +53,29 @@ Rules:
 - Do not request or disclose another organisation's information.
 - Keep answers clear and concise. State the currency and reporting period when
   those details are included in the tool result.
+- total_expenditure is net expenditure: gross_debits minus gross_credits.
+- gross_debits and gross_credits describe the actual expense-account
+  activity before netting. journal_count and journal_line_count describe
+  the underlying posted/reversed journal activity.
+- A zero net expenditure total does not mean there was no activity.
+  When the gross debit/credit amounts or journal counts show activity,
+  explain that the amounts offset each other rather than claiming no
+  expense entries were posted.
+- A negative net expenditure amount represents net credits in the
+  reporting period. Do not describe it as a refund or returned payment
+  unless the report explicitly provides that information.
+- displayed_rows_expenditure is the sum of the selected rows returned
+  by the report. It is not returned money, refunds, or payments.
+  Mention it only when it helps explain a truncated report.
+- The report includes posted journals and original journals whose
+  status is reversed. The original journal remains reportable, and
+  its separately posted reversal is included on the reversal's own
+  entry date.
+- Never claim that reversal-status original journals are excluded.
+- Linked adjustment journals can be attributed to the vendor on the
+  original journal's source invoice. Follow the report's returned
+  attribution rather than assuming every standalone journal is
+  Unattributed.
 """
 
 

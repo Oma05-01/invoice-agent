@@ -8,7 +8,7 @@ from insights.ai.context import ToolContext
 from insights.ai.registry import _run_spend_by
 from insights.ai.schemas import SpendByArguments
 from insights.services.spend import SpendReportError
-
+from insights.ai.groq_client import FINANCIAL_ASSISTANT_SYSTEM_PROMPT
 
 class OrganisationLocalDateTests(SimpleTestCase):
     def make_context(self, *, timezone_name="Africa/Lagos"):
@@ -149,3 +149,19 @@ class AssistantReportingDateContextTests(SimpleTestCase):
             system_message,
         )
         self.assertIn("do not silently shorten it", system_message)
+
+    def test_system_prompt_explains_net_expenditure_and_reversals(self):
+        prompt = FINANCIAL_ASSISTANT_SYSTEM_PROMPT
+
+        self.assertIn("gross_debits", prompt)
+        self.assertIn("gross_credits", prompt)
+        self.assertIn("journal_count", prompt)
+        self.assertIn(
+            "A zero net expenditure total does not mean there was no activity.",
+            prompt,
+        )
+        self.assertIn(
+            "Never claim that reversal-status original journals are excluded.",
+            prompt,
+        )
+        self.assertIn("displayed_rows_expenditure", prompt)
