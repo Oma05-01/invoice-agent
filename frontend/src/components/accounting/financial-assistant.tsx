@@ -19,9 +19,11 @@ import {
   fetchAssistantConversation,
   fetchAssistantConversations,
 } from "@/lib/financial-assistant";
+
 import type {
   AssistantConversationSummary,
   FinancialAssistantDisplayMessage,
+  FinancialAssistantReportArtifact,
   FinancialAssistantToolInvocation,
 } from "@/types/financial-assistant";
 
@@ -60,6 +62,7 @@ function toDisplayMessage(
     tool_call_count?: number;
     tool_invocations?: FinancialAssistantToolInvocation[];
     created_at?: string;
+    report_artifacts?: FinancialAssistantReportArtifact[];
   },
 ): FinancialAssistantDisplayMessage {
   return {
@@ -70,6 +73,7 @@ function toDisplayMessage(
     tool_call_count: message.tool_call_count,
     tool_invocations: message.tool_invocations,
     created_at: message.created_at,
+    report_artifacts: message.report_artifacts,
   };
 }
 
@@ -151,60 +155,63 @@ export function FinancialAssistant({ organizationId }: Props) {
     setConversations(response.results);
   }
 
-  async function handleSubmit(event: FormEvent<HTMLFormElement>) {
-    event.preventDefault();
-    const trimmedQuestion = question.trim();
-    if (!trimmedQuestion || loading || historyLoading || !organizationId) return;
+  
+async function handleSubmit(event: FormEvent<HTMLFormElement>) {
+  event.preventDefault();
+  const trimmedQuestion = question.trim();
+  if (!trimmedQuestion || loading || historyLoading || !organizationId) return;
 
-    const pendingId = `pending-${Date.now()}`;
-    const conversationIdAtSubmit = activeConversationId;
-    const userMessage: FinancialAssistantDisplayMessage = {
-      id: pendingId,
-      role: "user",
-      content: trimmedQuestion,
-    };
+  const pendingId = `pending-${Date.now()}`;
+  const conversationIdAtSubmit = activeConversationId;
+  const userMessage: FinancialAssistantDisplayMessage = {
+    id: pendingId,
+    role: "user",
+    content: trimmedQuestion,
+  };
 
-    setLoading(true);
-    setError("");
-    setQuestion("");
-    setMessages((current) => [...current, userMessage]);
+  setLoading(true);
+  setError("");
+  setQuestion("");
+  setMessages((current) => [...current, userMessage]);
+
+  try {
+    const response = await askFinancialAssistant(
+      organizationId,
+      trimmedQuestion,
+      conversationIdAtSubmit,
+    );
+    setActiveConversationId(response.conversation_id);
+    setMessages((current) => [
+      ...current,
+      {
+        id: `assistant-${Date.now()}`,
+        role: "assistant",
+        content: response.answer,
+        model: response.model,
+        tool_call_count: response.tool_call_count,
+        tool_invocations: response.tool_invocations,
+        report_artifacts: response.report_artifacts ?? [],
+      },
+    ]);
 
     try {
-      const response = await askFinancialAssistant(
-        organizationId,
-        trimmedQuestion,
-        conversationIdAtSubmit,
-      );
-      setActiveConversationId(response.conversation_id);
-      setMessages((current) => [
-        ...current,
-        {
-          id: `assistant-${Date.now()}`,
-          role: "assistant",
-          content: response.answer,
-          model: response.model,
-          tool_call_count: response.tool_call_count,
-          tool_invocations: response.tool_invocations,
-        },
-      ]);
-
-      try {
-        await refreshConversationList();
-      } catch {
-        setError("Your response was saved, but the conversation list could not be refreshed.");
-      }
-    } catch (err) {
-      setMessages((current) => current.filter((message) => message.id !== pendingId));
-      setQuestion(trimmedQuestion);
-      setError(
-        err instanceof Error
-          ? err.message
-          : "The financial assistant could not complete this request.",
-      );
-    } finally {
-      setLoading(false);
+      await refreshConversationList();
+    } catch {
+      setError("Your response was saved, but the conversation list could not be refreshed.");
     }
+  } catch (err) {
+    setMessages((current) => current.filter((message) => message.id !== pendingId));
+    setQuestion(trimmedQuestion);
+    setError(
+      err instanceof Error
+        ? err.message
+        : "The financial assistant could not complete this request.",
+    );
+  } finally {
+    setLoading(false);
   }
+}
+
 
   return (
     <section
