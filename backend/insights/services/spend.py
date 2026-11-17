@@ -114,6 +114,27 @@ def _vendor_grouped_rows(queryset, *, organization_id):
         output_field=CharField(),
     )
 
+    nested_adjustment_vendor_name = Coalesce(
+        NullIf(
+            F(
+                "entry__adjustment_record__original_journal"
+                "__adjustment_record__original_journal"
+                "__source_invoice__vendor__display_name"
+            ),
+            Value(""),
+        ),
+        NullIf(
+            F(
+                "entry__adjustment_record__original_journal"
+                "__adjustment_record__original_journal"
+                "__source_invoice__vendor__legal_name"
+            ),
+            Value(""),
+        ),
+        Value("Unattributed", output_field=CharField()),
+        output_field=CharField(),
+    )
+
     vendor_id = Case(
         When(
             entry__source_invoice__organization_id=organization_id,
@@ -132,6 +153,19 @@ def _vendor_grouped_rows(queryset, *, organization_id):
             entry__adjustment_record__original_journal__source_invoice__vendor__organization_id=organization_id,
             then=F(
                 "entry__adjustment_record__original_journal"
+                "__source_invoice__vendor_id"
+            ),
+        ),
+        When(
+            entry__adjustment_record__organization_id=organization_id,
+            entry__adjustment_record__original_journal__organization_id=organization_id,
+            entry__adjustment_record__original_journal__adjustment_record__organization_id=organization_id,
+            entry__adjustment_record__original_journal__adjustment_record__original_journal__organization_id=organization_id,
+            entry__adjustment_record__original_journal__adjustment_record__original_journal__source_invoice__organization_id=organization_id,
+            entry__adjustment_record__original_journal__adjustment_record__original_journal__source_invoice__vendor__organization_id=organization_id,
+            then=F(
+                "entry__adjustment_record__original_journal"
+                "__adjustment_record__original_journal"
                 "__source_invoice__vendor_id"
             ),
         ),
@@ -155,6 +189,15 @@ def _vendor_grouped_rows(queryset, *, organization_id):
             entry__adjustment_record__original_journal__source_invoice__organization_id=organization_id,
             entry__adjustment_record__original_journal__source_invoice__vendor__organization_id=organization_id,
             then=adjustment_vendor_name,
+        ),
+        When(
+            entry__adjustment_record__organization_id=organization_id,
+            entry__adjustment_record__original_journal__organization_id=organization_id,
+            entry__adjustment_record__original_journal__adjustment_record__organization_id=organization_id,
+            entry__adjustment_record__original_journal__adjustment_record__original_journal__organization_id=organization_id,
+            entry__adjustment_record__original_journal__adjustment_record__original_journal__source_invoice__organization_id=organization_id,
+            entry__adjustment_record__original_journal__adjustment_record__original_journal__source_invoice__vendor__organization_id=organization_id,
+            then=nested_adjustment_vendor_name,
         ),
         default=Value("Unattributed", output_field=CharField()),
         output_field=CharField(),
@@ -404,9 +447,10 @@ def spend_by(
             "date, so both the original and reversal remain visible in "
             "historical reporting. Draft journals are excluded. "
             "Reversal journals are attributed to the original invoice "
-            "vendor when one exists. Linked adjustment journals are "
-            "attributed to the vendor on their original journal's invoice "
-            "when one exists and belongs to the same organisation. "
+            "vendor when one exists. "
+            "Linked adjustment journals are attributed through their "
+            "original-journal chain to the source invoice vendor when one "
+            "exists and belongs to the same organisation. "
             "Other non-invoice expenditure is grouped as Unattributed "
             "when reporting by vendor. Amounts are reported separately "
             "by currency without conversion. "

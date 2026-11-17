@@ -535,16 +535,49 @@ class SpendReportServiceTests(TestCase):
             actor=self.admin,
         )
 
+        correction = create_adjustment_journal(
+            organization_id=self.organization.id,
+            original_journal_id=adjustment.id,
+            actor=self.operator,
+            entry_date=reversal.entry_date,
+            reason="Correct the counterpart account on the original adjustment.",
+            description="Nested ClearWave adjustment correction.",
+            lines=[
+                {
+                    "account_id": self.accounts["2000"].id,
+                    "debit": "900.00",
+                    "credit": "0.00",
+                    "description": "Correct adjustment counterpart.",
+                },
+                {
+                    "account_id": self.accounts["5000"].id,
+                    "debit": "0.00",
+                    "credit": "900.00",
+                    "description": "Reverse the incorrect expense classification.",
+                },
+            ],
+        )
+
+        correction = post_journal_entry(
+            organization_id=self.organization.id,
+            journal_entry_id=correction.id,
+            actor=self.admin,
+        )
+
         self.assertEqual(
             adjustment.adjustment_record.original_journal_id,
             original_entry.id,
+        )
+        self.assertEqual(
+            correction.adjustment_record.original_journal_id,
+            adjustment.id,
         )
 
         result = spend_by(
             self.organization,
             dimension="vendor",
             start_date=reversal.entry_date,
-            end_date=adjustment.entry_date,
+            end_date=correction.entry_date,
         )
         report = self.get_currency_report(result)
 
@@ -554,19 +587,19 @@ class SpendReportServiceTests(TestCase):
             if row["vendor_id"] == str(vendor.id)
         )
 
-        self.assertEqual(report["total_expenditure"], "0.00")
+        self.assertEqual(report["total_expenditure"], "-900.00")
         self.assertEqual(report["gross_debits"], "900.00")
-        self.assertEqual(report["gross_credits"], "900.00")
-        self.assertEqual(report["journal_count"], 2)
-        self.assertEqual(report["journal_line_count"], 2)
+        self.assertEqual(report["gross_credits"], "1800.00")
+        self.assertEqual(report["journal_count"], 3)
+        self.assertEqual(report["journal_line_count"], 3)
 
         self.assertEqual(
             clearwave_row["vendor_name"],
             vendor.display_name,
         )
-        self.assertEqual(clearwave_row["amount"], "0.00")
+        self.assertEqual(clearwave_row["amount"], "-900.00")
         self.assertEqual(clearwave_row["gross_debits"], "900.00")
-        self.assertEqual(clearwave_row["gross_credits"], "900.00")
-        self.assertEqual(clearwave_row["journal_count"], 2)
-        self.assertEqual(clearwave_row["journal_line_count"], 2)
+        self.assertEqual(clearwave_row["gross_credits"], "1800.00")
+        self.assertEqual(clearwave_row["journal_count"], 3)
+        self.assertEqual(clearwave_row["journal_line_count"], 3)
 
