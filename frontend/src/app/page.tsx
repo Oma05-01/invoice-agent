@@ -24,6 +24,7 @@ import {
   X,
   type LucideIcon,
 } from "lucide-react";
+import { Bot } from "lucide-react";
 
 import { useAuth } from "@/components/auth-provider";
 import { ProtectedRoute } from "@/components/protected-route";
@@ -232,10 +233,17 @@ export default function Home() {
     { label: "Overview", href: "/", icon: LayoutDashboard, active: true },
     { label: "Invoices", href: "/invoices", icon: FileText, active: false },
     { label: "Accounting", href: "/accounting", icon: BookOpen, active: false },
+    {
+      label: "Financial Assistant",
+      href: "/accounting/assistant",
+      icon: Bot,
+      active: false,
+    },
     { label: "Approvals", icon: ShieldCheck, soon: true },
     { label: "Vendors", icon: Building2, soon: true },
     { label: "Audit log", icon: Activity, soon: true },
   ];
+
 
   async function handleLogout() {
     setIsLoggingOut(true);
